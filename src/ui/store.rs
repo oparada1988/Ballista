@@ -3,7 +3,7 @@
 use crate::core::PluginManager;
 use crate::models::WindowState;
 use adw::prelude::*;
-use adw::{ActionRow, Carousel, CarouselIndicatorDots, HeaderBar, ToolbarView, Window};
+use adw::{ActionRow, Carousel, CarouselIndicatorDots, Clamp, HeaderBar, ToolbarView, Window};
 use gtk::{
     Box, Button, FileDialog, GestureClick, Grid, Image, Label, Orientation, Picture,
     ScrolledWindow, SearchEntry, Stack, StackTransitionType,
@@ -12,19 +12,187 @@ use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct PluginInfo {
-    pub id: &'static str,
-    pub name: &'static str,
-    pub category: &'static str,
-    pub author: &'static str,
-    pub version: &'static str,
-    pub icon: &'static str,
-    pub thumbnail: Option<&'static str>,
+    pub id: String,
+    pub name: String,
+    pub category: String,
+    pub author: String,
+    pub version: String,
+    pub icon: String,
+    pub thumbnail: Option<String>,
     pub is_file_icon: bool,
-    pub fallback_grad: &'static str,
-    pub description: &'static str,
-    pub local_path: Option<&'static str>,
+    pub fallback_grad: String,
+    pub description: String,
+    pub download_url: Option<String>,
+    pub local_path: Option<String>,
+}
+
+fn load_marketplace_catalog() -> Vec<PluginInfo> {
+    let cache_dir = glib::user_cache_dir().join("ballista");
+    let _ = std::fs::create_dir_all(&cache_dir);
+    let cache_file = cache_dir.join("market_catalog.json");
+    let img_cache_dir = cache_dir.join("market_images");
+    let _ = std::fs::create_dir_all(&img_cache_dir);
+
+    // Fetch live catalog from Ballista-Market with 3s timeout
+    let url = "https://raw.githubusercontent.com/oparada1988/Ballista-Market/main/catalog.json";
+    let _ = std::process::Command::new("curl")
+        .arg("-s")
+        .arg("-m")
+        .arg("3")
+        .arg("-o")
+        .arg(&cache_file)
+        .arg(url)
+        .status();
+
+    if let Ok(data) = std::fs::read_to_string(&cache_file) {
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&data) {
+            if let Some(arr) = val.get("plugins").and_then(|v| v.as_array()) {
+                let mut list = Vec::new();
+                for p in arr {
+                    let id = p.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let name = p.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let author = p.get("author").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let version = p.get("version").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let category = p.get("category").and_then(|v| v.as_str()).unwrap_or("Utility").to_string();
+                    let description = p.get("description").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let download_url = p.get("download_url").and_then(|v| v.as_str()).map(|s| s.to_string());
+
+                    // Check for local project path on workstation
+                    let local_path = match id.as_str() {
+                        "com_oparada_AppLauncher" => Some("/home/oscar/Github Projects/AppLauncher".to_string()),
+                        "com_oparada_DiscordSC" => Some("/home/oscar/Github Projects/DiscordSC".to_string()),
+                        "com_oparada_GoveeStreamController" => Some("/home/oscar/Github Projects/Govee-Streamcontroller".to_string()),
+                        _ => None,
+                    };
+
+                    // Cache and resolve thumbnail
+                    let thumb_url = p.get("thumbnail").and_then(|v| v.as_str());
+                    let thumbnail = if let Some(t_url) = thumb_url {
+                        if t_url.starts_with("http") {
+                            let thumb_file = img_cache_dir.join(format!("{id}_thumb.png"));
+                            if !thumb_file.exists() {
+                                let _ = std::process::Command::new("curl")
+                                    .arg("-s")
+                                    .arg("-m")
+                                    .arg("5")
+                                    .arg("-o")
+                                    .arg(&thumb_file)
+                                    .arg(t_url)
+                                    .status();
+                            }
+                            if thumb_file.exists() {
+                                Some(thumb_file.to_string_lossy().to_string())
+                            } else {
+                                None
+                            }
+                        } else {
+                            Some(t_url.to_string())
+                        }
+                    } else {
+                        None
+                    };
+
+                    // Cache and resolve icon
+                    let icon_url = p.get("icon").and_then(|v| v.as_str()).unwrap_or("system-run-symbolic");
+                    let (icon, is_file_icon) = if icon_url.starts_with("http") {
+                        let icon_file = img_cache_dir.join(format!("{id}_icon.png"));
+                        if !icon_file.exists() {
+                            let _ = std::process::Command::new("curl")
+                                .arg("-s")
+                                .arg("-m")
+                                .arg("5")
+                                .arg("-o")
+                                .arg(&icon_file)
+                                .arg(icon_url)
+                                .status();
+                        }
+                        if icon_file.exists() {
+                            (icon_file.to_string_lossy().to_string(), true)
+                        } else {
+                            ("system-run-symbolic".to_string(), false)
+                        }
+                    } else if icon_url.ends_with(".png") {
+                        (icon_url.to_string(), true)
+                    } else {
+                        (icon_url.to_string(), false)
+                    };
+
+                    let fallback_grad = match category.as_str() {
+                        "Streaming" => "thumb-grad-streaming".to_string(),
+                        "System" => "thumb-grad-system".to_string(),
+                        "Audio" => "thumb-grad-audio".to_string(),
+                        "Developer" => "thumb-grad-developer".to_string(),
+                        "Productivity" => "thumb-grad-productivity".to_string(),
+                        _ => "thumb-grad-utility".to_string(),
+                    };
+
+                    list.push(PluginInfo {
+                        id,
+                        name,
+                        category,
+                        author,
+                        version,
+                        icon,
+                        thumbnail,
+                        is_file_icon,
+                        fallback_grad,
+                        description,
+                        download_url,
+                        local_path,
+                    });
+                }
+                return list;
+            }
+        }
+    }
+
+    // Bundled fallback
+    vec![
+        PluginInfo {
+            id: "com_oparada_AppLauncher".into(),
+            name: "App Launcher".into(),
+            category: "Utility".into(),
+            author: "oparada1988".into(),
+            version: "0.1.0".into(),
+            icon: "action_launch.png".into(),
+            thumbnail: Some("/home/oscar/.cache/ballista/market_images/com_oparada_AppLauncher_thumb.png".into()),
+            is_file_icon: true,
+            fallback_grad: "thumb-grad-utility".into(),
+            description: "Easily launch any installed host desktop application from your Stream Deck keys with automatic freedesktop icon and label setup.".into(),
+            download_url: Some("https://github.com/oparada1988/AppLauncher/archive/refs/heads/main.zip".into()),
+            local_path: Some("/home/oscar/Github Projects/AppLauncher".into()),
+        },
+        PluginInfo {
+            id: "com_oparada_DiscordSC".into(),
+            name: "DiscordSC".into(),
+            category: "Streaming".into(),
+            author: "oparada1988".into(),
+            version: "1.2.4".into(),
+            icon: "user-available-symbolic".into(),
+            thumbnail: Some("/home/oscar/.cache/ballista/market_images/com_oparada_DiscordSC_thumb.png".into()),
+            is_file_icon: false,
+            fallback_grad: "thumb-grad-streaming".into(),
+            description: "Control your Discord client's mute, deafen, notifications, server status, and input modes directly from your Stream Deck.".into(),
+            download_url: Some("https://github.com/oparada1988/DiscordSC/archive/refs/heads/main.zip".into()),
+            local_path: Some("/home/oscar/Github Projects/DiscordSC".into()),
+        },
+        PluginInfo {
+            id: "com_oparada_GoveeStreamController".into(),
+            name: "Govee Controller".into(),
+            category: "Utility".into(),
+            author: "oparada1988".into(),
+            version: "1.0.1".into(),
+            icon: "lightbulb-symbolic".into(),
+            thumbnail: Some("/home/oscar/.cache/ballista/market_images/com_oparada_GoveeStreamController_thumb.png".into()),
+            is_file_icon: false,
+            fallback_grad: "thumb-grad-utility".into(),
+            description: "Control Govee smart lights, LED strips, and home appliances directly from your Stream Deck.".into(),
+            download_url: Some("https://github.com/oparada1988/Govee-Streamcontroller/archive/refs/heads/main.zip".into()),
+            local_path: Some("/home/oscar/Github Projects/Govee-Streamcontroller".into()),
+        },
+    ]
 }
 
 pub fn create_store_window(
@@ -32,24 +200,26 @@ pub fn create_store_window(
     plugin_manager: Rc<RefCell<PluginManager>>,
     on_plugin_installed: Rc<dyn Fn()>,
 ) -> Window {
-    let saved_state = WindowState::load();
+    let _saved_state = WindowState::load();
 
     let window = Window::builder()
         .title("Plugin Store")
         .transient_for(parent)
         .modal(true)
-        .default_width(saved_state.store_width)
-        .default_height(saved_state.store_height)
+        .default_width(940)
+        .default_height(840)
+        .resizable(false)
         .build();
 
+    window.set_size_request(940, 840);
     window.add_css_class("ballista-modal");
     window.add_css_class("ballista-midnight-window");
 
     // Persist store window dimensions on close
     window.connect_close_request(|win| {
         let mut state = WindowState::load();
-        let w = win.width().max(600);
-        let h = win.height().max(400);
+        let w = win.width().max(760);
+        let h = win.height().max(560);
         state.store_width = w;
         state.store_height = h;
         state.save();
@@ -134,126 +304,8 @@ pub fn create_store_window(
     spotlight_header.append(&next_btn);
     scroll_content.append(&spotlight_header);
 
-    // Exactly 9 Featured Plugins Definition (3 slides x 3 cards = perfectly balanced)
-    let plugins_catalog: [PluginInfo; 9] = [
-        PluginInfo {
-            id: "com_oparada_AppLauncher",
-            name: "App Launcher",
-            category: "Utility",
-            author: "oparada1988",
-            version: "v0.2.0",
-            icon: "action_launch.png",
-            thumbnail: Some("/home/oscar/.local/share/ballista/plugins/com_oparada_AppLauncher/assets/thumbnail.png"),
-            is_file_icon: true,
-            fallback_grad: "thumb-grad-utility",
-            description: "Easily launch any installed host desktop application from your Stream Deck keys with automatic freedesktop icon and label setup. Compatible with StreamController manifests and workflows.",
-            local_path: Some("/home/oscar/Github Projects/AppLauncher"),
-        },
-        PluginInfo {
-            id: "com_community_obs",
-            name: "OBS Studio",
-            category: "Streaming",
-            author: "Community",
-            version: "v1.2.0",
-            icon: "video-display-symbolic",
-            thumbnail: None,
-            is_file_icon: false,
-            fallback_grad: "thumb-grad-streaming",
-            description: "Comprehensive Stream Deck control for OBS Studio. Switch scenes, trigger stinger transitions, start or stop streaming/recording, and toggle microphone mutes via OBS WebSocket.",
-            local_path: None,
-        },
-        PluginInfo {
-            id: "com_ballista_audioswitcher",
-            name: "Audio Switcher",
-            category: "Audio",
-            author: "Ballista",
-            version: "v1.0.0",
-            icon: "audio-volume-high-symbolic",
-            thumbnail: None,
-            is_file_icon: false,
-            fallback_grad: "thumb-grad-audio",
-            description: "Instantly toggle default PipeWire audio output sinks, input sources, headphone monitors, and custom hardware profile presets with zero latency.",
-            local_path: None,
-        },
-        PluginInfo {
-            id: "com_hardwarelabs_sysmon",
-            name: "System Monitor",
-            category: "System",
-            author: "HardwareLabs",
-            version: "v0.9.5",
-            icon: "utilities-system-monitor-symbolic",
-            thumbnail: None,
-            is_file_icon: false,
-            fallback_grad: "thumb-grad-system",
-            description: "Live hardware telemetry directly on your keys. Monitor real-time CPU usage, memory consumption, GPU temps, and network upload/download bandwidth.",
-            local_path: None,
-        },
-        PluginInfo {
-            id: "com_linuxmedia_controls",
-            name: "Media Controls",
-            category: "Utility",
-            author: "LinuxMedia",
-            version: "v1.1.0",
-            icon: "media-playback-start-symbolic",
-            thumbnail: None,
-            is_file_icon: false,
-            fallback_grad: "thumb-grad-utility",
-            description: "Native MPRIS integration for Spotify, YouTube, VLC, and desktop media players. Play, pause, skip tracks, and display live song titles on LCD keys.",
-            local_path: None,
-        },
-        PluginInfo {
-            id: "com_streamlabs_twitch",
-            name: "Twitch Tools",
-            category: "Streaming",
-            author: "StreamLabs",
-            version: "v1.4.2",
-            icon: "camera-video-symbolic",
-            thumbnail: None,
-            is_file_icon: false,
-            fallback_grad: "thumb-grad-streaming",
-            description: "Marker creation, commercial triggers, follower-only chat toggle, emote modes, and instantaneous stream clip automation for Twitch creators.",
-            local_path: None,
-        },
-        PluginInfo {
-            id: "com_voipmods_discord",
-            name: "Discord Bridge",
-            category: "Streaming",
-            author: "VoipMods",
-            version: "v2.1.0",
-            icon: "user-available-symbolic",
-            thumbnail: None,
-            is_file_icon: false,
-            fallback_grad: "thumb-grad-streaming",
-            description: "Mute microphone, deafen audio, switch voice channels, send soundboard soundbites, and display speaking indicators with Discord IPC.",
-            local_path: None,
-        },
-        PluginInfo {
-            id: "com_devops_terminalrunner",
-            name: "Terminal Runner",
-            category: "Developer",
-            author: "DevOpsLinux",
-            version: "v1.0.5",
-            icon: "utilities-terminal-symbolic",
-            thumbnail: None,
-            is_file_icon: false,
-            fallback_grad: "thumb-grad-developer",
-            description: "One-touch execution of custom bash scripts, docker container starts/stops, git pull commands, and automated SSH shortcuts.",
-            local_path: None,
-        },
-        PluginInfo {
-            id: "com_productivity_clockweather",
-            name: "Clock & Weather",
-            category: "Productivity",
-            author: "TimeKeep",
-            version: "v1.0.0",
-            icon: "weather-clear-symbolic",
-            thumbnail: None,
-            is_file_icon: false,
-            fallback_grad: "thumb-grad-productivity",
-            description: "Custom digital world clocks, stopwatch timers, and live weather conditions with animated temperature badges on hardware keys.",
-            local_path: None,
-        },
-    ];
+    // Live Marketplace Catalog queried directly from Ballista-Market
+    let plugins_catalog = load_marketplace_catalog();
 
     // =========================================================================
     // Page 2: Plugin Detail Subview (Matching Mockup)
@@ -321,29 +373,38 @@ pub fn create_store_window(
     shots_title.set_xalign(0.0);
     detail_scroll_content.append(&shots_title);
 
-    let shots_scrolled = ScrolledWindow::builder()
-        .hscrollbar_policy(gtk::PolicyType::Automatic)
-        .vscrollbar_policy(gtk::PolicyType::Never)
-        .min_content_height(145)
-        .vexpand(false)
-        .build();
-
-    let shots_box = Box::new(Orientation::Horizontal, 14);
+    let shots_box = Box::new(Orientation::Horizontal, 12);
+    shots_box.set_hexpand(true);
+    shots_box.set_homogeneous(true);
+    shots_box.set_vexpand(false);
+    shots_box.set_size_request(-1, 105);
     shots_box.set_margin_bottom(6);
+
+    let shot_box_1 = Box::new(Orientation::Vertical, 0);
+    shot_box_1.add_css_class("store-screenshot-tile");
+    shot_box_1.set_hexpand(true);
+    shot_box_1.set_vexpand(false);
+    shot_box_1.set_size_request(292, 105);
 
     let shot_pic_1 = Picture::new();
     shot_pic_1.set_can_shrink(true);
-    shot_pic_1.set_content_fit(gtk::ContentFit::Cover);
-    shot_pic_1.set_size_request(240, 135);
-    shot_pic_1.add_css_class("store-screenshot-tile");
-    shots_box.append(&shot_pic_1);
+    shot_pic_1.set_content_fit(gtk::ContentFit::Fill);
+    shot_pic_1.set_hexpand(true);
+    shot_pic_1.set_vexpand(false);
+    shot_pic_1.set_size_request(292, 105);
+    shot_box_1.append(&shot_pic_1);
+    shots_box.append(&shot_box_1);
 
     let shot_box_2 = Box::new(Orientation::Vertical, 0);
     shot_box_2.add_css_class("store-screenshot-tile");
     shot_box_2.add_css_class("thumb-grad-streaming");
-    shot_box_2.set_size_request(240, 135);
+    shot_box_2.set_hexpand(true);
+    shot_box_2.set_vexpand(false);
+    shot_box_2.set_size_request(292, 105);
     let shot_icon_2 = Image::from_icon_name("video-display-symbolic");
-    shot_icon_2.set_pixel_size(42);
+    shot_icon_2.set_pixel_size(36);
+    shot_icon_2.set_halign(gtk::Align::Center);
+    shot_icon_2.set_valign(gtk::Align::Center);
     shot_icon_2.set_vexpand(true);
     shot_box_2.append(&shot_icon_2);
     shots_box.append(&shot_box_2);
@@ -351,15 +412,18 @@ pub fn create_store_window(
     let shot_box_3 = Box::new(Orientation::Vertical, 0);
     shot_box_3.add_css_class("store-screenshot-tile");
     shot_box_3.add_css_class("thumb-grad-system");
-    shot_box_3.set_size_request(240, 135);
+    shot_box_3.set_hexpand(true);
+    shot_box_3.set_vexpand(false);
+    shot_box_3.set_size_request(292, 105);
     let shot_icon_3 = Image::from_icon_name("utilities-system-monitor-symbolic");
-    shot_icon_3.set_pixel_size(42);
+    shot_icon_3.set_pixel_size(36);
+    shot_icon_3.set_halign(gtk::Align::Center);
+    shot_icon_3.set_valign(gtk::Align::Center);
     shot_icon_3.set_vexpand(true);
     shot_box_3.append(&shot_icon_3);
     shots_box.append(&shot_box_3);
 
-    shots_scrolled.set_child(Some(&shots_box));
-    detail_scroll_content.append(&shots_scrolled);
+    detail_scroll_content.append(&shots_box);
 
     detail_scrolled.set_child(Some(&detail_scroll_content));
     detail_page_box.append(&detail_scrolled);
@@ -413,7 +477,7 @@ pub fn create_store_window(
         let pm_b = pm_hdr.borrow();
         let mut has_update = false;
         for c in &cat_hdr {
-            if let Some(inst) = pm_b.plugins.get(c.id) {
+            if let Some(inst) = pm_b.plugins.get(&c.id) {
                 let inst_ver = inst.version.trim_start_matches('v');
                 let cat_ver = c.version.trim_start_matches('v');
                 if cat_ver > inst_ver {
@@ -488,7 +552,7 @@ pub fn create_store_window(
                     btn_box.set_halign(gtk::Align::End);
 
                     // Check if catalog offers an update
-                    let cat_match = catalog_copy.iter().find(|c| c.id == p_id);
+                    let cat_match = catalog_copy.iter().find(|c| c.id == *p_id);
                     if let Some(cat_item) = cat_match {
                         let inst_ver = p_obj.version.trim_start_matches('v');
                         let cat_ver = cat_item.version.trim_start_matches('v');
@@ -594,42 +658,39 @@ pub fn create_store_window(
         let on_inst_inner = on_installed_detail.clone();
 
         move |plugin: PluginInfo| {
-            name_lbl.set_text(plugin.name);
+            name_lbl.set_text(&plugin.name);
             meta_lbl.set_text(&format!("by {} • {} • {}", plugin.author, plugin.version, plugin.category));
-            desc_lbl.set_text(plugin.description);
-            win_title_inner.set_title(Some(plugin.name));
+            desc_lbl.set_text(&plugin.description);
+            win_title_inner.set_title(Some(&plugin.name));
 
             // Load Icon
             if plugin.is_file_icon {
-                let full_path = format!("/home/oscar/.local/share/ballista/plugins/com_oparada_AppLauncher/assets/{}", plugin.icon);
-                if std::path::Path::new(&full_path).exists() {
-                    icon_img.set_from_file(Some(&full_path));
+                if std::path::Path::new(&plugin.icon).exists() {
+                    icon_img.set_from_file(Some(&plugin.icon));
                     icon_img.set_pixel_size(64);
                 } else {
                     icon_img.set_icon_name(Some("system-run-symbolic"));
                     icon_img.set_pixel_size(64);
                 }
             } else {
-                icon_img.set_icon_name(Some(plugin.icon));
+                icon_img.set_icon_name(Some(&plugin.icon));
                 icon_img.set_pixel_size(64);
             }
 
             // Load Screenshot 1
-            if let Some(thumb) = plugin.thumbnail {
+            if let Some(ref thumb) = plugin.thumbnail {
                 if std::path::Path::new(thumb).exists() {
-                    if let Ok(pixbuf) = gdk_pixbuf::Pixbuf::from_file_at_scale(thumb, 480, 270, false) {
-                        let texture = gtk::gdk::Texture::for_pixbuf(&pixbuf);
-                        shot1.set_paintable(Some(&texture));
-                    } else {
-                        shot1.set_filename(Some(thumb));
-                    }
+                    let file = gtk::gio::File::for_path(thumb);
+                    shot1.set_file(Some(&file));
+                } else {
+                    shot1.set_paintable(Option::<&gtk::gdk::Paintable>::None);
                 }
             } else {
                 shot1.set_paintable(Option::<&gtk::gdk::Paintable>::None);
             }
 
             // Check if installed
-            let is_installed = pm_inner.borrow().plugins.contains_key(plugin.id);
+            let is_installed = pm_inner.borrow().plugins.contains_key(&plugin.id);
             action_btn.remove_css_class("btn-install");
             action_btn.remove_css_class("btn-installed");
 
@@ -645,21 +706,33 @@ pub fn create_store_window(
                 let btn_clone = action_btn.clone();
                 let pm_action = pm_inner.clone();
                 let on_inst_action = on_inst_inner.clone();
-                let local_path = plugin.local_path;
+                let local_path = plugin.local_path.clone();
+                let download_url = plugin.download_url.clone();
+                let plugin_id = plugin.id.clone();
 
                 action_btn.connect_clicked(move |_| {
-                    if let Some(path_str) = local_path {
+                    let mut installed = false;
+                    if let Some(ref path_str) = local_path {
                         let path = PathBuf::from(path_str);
                         if path.exists() {
-                            let res = pm_action.borrow_mut().install_from_dir(&path);
-                            if res.is_ok() {
-                                btn_clone.set_label("Installed");
-                                btn_clone.remove_css_class("btn-install");
-                                btn_clone.add_css_class("btn-installed");
-                                btn_clone.set_sensitive(false);
-                                on_inst_action();
+                            if pm_action.borrow_mut().install_from_dir(&path).is_ok() {
+                                installed = true;
                             }
                         }
+                    }
+                    if !installed {
+                        if let Some(ref d_url) = download_url {
+                            if pm_action.borrow_mut().install_from_url(&plugin_id, d_url).is_ok() {
+                                installed = true;
+                            }
+                        }
+                    }
+                    if installed {
+                        btn_clone.set_label("Installed");
+                        btn_clone.remove_css_class("btn-install");
+                        btn_clone.add_css_class("btn-installed");
+                        btn_clone.set_sensitive(false);
+                        on_inst_action();
                     }
                 });
             }
@@ -748,7 +821,7 @@ pub fn create_store_window(
                 grid_cat.attach(&empty_lbl, 0, 0, 2, 1);
             } else {
                 for (idx, item) in matching.iter().enumerate() {
-                    let is_installed = pm_cat.borrow().plugins.contains_key(item.id);
+                    let is_installed = pm_cat.borrow().plugins.contains_key(&item.id);
                     let card = create_catalog_card(
                         item,
                         is_installed,
@@ -815,6 +888,8 @@ pub fn create_store_window(
     carousel.set_spacing(12);
     carousel.set_allow_mouse_drag(true);
     carousel.set_allow_scroll_wheel(true);
+    carousel.set_hexpand(true);
+    carousel.set_size_request(-1, 105);
 
     let mut chunk = Vec::new();
     for (i, item) in plugins_catalog.iter().enumerate() {
@@ -825,6 +900,7 @@ pub fn create_store_window(
             let slide_box = Box::new(Orientation::Horizontal, 12);
             slide_box.set_hexpand(true);
             slide_box.set_homogeneous(true);
+            slide_box.set_size_request(-1, 105);
             for c in chunk.drain(..) {
                 slide_box.append(&c);
             }
@@ -875,12 +951,21 @@ pub fn create_store_window(
     scroll_content.append(&dots);
 
     // =========================================================================
-    // 3. 3-Column x 2-Row Category Grid
+    // Centered Content Box for Categories and Popular Plugins (Locked within Red Box, 760px)
     // =========================================================================
+    let center_clamp = Clamp::builder()
+        .maximum_size(760)
+        .tightening_threshold(760)
+        .build();
+
+    let center_content_box = Box::new(Orientation::Vertical, 18);
+    center_content_box.set_hexpand(true);
+
+    // 3. 3-Column x 2-Row Category Grid
     let cat_title = Label::new(Some("Categories"));
     cat_title.add_css_class("store-section-title");
     cat_title.set_xalign(0.0);
-    scroll_content.append(&cat_title);
+    center_content_box.append(&cat_title);
 
     let cat_grid = Grid::new();
     cat_grid.set_column_spacing(10);
@@ -918,7 +1003,7 @@ pub fn create_store_window(
         cat_grid.attach(&btn, col, row, 1, 1);
         cat_buttons.push((cat_name, btn));
     }
-    scroll_content.append(&cat_grid);
+    center_content_box.append(&cat_grid);
 
     // =========================================================================
     // 4. Popular Plugins Catalog
@@ -934,17 +1019,20 @@ pub fn create_store_window(
 
     pop_header_box.append(&plugins_title);
     pop_header_box.append(&plugins_sub);
-    scroll_content.append(&pop_header_box);
+    center_content_box.append(&pop_header_box);
 
     let list_box = Box::new(Orientation::Vertical, 10);
-    let mut catalog_items: Vec<(Box, &'static str, &'static str)> = Vec::new();
+    let mut catalog_items: Vec<(Box, String, String)> = Vec::new();
 
     for item in plugins_catalog.iter() {
-        let is_installed = plugin_manager.borrow().plugins.contains_key(item.id);
+        let is_installed = plugin_manager.borrow().plugins.contains_key(&item.id);
         let card = create_catalog_card(item, is_installed, open_plugin_detail.clone(), plugin_manager.clone(), on_plugin_installed.clone(), refresh_header_status.clone());
         list_box.append(&card);
-        catalog_items.push((card, item.name, item.category));
+        catalog_items.push((card, item.name.clone(), item.category.clone()));
     }
+    center_content_box.append(&list_box);
+    center_clamp.set_child(Some(&center_content_box));
+    scroll_content.append(&center_clamp);
 
     let catalog_items_rc = Rc::new(catalog_items);
     let active_cat = Rc::new(RefCell::new(Option::<String>::None));
@@ -980,7 +1068,6 @@ pub fn create_store_window(
         filter_for_search();
     });
 
-    scroll_content.append(&list_box);
     scrolled.set_child(Some(&scroll_content));
     main_content_box.append(&scrolled);
 
@@ -1030,22 +1117,21 @@ fn create_spotlight_card(
 ) -> Box {
     let card = Box::new(Orientation::Vertical, 0);
     card.add_css_class("store-spotlight-card");
-    card.set_overflow(gtk::Overflow::Hidden);
-    card.set_cursor_from_name(Some("pointer"));
     card.set_hexpand(true);
-    card.set_size_request(230, 125);
-
-    // Top Hero Artwork Thumbnail - Occupies full card
-    let thumb_pic = Picture::new();
-    thumb_pic.set_can_shrink(true);
-    thumb_pic.set_content_fit(gtk::ContentFit::Cover);
-    thumb_pic.set_hexpand(true);
-    thumb_pic.set_vexpand(true);
-    thumb_pic.set_size_request(230, 125);
-    thumb_pic.add_css_class("store-spotlight-thumbnail");
+    card.set_vexpand(false);
+    card.set_size_request(292, 105);
+    card.set_cursor_from_name(Some("pointer"));
 
     let mut has_real_thumb = false;
-    if let Some(path) = item.thumbnail {
+    let thumb_pic = Picture::new();
+    thumb_pic.set_can_shrink(true);
+    thumb_pic.set_content_fit(gtk::ContentFit::Fill);
+    thumb_pic.set_hexpand(true);
+    thumb_pic.set_vexpand(true);
+    thumb_pic.set_size_request(292, 105);
+    thumb_pic.add_css_class("store-spotlight-thumbnail");
+
+    if let Some(ref path) = item.thumbnail {
         if std::path::Path::new(path).exists() {
             let file = gtk::gio::File::for_path(path);
             thumb_pic.set_file(Some(&file));
@@ -1058,12 +1144,12 @@ fn create_spotlight_card(
     } else {
         let fallback_box = Box::new(Orientation::Vertical, 0);
         fallback_box.add_css_class("thumb-banner-fallback");
-        fallback_box.add_css_class(item.fallback_grad);
+        fallback_box.add_css_class(&item.fallback_grad);
         fallback_box.set_hexpand(true);
         fallback_box.set_vexpand(true);
-        fallback_box.set_size_request(230, 125);
+        fallback_box.set_size_request(292, 105);
 
-        let icon_preview = Image::from_icon_name(if item.is_file_icon { "system-run-symbolic" } else { item.icon });
+        let icon_preview = Image::from_icon_name(if item.is_file_icon { "system-run-symbolic" } else { &item.icon });
         icon_preview.set_pixel_size(42);
         icon_preview.set_halign(gtk::Align::Center);
         icon_preview.set_valign(gtk::Align::Center);
@@ -1098,8 +1184,8 @@ fn create_catalog_card(
     card.add_css_class("store-card");
     card.set_cursor_from_name(Some("pointer"));
 
-    let escaped_name = glib::markup_escape_text(item.name);
-    let escaped_desc = glib::markup_escape_text(item.description);
+    let escaped_name = glib::markup_escape_text(&item.name);
+    let escaped_desc = glib::markup_escape_text(&item.description);
     let row = ActionRow::builder()
         .title(escaped_name.as_str())
         .subtitle(escaped_desc.as_str())
@@ -1117,7 +1203,7 @@ fn create_catalog_card(
             img
         }
     } else {
-        let img = Image::from_icon_name(item.icon);
+        let img = Image::from_icon_name(&item.icon);
         img.set_pixel_size(32);
         img
     };
@@ -1131,7 +1217,7 @@ fn create_catalog_card(
         let pm_b = plugin_manager.borrow();
         let mut has_update = false;
         let mut manifest_path_opt = None;
-        if let Some(inst) = pm_b.plugins.get(item.id) {
+        if let Some(inst) = pm_b.plugins.get(&item.id) {
             let inst_ver = inst.version.trim_start_matches('v');
             let cat_ver = item.version.trim_start_matches('v');
             if cat_ver > inst_ver {
@@ -1181,26 +1267,40 @@ fn create_catalog_card(
         }
     } else {
         btn.add_css_class("btn-install");
-        if let Some(path_str) = item.local_path {
-            let btn_clone = btn.clone();
-            let pm_inner = plugin_manager.clone();
-            let on_inst_inner = on_plugin_installed.clone();
-            let on_ref_hdr = on_refresh_header.clone();
-            btn.connect_clicked(move |_| {
+        let btn_clone = btn.clone();
+        let pm_inner = plugin_manager.clone();
+        let on_inst_inner = on_plugin_installed.clone();
+        let on_ref_hdr = on_refresh_header.clone();
+        let local_path = item.local_path.clone();
+        let download_url = item.download_url.clone();
+        let plugin_id = item.id.clone();
+
+        btn.connect_clicked(move |_| {
+            let mut installed = false;
+            if let Some(ref path_str) = local_path {
                 let path = PathBuf::from(path_str);
                 if path.exists() {
-                    let res = pm_inner.borrow_mut().install_from_dir(&path);
-                    if res.is_ok() {
-                        btn_clone.set_label("Installed");
-                        btn_clone.remove_css_class("btn-install");
-                        btn_clone.add_css_class("btn-installed");
-                        btn_clone.set_sensitive(false);
-                        on_inst_inner();
-                        on_ref_hdr();
+                    if pm_inner.borrow_mut().install_from_dir(&path).is_ok() {
+                        installed = true;
                     }
                 }
-            });
-        }
+            }
+            if !installed {
+                if let Some(ref d_url) = download_url {
+                    if pm_inner.borrow_mut().install_from_url(&plugin_id, d_url).is_ok() {
+                        installed = true;
+                    }
+                }
+            }
+            if installed {
+                btn_clone.set_label("Installed");
+                btn_clone.remove_css_class("btn-install");
+                btn_clone.add_css_class("btn-installed");
+                btn_clone.set_sensitive(false);
+                on_inst_inner();
+                on_ref_hdr();
+            }
+        });
     }
     row.add_suffix(&btn);
     card.append(&row);

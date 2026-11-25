@@ -15,11 +15,11 @@ pub struct WindowState {
 }
 
 fn default_store_width() -> i32 {
-    780
+    940
 }
 
 fn default_store_height() -> i32 {
-    640
+    840
 }
 
 impl Default for WindowState {
@@ -29,8 +29,8 @@ impl Default for WindowState {
             window_height: 780,
             sidebar_position: 820,
             work_paned_position: 440,
-            store_width: 780,
-            store_height: 640,
+            store_width: 940,
+            store_height: 840,
         }
     }
 }

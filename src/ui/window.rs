@@ -87,23 +87,25 @@ impl MainWindow {
         work_paned.set_vexpand(true);
         work_paned.set_hexpand(true);
 
-        // 4. Canvas
+        // 4. Canvas (Guaranteed minimum height to prevent hiding button grid)
         let canvas = Rc::new(Canvas::new(initial_kind));
+        canvas.container.set_size_request(-1, 280);
         work_paned.set_start_child(Some(&canvas.container));
         work_paned.set_resize_start_child(true);
-        work_paned.set_shrink_start_child(true);
+        work_paned.set_shrink_start_child(false);
 
         // 5. Property Inspector in Scrollable Container
         let inspector = Rc::new(PropertyInspector::new());
         let insp_scroll = gtk::ScrolledWindow::new();
         insp_scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
         insp_scroll.set_child(Some(&inspector.container));
-        insp_scroll.set_min_content_height(140);
+        insp_scroll.set_min_content_height(160);
+        insp_scroll.set_size_request(-1, 160);
 
         work_paned.set_end_child(Some(&insp_scroll));
         work_paned.set_resize_end_child(true);
         work_paned.set_shrink_end_child(false);
-        work_paned.set_position(state.work_paned_position);
+        work_paned.set_position(state.work_paned_position.max(280));
 
         // 6. Sidebar (Full Height)
         let sidebar = Rc::new(Sidebar::new());
@@ -122,11 +124,12 @@ impl MainWindow {
         let canvas_scale_paned = canvas.clone();
         let prof_scale_paned = profile.clone();
         work_paned.connect_position_notify(move |p| {
-            let pos = p.position();
-            if pos > 100 {
-                canvas_scale_paned.update_scale(pos);
-                canvas_scale_paned.render_profile_page(&prof_scale_paned.borrow());
+            let pos = p.position().max(280);
+            if p.position() < 280 {
+                p.set_position(280);
             }
+            canvas_scale_paned.update_scale(pos);
+            canvas_scale_paned.render_profile_page(&prof_scale_paned.borrow());
             let w = win_pos1.width().max(600);
             let h = win_pos1.height().max(400);
             let s = WindowState {

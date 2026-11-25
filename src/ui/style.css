@@ -433,8 +433,10 @@ window.ballista-modal .boxed-list > row:last-child {
 .store-spotlight-card {
     background-color: #191920;
     border: 1px solid rgba(255, 255, 255, 0.08);
-    border-radius: 12px;
+    border-radius: 0px;
     padding: 0;
+    min-width: 292px;
+    min-height: 105px;
     transition: all 120ms ease;
 }
 
@@ -445,14 +447,16 @@ window.ballista-modal .boxed-list > row:last-child {
 }
 
 .store-spotlight-thumbnail {
-    border-radius: 11px;
+    border-radius: 0px;
     background-color: #141418;
-    min-height: 125px;
+    min-width: 292px;
+    min-height: 105px;
 }
 
 .thumb-banner-fallback {
-    min-height: 125px;
-    border-radius: 11px;
+    border-radius: 0px;
+    min-width: 292px;
+    min-height: 105px;
 }
 
 .thumb-grad-streaming { background: linear-gradient(135deg, #4f46e5 0%, #7c3aed 50%, #db2777 100%); }
@@ -607,7 +611,6 @@ window.ballista-modal .boxed-list > row:last-child {
 .store-screenshot-tile {
     background-color: #191920;
     border: 1px solid rgba(255, 255, 255, 0.08);
-    border-radius: 10px;
-    min-width: 230px;
-    min-height: 135px;
+    border-radius: 0px;
+    min-height: 105px;
 }

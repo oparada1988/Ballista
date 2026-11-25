@@ -190,6 +190,63 @@ impl PluginManager {
         Ok(id.to_string())
     }
 
+    /// Download & Install a plugin directly from a zip archive URL (e.g. GitHub release or main branch)
+    pub fn install_from_url(&mut self, id: &str, download_url: &str) -> Result<String, String> {
+        let dest = self.plugins_dir.join(id);
+        let _ = fs::remove_dir_all(&dest);
+        let _ = fs::create_dir_all(&dest);
+
+        let temp_zip = std::env::temp_dir().join(format!("{id}.zip"));
+        let temp_extract = std::env::temp_dir().join(format!("{id}_extracted"));
+        let _ = fs::remove_file(&temp_zip);
+        let _ = fs::remove_dir_all(&temp_extract);
+
+        let status = std::process::Command::new("curl")
+            .arg("-L")
+            .arg("-s")
+            .arg("-o")
+            .arg(&temp_zip)
+            .arg(download_url)
+            .status()
+            .map_err(|e| format!("Failed to download: {e}"))?;
+
+        if !status.success() {
+            return Err("Failed to download plugin archive".into());
+        }
+
+        let unzip_status = std::process::Command::new("unzip")
+            .arg("-q")
+            .arg("-o")
+            .arg(&temp_zip)
+            .arg("-d")
+            .arg(&temp_extract)
+            .status()
+            .map_err(|e| format!("Failed to unzip: {e}"))?;
+
+        if !unzip_status.success() {
+            return Err("Failed to extract plugin archive".into());
+        }
+
+        // GitHub zips contain an inner folder (e.g. AppLauncher-main)
+        // Find folder containing manifest.json
+        let mut source_folder = temp_extract.clone();
+        if let Ok(entries) = fs::read_dir(&temp_extract) {
+            for entry in entries.flatten() {
+                if entry.path().is_dir() && entry.path().join("manifest.json").exists() {
+                    source_folder = entry.path();
+                    break;
+                }
+            }
+        }
+
+        Self::copy_dir_all(&source_folder, &dest).map_err(|e| format!("Failed to copy plugin: {e}"))?;
+        let _ = fs::remove_file(&temp_zip);
+        let _ = fs::remove_dir_all(&temp_extract);
+
+        self.rescan_plugins();
+        Ok(id.to_string())
+    }
+
     pub fn uninstall_plugin(&mut self, plugin_id: &str) -> Result<(), String> {
         let dest = self.plugins_dir.join(plugin_id);
         if dest.exists() {

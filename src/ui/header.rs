@@ -1,6 +1,5 @@
 use crate::core::ConnectedDevice;
 use adw::HeaderBar;
-use gdk_pixbuf::prelude::*;
 use gtk::prelude::*;
 use gtk::{Box, Button, DropDown, Orientation, StringList};
 
@@ -45,29 +44,15 @@ impl Header {
         let right_box = Box::new(Orientation::Horizontal, 4);
         right_box.set_margin_end(4);
 
-        let store_button = Button::new();
+        if let Some(display) = gtk::gdk::Display::default() {
+            let icon_theme = gtk::IconTheme::for_display(&display);
+            icon_theme.add_search_path("/home/oscar/Github Projects/Ballista/resources/icons");
+            icon_theme.add_search_path("resources/icons");
+        }
+
+        let store_button = Button::from_icon_name("store-badge-symbolic");
         store_button.set_tooltip_text(Some("Plugin Store / Marketplace"));
         store_button.add_css_class("flat");
-
-        // Custom Plugin Store / Marketplace Badge SVG
-        let svg_bytes = include_bytes!("../../resources/icons/store-badge.svg");
-        let loader = gdk_pixbuf::PixbufLoader::with_type("svg");
-        let mut loaded = false;
-        if let Ok(loader) = loader {
-            loader.set_size(48, 48);
-            if loader.write(svg_bytes).is_ok() && loader.close().is_ok() {
-                if let Some(pixbuf) = loader.pixbuf() {
-                    let texture = gtk::gdk::Texture::for_pixbuf(&pixbuf);
-                    let img = gtk::Image::from_paintable(Some(&texture));
-                    img.set_pixel_size(20);
-                    store_button.set_child(Some(&img));
-                    loaded = true;
-                }
-            }
-        }
-        if !loaded {
-            store_button.set_icon_name("software-properties-symbolic");
-        }
 
         let settings_button = Button::from_icon_name("emblem-system-symbolic");
         settings_button.set_tooltip_text(Some("Preferences & Settings"));
