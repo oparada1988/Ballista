@@ -413,12 +413,6 @@ impl Canvas {
             let mut touch_icons = Vec::new();
 
             for slot_idx in 0..dial_count {
-                if slot_idx > 0 {
-                    let sep = Box::new(Orientation::Vertical, 0);
-                    sep.add_css_class("deck-touch-separator");
-                    touch_capsule.append(&sep);
-                }
-
                 let slot_box = Box::new(Orientation::Vertical, 2);
                 slot_box.add_css_class("deck-touch-slot");
                 slot_box.add_css_class(&format!("deck-touch-slot-{}", slot_idx));
@@ -544,7 +538,7 @@ impl Canvas {
 
                 let is_hovered = Rc::new(Cell::new(false));
                 let selected_dial_ref = self.selected_dial_idx.clone();
-                let angle_draw = angle_cell.clone();
+                let _angle_draw = angle_cell.clone();
                 let is_hovered_draw = is_hovered.clone();
                 let d_idx = dial_idx;
 
@@ -554,7 +548,6 @@ impl Canvas {
                     let cx = w / 2.0;
                     let cy = h / 2.0;
                     let r = (w.min(h) / 2.0 - 5.0).max(10.0);
-                    let angle = angle_draw.get();
                     let is_sel = selected_dial_ref.borrow().map_or(false, |sel| sel == d_idx);
                     let is_hov = is_hovered_draw.get();
 
@@ -566,60 +559,29 @@ impl Canvas {
                         let _ = cr.stroke();
                     }
 
-                    // 2. Knob body with metallic radial gradient (simulating ambient lighting from top)
-                    let pat = cairo::RadialGradient::new(cx, cy - r * 0.22, r * 0.08, cx, cy, r);
-                    pat.add_color_stop_rgb(0.0, 0.16, 0.16, 0.22);
-                    pat.add_color_stop_rgb(0.70, 0.11, 0.11, 0.15);
-                    pat.add_color_stop_rgb(1.0, 0.07, 0.07, 0.095);
-                    let _ = cr.set_source(&pat);
+                    // 2. Flat knob body with EXACT same Midnight Dark color as buttons (#191920)
+                    let (fill_r, fill_g, fill_b) = if is_hov && !is_sel {
+                        (0.1294, 0.1294, 0.1725) // #21212c on hover
+                    } else {
+                        (0.0980, 0.0980, 0.1255) // #191920 Midnight Dark
+                    };
+                    cr.set_source_rgb(fill_r, fill_g, fill_b);
                     cr.arc(cx, cy, r, 0.0, 2.0 * std::f64::consts::PI);
                     let _ = cr.fill();
 
-                    // 3. Knob circular border
+                    // 3. Knob circular border matching regular buttons
                     if is_sel {
                         cr.set_source_rgba(0.57, 0.27, 1.0, 0.95); // #9146ff solid rim
-                        cr.set_line_width(2.2);
+                        cr.set_line_width(2.0);
                     } else if is_hov {
-                        cr.set_source_rgba(0.57, 0.27, 1.0, 0.55);
-                        cr.set_line_width(1.8);
+                        cr.set_source_rgba(0.57, 0.27, 1.0, 0.45);
+                        cr.set_line_width(2.0);
                     } else {
-                        cr.set_source_rgba(0.20, 0.20, 0.26, 0.9);
-                        cr.set_line_width(1.5);
+                        cr.set_source_rgba(1.0, 1.0, 1.0, 0.08);
+                        cr.set_line_width(2.0);
                     }
                     cr.arc(cx, cy, r, 0.0, 2.0 * std::f64::consts::PI);
                     let _ = cr.stroke();
-
-                    // 4. Inset shadow groove ring
-                    cr.set_source_rgba(0.0, 0.0, 0.0, 0.5);
-                    cr.set_line_width(1.0);
-                    cr.arc(cx, cy, (r - 2.5).max(1.0), 0.0, 2.0 * std::f64::consts::PI);
-                    let _ = cr.stroke();
-
-                    // 5. Rotated Marker Notch (Exact match to sleek purple marker)
-                    let _ = cr.save();
-                    cr.translate(cx, cy);
-                    cr.rotate(angle);
-
-                    let notch_w = (r * 0.13).clamp(3.0, 4.5);
-                    let y_top = -r * 0.82;
-                    let y_bottom = -r * 0.52;
-
-                    // Neon violet glow around notch
-                    cr.set_source_rgba(0.66, 0.33, 0.97, 0.35);
-                    cr.set_line_cap(cairo::LineCap::Round);
-                    cr.set_line_width(notch_w + 3.0);
-                    cr.move_to(0.0, y_top);
-                    cr.line_to(0.0, y_bottom);
-                    let _ = cr.stroke();
-
-                    // Bright core notch
-                    cr.set_source_rgb(0.72, 0.40, 1.0); // #b866ff
-                    cr.set_line_width(notch_w);
-                    cr.move_to(0.0, y_top);
-                    cr.line_to(0.0, y_bottom);
-                    let _ = cr.stroke();
-
-                    let _ = cr.restore();
                 });
 
                 // Hover Controller
@@ -879,6 +841,17 @@ impl Canvas {
         *self.selected_idx.borrow_mut() = Some(index);
     }
 
+    pub fn set_key_pressed(&self, index: usize, is_pressed: bool) {
+        let keys = self.key_buttons.borrow();
+        if let Some(btn) = keys.get(index) {
+            if is_pressed {
+                btn.add_css_class("pressed");
+            } else {
+                btn.remove_css_class("pressed");
+            }
+        }
+    }
+
     /// Highlights Dial `dial_idx` and its designated Touch Card directly above it together
     pub fn select_dial_and_touch(&self, dial_idx: usize) {
         // Clear key selection
@@ -979,16 +952,17 @@ impl Canvas {
             // 1. Primary LCD Keys
             for (idx, _btn) in keys.iter().enumerate() {
                 if let Some(action) = page.keys.get(&idx) {
-                    let display_title = if !action.appearance.show_title || action.appearance.title.is_empty() {
+                    let app = action.active_appearance();
+                    let display_title = if !app.show_title || app.title.is_empty() {
                         ""
                     } else {
-                        &action.appearance.title
+                        &app.title
                     };
 
                     if let Some(label) = labels.get(idx) {
                         label.set_text(display_title);
                         label.set_visible(!display_title.is_empty());
-                        match action.appearance.vertical_align {
+                        match app.vertical_align {
                             TextVerticalAlign::Top => label.set_valign(gtk::Align::Start),
                             TextVerticalAlign::Center => label.set_valign(gtk::Align::Center),
                             TextVerticalAlign::Bottom => label.set_valign(gtk::Align::End),
@@ -1001,10 +975,10 @@ impl Canvas {
 
                     if let Some(icon) = icons.get(idx) {
                         let btn_sz = self.current_btn_size.get() as f64;
-                        let scale_pct = (action.appearance.icon_scale.clamp(20, 100) as f64) / 100.0;
+                        let scale_pct = (app.icon_scale.clamp(20, 100) as f64) / 100.0;
                         let icon_sz = ((btn_sz * scale_pct) as i32).max(12);
 
-                        let icon_path = action.appearance.icon_path.as_deref();
+                        let icon_path = app.icon_path.as_deref();
                         let icon_name = action.parameters.get("icon_name").map(|s| s.as_str())
                             .or_else(|| match action.action_id.as_str() {
                                 "system.hotkey" => Some("input-keyboard-symbolic"),
@@ -1094,10 +1068,10 @@ impl Canvas {
                         }
                     }
 
-                    let bg = action.appearance.bg_color.as_deref().unwrap_or("#191920");
-                    let fg = &action.appearance.text_color;
-                    let font = &action.appearance.font_family;
-                    let size = action.appearance.font_size;
+                    let bg = app.bg_color.as_deref().unwrap_or("#191920");
+                    let fg = &app.text_color;
+                    let font = &app.font_family;
+                    let size = app.font_size;
                     css.push_str(&format!(
                         "button.deck-key.deck-key-slot-{} {{ background-color: {}; background-image: none; }}\n\
                          button.deck-key.deck-key-slot-{} label {{ color: {}; font-family: '{}'; font-size: {}pt; font-weight: bold; }}\n",
@@ -1124,14 +1098,15 @@ impl Canvas {
             let touch_segs = self.touch_segments.borrow();
 
             let has_panoramic = page.touchscreen_action.as_ref().map_or(false, |act| {
-                !act.appearance.title.is_empty()
-                    || act.appearance.bg_color.is_some()
-                    || act.appearance.icon_path.is_some()
+                let app = act.active_appearance();
+                !app.title.is_empty()
+                    || app.bg_color.is_some()
+                    || app.icon_path.is_some()
             });
 
             // Update Touch Strip Wallpaper if configured
             if let Some(ref pic) = *self.touch_wallpaper_pic.borrow() {
-                let wallpaper_path = page.touchscreen_action.as_ref().and_then(|a| a.appearance.icon_path.as_deref());
+                let wallpaper_path = page.touchscreen_action.as_ref().and_then(|a| a.active_appearance().icon_path.as_deref());
                 if let Some(path) = wallpaper_path {
                     if std::path::Path::new(path).exists() {
                         let (_rows, cols) = self.current_kind.borrow().grid_dimensions();
@@ -1162,14 +1137,15 @@ impl Canvas {
 
             if has_panoramic {
                 if let Some(ref act) = page.touchscreen_action {
-                    let bg = act.appearance.bg_color.as_deref().unwrap_or("transparent");
+                    let app = act.active_appearance();
+                    let bg = app.bg_color.as_deref().unwrap_or("transparent");
                     css.push_str(&format!(
                         ".deck-touchscreen-capsule {{ background-color: {}; }}\n",
                         bg
                     ));
                     if let Some(label) = touch_labels.first() {
-                        label.set_text(&act.appearance.title);
-                        label.set_visible(!act.appearance.title.is_empty());
+                        label.set_text(&app.title);
+                        label.set_visible(!app.title.is_empty());
                     }
                     for label in touch_labels.iter().skip(1) {
                         label.set_text("");
@@ -1182,16 +1158,17 @@ impl Canvas {
             } else {
                 for (idx, _seg) in touch_segs.iter().enumerate() {
                     if let Some(action) = page.dial_actions.get(&idx) {
-                        let display_title = if !action.appearance.show_title || action.appearance.title.is_empty() {
+                        let app = action.active_appearance();
+                        let display_title = if !app.show_title || app.title.is_empty() {
                             ""
                         } else {
-                            &action.appearance.title
+                            &app.title
                         };
 
                         if let Some(label) = touch_labels.get(idx) {
                             label.set_text(display_title);
                             label.set_visible(!display_title.is_empty());
-                            match action.appearance.vertical_align {
+                            match app.vertical_align {
                                 TextVerticalAlign::Top => label.set_valign(gtk::Align::Start),
                                 TextVerticalAlign::Center => label.set_valign(gtk::Align::Center),
                                 TextVerticalAlign::Bottom => label.set_valign(gtk::Align::End),
@@ -1199,11 +1176,11 @@ impl Canvas {
                         }
 
                         if let Some(icon) = touch_icons.get(idx) {
-                            let scale_pct = (action.appearance.icon_scale.clamp(20, 100) as f64) / 100.0;
+                            let scale_pct = (app.icon_scale.clamp(20, 100) as f64) / 100.0;
                             let base_sz = if display_title.is_empty() { 36.0 } else { 22.0 };
                             let icon_sz = ((base_sz * scale_pct) as i32).max(10);
 
-                            let icon_path = action.appearance.icon_path.as_deref();
+                            let icon_path = app.icon_path.as_deref();
                             let icon_name = action.parameters.get("icon_name").map(|s| s.as_str())
                                 .or_else(|| match action.action_id.as_str() {
                                     "system.hotkey" => Some("input-keyboard-symbolic"),
@@ -1222,10 +1199,10 @@ impl Canvas {
                             }
                         }
 
-                        let bg = action.appearance.bg_color.as_deref().unwrap_or("transparent");
-                        let fg = &action.appearance.text_color;
-                        let font = &action.appearance.font_family;
-                        let size = action.appearance.font_size;
+                        let bg = app.bg_color.as_deref().unwrap_or("transparent");
+                        let fg = &app.text_color;
+                        let font = &app.font_family;
+                        let size = app.font_size;
                         css.push_str(&format!(
                             ".deck-touch-slot.deck-touch-slot-{} {{ background-color: {}; }}\n\
                              .deck-touch-slot.deck-touch-slot-{} label {{ color: {}; font-family: '{}'; font-size: {}pt; font-weight: bold; }}\n",

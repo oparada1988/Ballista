@@ -5,7 +5,7 @@ use super::settings::create_settings_window;
 use super::sidebar::Sidebar;
 use super::store::create_store_window;
 use crate::core::{ConnectedDevice, HardwareEvent, HardwareManager, PluginManager};
-use crate::models::{DeviceKind, KeyAction, Profile, TextVerticalAlign, WindowState};
+use crate::models::{DeviceKind, KeyAction, KeyAppearance, Profile, TextVerticalAlign, WindowState};
 use adw::prelude::*;
 use adw::{ApplicationWindow, ToolbarView};
 use gtk::gdk::RGBA;
@@ -96,6 +96,10 @@ impl MainWindow {
 
         // 5. Property Inspector in Scrollable Container
         let inspector = Rc::new(PropertyInspector::new());
+        let win_plugin_settings = window.clone();
+        *inspector.on_open_plugin_settings.borrow_mut() = Some(std::boxed::Box::new(move |pid, pname| {
+            super::plugin_settings::open_plugin_settings_dialog(&win_plugin_settings, &pid, &pname);
+        }));
         let insp_scroll = gtk::ScrolledWindow::new();
         insp_scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
         insp_scroll.set_child(Some(&inspector.container));
@@ -179,9 +183,21 @@ impl MainWindow {
         toolbar_view.set_content(Some(&paned));
         window.set_content(Some(&toolbar_view));
 
-        // Populate Installed Apps into Inspector
+        // Populate Installed Apps and Plugin Manager into Inspector
+        *inspector.plugin_manager.borrow_mut() = Some(plugin_manager.borrow().clone());
         let apps = plugin_manager.borrow().installed_apps.clone();
         inspector.populate_installed_apps(&apps);
+
+        let prof_param = profile.clone();
+        let insp_param = inspector.clone();
+        *inspector.on_parameter_changed.borrow_mut() = Some(std::boxed::Box::new(move |key, val| {
+            let target = *insp_param.current_target.borrow();
+            let mut prof = prof_param.borrow_mut();
+            if let Some(page) = prof.current_page_mut() {
+                let action = get_target_mut(page, target);
+                action.parameters.insert(key, val);
+            }
+        }));
 
         // Initial Canvas Render & Physical Hardware Sync
         canvas.update_scale(state.work_paned_position);
@@ -221,22 +237,38 @@ impl MainWindow {
                     HardwareEvent::KeyDown { key_index } => {
                         tracing::info!("Physical Stream Deck Key Down: key {}", key_index);
                         canvas_hw.select_key(key_index);
+                        canvas_hw.set_key_pressed(key_index, true);
                         *inspector_hw.current_key_idx.borrow_mut() = Some(key_index);
 
+                        let mut toggled = false;
+                        {
+                            let mut prof = profile_hw.borrow_mut();
+                            if let Some(page) = prof.current_page_mut() {
+                                if let Some(action) = page.keys.get_mut(&key_index) {
+                                    if action.states.len() > 1 {
+                                        action.toggle_state();
+                                        toggled = true;
+                                    }
+                                    if let Some(desktop_id) = action.parameters.get("desktop_id") {
+                                        let _ = pm_hw.borrow().launch_app_desktop(desktop_id);
+                                    }
+                                }
+                            }
+                        }
+
                         let prof = profile_hw.borrow();
+                        if toggled {
+                            canvas_hw.render_profile_page(&prof);
+                            Self::sync_hardware(&devs_hw, *act_hw.borrow(), &hwm_hw, &prof);
+                        }
                         if let Some(page) = prof.current_page() {
                             let act = page.keys.get(&key_index);
                             inspector_hw.set_key_action(act);
-
-                            if let Some(action) = act {
-                                if let Some(desktop_id) = action.parameters.get("desktop_id") {
-                                    let _ = pm_hw.borrow().launch_app_desktop(desktop_id);
-                                }
-                            }
                         }
                     }
                     HardwareEvent::KeyUp { key_index } => {
                         tracing::info!("Physical Stream Deck Key Up: key {}", key_index);
+                        canvas_hw.set_key_pressed(key_index, false);
                     }
                     HardwareEvent::DialRotate { dial_index, delta } => {
                         tracing::info!("Physical Stream Deck Dial Rotate: dial {}, delta {}", dial_index, delta);
@@ -486,6 +518,7 @@ impl MainWindow {
                 let d_ref = devs_cb.clone();
                 let a_ref = act_cb.clone();
 
+                *insp_cb.plugin_manager.borrow_mut() = Some(pm_ref.clone());
                 sb_cb.populate_from_plugins(&pm_ref, move |sel| {
                     let cur_key = can_ref.selected_idx.borrow().unwrap_or(0);
                     {
@@ -585,11 +618,11 @@ impl MainWindow {
             }
             let target = *insp_target_title.borrow();
             let text = entry.text().to_string();
+            let st = insp_ui_title.selected_state_idx.get();
             {
                 let mut prof = prof_title.borrow_mut();
                 if let Some(page) = prof.current_page_mut() {
-                    let action = get_target_mut(page, target);
-                    action.appearance.title = text.clone();
+                    mutate_target_appearance(page, target, st, |app| app.title = text.clone());
                 }
             }
             insp_ui_title.preview_inner_label.set_text(&text);
@@ -612,13 +645,15 @@ impl MainWindow {
 
         inspector.title_toggle_btn.connect_clicked(move |btn| {
             let target = *insp_title_toggle.current_target.borrow();
+            let st = insp_title_toggle.selected_state_idx.get();
             let mut is_shown = true;
             {
                 let mut prof = prof_title_toggle.borrow_mut();
                 if let Some(page) = prof.current_page_mut() {
-                    let action = get_target_mut(page, target);
-                    action.appearance.show_title = !action.appearance.show_title;
-                    is_shown = action.appearance.show_title;
+                    mutate_target_appearance(page, target, st, |app| {
+                        app.show_title = !app.show_title;
+                        is_shown = app.show_title;
+                    });
                 }
             }
             btn.set_icon_name(if is_shown { "view-reveal-symbolic" } else { "view-conceal-symbolic" });
@@ -649,15 +684,17 @@ impl MainWindow {
                 return;
             }
             let target = *insp_font.current_target.borrow();
+            let st = insp_font.selected_state_idx.get();
             if let Some(desc) = fdb.font_desc() {
                 let fam = desc.family().map(|s| s.to_string()).unwrap_or_else(|| "Cantarell".into());
                 let sz = (desc.size() / pango::SCALE).max(6) as u32;
                 {
                     let mut prof = prof_font.borrow_mut();
                     if let Some(page) = prof.current_page_mut() {
-                        let action = get_target_mut(page, target);
-                        action.appearance.font_family = fam;
-                        action.appearance.font_size = sz;
+                        mutate_target_appearance(page, target, st, |app| {
+                            app.font_family = fam;
+                            app.font_size = sz;
+                        });
                     }
                 }
                 insp_font.is_updating.set(true);
@@ -684,12 +721,12 @@ impl MainWindow {
                 return;
             }
             let target = *insp_spin.current_target.borrow();
+            let st = insp_spin.selected_state_idx.get();
             let sz = spin.value() as u32;
             {
                 let mut prof = prof_spin.borrow_mut();
                 if let Some(page) = prof.current_page_mut() {
-                    let action = get_target_mut(page, target);
-                    action.appearance.font_size = sz;
+                    mutate_target_appearance(page, target, st, |app| app.font_size = sz);
                 }
             }
             let prof = prof_spin.borrow();
@@ -706,18 +743,19 @@ impl MainWindow {
         let devs_bg = connected_devices.clone();
         let act_bg = active_device_idx.clone();
         let insp_updating_bg = inspector.is_updating.clone();
+        let insp_bg_state = inspector.clone();
 
         inspector.btn_color_picker.connect_rgba_notify(move |cp| {
             if insp_updating_bg.get() {
                 return;
             }
             let target = *insp_target_bg.borrow();
+            let st = insp_bg_state.selected_state_idx.get();
             let hex = rgba_to_hex(&cp.rgba());
             {
                 let mut prof = prof_bg.borrow_mut();
                 if let Some(page) = prof.current_page_mut() {
-                    let action = get_target_mut(page, target);
-                    action.appearance.bg_color = Some(hex);
+                    mutate_target_appearance(page, target, st, |app| app.bg_color = Some(hex));
                 }
             }
             let prof = prof_bg.borrow();
@@ -736,11 +774,11 @@ impl MainWindow {
 
         inspector.btn_color_reset.connect_clicked(move |_| {
             let target = *insp_bg_rst.current_target.borrow();
+            let st = insp_bg_rst.selected_state_idx.get();
             {
                 let mut prof = prof_bg_rst.borrow_mut();
                 if let Some(page) = prof.current_page_mut() {
-                    let action = get_target_mut(page, target);
-                    action.appearance.bg_color = None;
+                    mutate_target_appearance(page, target, st, |app| app.bg_color = None);
                 }
             }
             insp_bg_rst.is_updating.set(true);
@@ -761,18 +799,19 @@ impl MainWindow {
         let devs_fg = connected_devices.clone();
         let act_fg = active_device_idx.clone();
         let insp_updating_fg = inspector.is_updating.clone();
+        let insp_fg_state = inspector.clone();
 
         inspector.text_color_picker.connect_rgba_notify(move |cp| {
             if insp_updating_fg.get() {
                 return;
             }
             let target = *insp_target_fg.borrow();
+            let st = insp_fg_state.selected_state_idx.get();
             let hex = rgba_to_hex(&cp.rgba());
             {
                 let mut prof = prof_fg.borrow_mut();
                 if let Some(page) = prof.current_page_mut() {
-                    let action = get_target_mut(page, target);
-                    action.appearance.text_color = hex;
+                    mutate_target_appearance(page, target, st, |app| app.text_color = hex);
                 }
             }
             let prof = prof_fg.borrow();
@@ -828,11 +867,11 @@ impl MainWindow {
                     if let Some(path) = file.path() {
                         let raw_str = path.to_string_lossy().to_string();
                         let path_str = resolve_possible_ellipsis_path(&raw_str);
+                        let st = insp_c.selected_state_idx.get();
                         {
                             let mut p = prof_c.borrow_mut();
                             if let Some(page) = p.current_page_mut() {
-                                let action = get_target_mut(page, target);
-                                action.appearance.icon_path = Some(path_str.clone());
+                                mutate_target_appearance(page, target, st, |app| app.icon_path = Some(path_str.clone()));
                             }
                         }
                         insp_c.mark_assigned();
@@ -861,11 +900,11 @@ impl MainWindow {
 
         inspector.clear_icon_btn.connect_clicked(move |_| {
             let target = *insp_rst_icon.current_target.borrow();
+            let st = insp_rst_icon.selected_state_idx.get();
             {
                 let mut p = prof_rst_icon.borrow_mut();
                 if let Some(page) = p.current_page_mut() {
-                    let action = get_target_mut(page, target);
-                    action.appearance.icon_path = None;
+                    mutate_target_appearance(page, target, st, |app| app.icon_path = None);
                 }
             }
             insp_rst_icon.preview_icon.set_visible(false);
@@ -888,12 +927,12 @@ impl MainWindow {
                 return;
             }
             let target = *insp_scale.current_target.borrow();
+            let st = insp_scale.selected_state_idx.get();
             let val = spin.value() as u32;
             {
                 let mut prof = prof_scale.borrow_mut();
                 if let Some(page) = prof.current_page_mut() {
-                    let action = get_target_mut(page, target);
-                    action.appearance.icon_scale = val;
+                    mutate_target_appearance(page, target, st, |app| app.icon_scale = val);
                 }
             }
 
@@ -921,11 +960,11 @@ impl MainWindow {
                            act: Rc<RefCell<usize>>| {
             btn.connect_clicked(move |_| {
                 let target = *target_ref.borrow();
+                let st = insp.selected_state_idx.get();
                 {
                     let mut p = prof.borrow_mut();
                     if let Some(page) = p.current_page_mut() {
-                        let action = get_target_mut(page, target);
-                        action.appearance.vertical_align = pos;
+                        mutate_target_appearance(page, target, st, |app| app.vertical_align = pos);
                     }
                 }
                 let p = prof.borrow();
@@ -957,6 +996,57 @@ impl MainWindow {
         connect_pos(&inspector.pos_mid_btn, TextVerticalAlign::Center, profile.clone(), canvas.clone(), inspector.current_target.clone(), inspector.clone(), hardware_manager.clone(), connected_devices.clone(), active_device_idx.clone());
         connect_pos(&inspector.pos_bot_btn, TextVerticalAlign::Bottom, profile.clone(), canvas.clone(), inspector.current_target.clone(), inspector.clone(), hardware_manager.clone(), connected_devices.clone(), active_device_idx.clone());
 
+        // 10. Multi-State Selector Radio Buttons (State 0 / State 1)
+        let prof_state = profile.clone();
+        let canvas_state = canvas.clone();
+        let insp_state = inspector.clone();
+        let hw_state = hardware_manager.clone();
+        let devs_state = connected_devices.clone();
+        let act_state = active_device_idx.clone();
+
+        let handle_state_toggle = move |target_state: usize| {
+            if insp_state.is_updating.get() {
+                return;
+            }
+            let target = *insp_state.current_target.borrow();
+            insp_state.selected_state_idx.set(target_state);
+
+            {
+                let mut prof = prof_state.borrow_mut();
+                if let Some(page) = prof.current_page_mut() {
+                    let action = get_target_mut(page, target);
+                    action.set_active_state(target_state);
+                }
+            }
+
+            let prof = prof_state.borrow();
+            canvas_state.render_profile_page(&prof);
+            if let Some(page) = prof.current_page() {
+                let act = match target {
+                    InspectorTarget::Key(k) => page.keys.get(&k),
+                    InspectorTarget::Dial(d) => page.dial_actions.get(&d),
+                    InspectorTarget::Touchscreen => page.touchscreen_action.as_ref(),
+                };
+                insp_state.set_key_action(act);
+            }
+            drop(prof);
+            Self::sync_hardware(&devs_state, *act_state.borrow(), &hw_state, &prof_state.borrow());
+        };
+
+        let h0 = handle_state_toggle.clone();
+        inspector.radio_state_0.connect_toggled(move |btn| {
+            if btn.is_active() {
+                h0(0);
+            }
+        });
+
+        let h1 = handle_state_toggle;
+        inspector.radio_state_1.connect_toggled(move |btn| {
+            if btn.is_active() {
+                h1(1);
+            }
+        });
+
         // App Dropdown Selection
         let prof_app_dd = profile.clone();
         let canvas_app_dd = canvas.clone();
@@ -966,8 +1056,28 @@ impl MainWindow {
         let act_app = active_device_idx.clone();
 
         inspector.app_dropdown.connect_selected_notify(move |dd| {
+            if insp_app_dd.is_updating.get() {
+                return;
+            }
             let sel_idx = dd.selected() as usize;
             let target = *insp_app_dd.current_target.borrow();
+
+            // Guard: Only update if the target action is explicitly an App Launcher action!
+            {
+                let prof = prof_app_dd.borrow();
+                let current_act = match target {
+                    InspectorTarget::Key(k) => prof.current_page().and_then(|p| p.keys.get(&k)),
+                    InspectorTarget::Dial(d) => prof.current_page().and_then(|p| p.dial_actions.get(&d)),
+                    InspectorTarget::Touchscreen => prof.current_page().and_then(|p| p.touchscreen_action.as_ref()),
+                };
+                let is_app_launcher = current_act.map_or(false, |a| {
+                    a.action_id.contains("AppLauncher") || a.action_id == "app_launcher.launch"
+                });
+                if !is_app_launcher {
+                    return;
+                }
+            }
+
             let apps = insp_app_dd.installed_apps.borrow();
             if let Some(app) = apps.get(sel_idx) {
                 let mut needs_title_update = false;
@@ -1056,11 +1166,20 @@ impl MainWindow {
         let hw_sidebar = hardware_manager.clone();
         let devs_sidebar = connected_devices.clone();
         let act_sidebar = active_device_idx.clone();
+        let pm_sidebar = plugin_manager.clone();
 
         sidebar.populate_from_plugins(&plugin_manager.borrow(), move |sel| {
             let target = *insp_sidebar.current_target.borrow();
+            let action_stem = sel.action_id.split("::").last().unwrap_or(&sel.action_id);
+            let states = pm_sidebar.borrow().resolve_action_states(&sel.plugin_id, action_stem);
             let mut action = KeyAction::new(&sel.plugin_id, &sel.plugin_name, &sel.action_id, &sel.action_name);
-            action.appearance.title = sel.action_name.clone();
+            if !states.is_empty() {
+                action.appearance = states[0].clone();
+                action.states = states;
+                action.current_state = 0;
+            } else {
+                action.appearance.title = sel.action_name.clone();
+            }
             if !sel.icon_name.is_empty() {
                 action.parameters.insert("icon_name".into(), sel.icon_name.clone());
             }
@@ -1102,10 +1221,19 @@ impl MainWindow {
         let hw_drop = hardware_manager.clone();
         let devs_drop = connected_devices.clone();
         let act_drop = active_device_idx.clone();
+        let pm_drop = plugin_manager.clone();
 
         canvas.set_action_dropped_callback(move |target, sel| {
+            let action_stem = sel.action_id.split("::").last().unwrap_or(&sel.action_id);
+            let states = pm_drop.borrow().resolve_action_states(&sel.plugin_id, action_stem);
             let mut action = KeyAction::new(&sel.plugin_id, &sel.plugin_name, &sel.action_id, &sel.action_name);
-            action.appearance.title = sel.action_name.clone();
+            if !states.is_empty() {
+                action.appearance = states[0].clone();
+                action.states = states;
+                action.current_state = 0;
+            } else {
+                action.appearance.title = sel.action_name.clone();
+            }
             if !sel.icon_name.is_empty() {
                 action.parameters.insert("icon_name".into(), sel.icon_name.clone());
             }
@@ -1184,20 +1312,48 @@ impl MainWindow {
         inspector: &Rc<PropertyInspector>,
         profile: &Rc<RefCell<Profile>>,
         _plugin_manager: &Rc<RefCell<PluginManager>>,
-        _devices: &Rc<RefCell<Vec<ConnectedDevice>>>,
-        _active_device_idx: &Rc<RefCell<usize>>,
-        _hw: &Rc<RefCell<HardwareManager>>,
+        devices: &Rc<RefCell<Vec<ConnectedDevice>>>,
+        active_device_idx: &Rc<RefCell<usize>>,
+        hw: &Rc<RefCell<HardwareManager>>,
     ) {
         let keys = canvas.key_buttons.borrow();
         for (idx, btn) in keys.iter().enumerate() {
             let can_ref = canvas.clone();
             let insp_ref = inspector.clone();
             let prof_ref = profile.clone();
+            let devs_ref = devices.clone();
+            let act_dev_ref = active_device_idx.clone();
+            let hw_ref = hw.clone();
 
             btn.connect_clicked(move |_| {
+                can_ref.set_key_pressed(idx, true);
+                let can_timeout = can_ref.clone();
+                glib::timeout_add_local_once(std::time::Duration::from_millis(130), move || {
+                    can_timeout.set_key_pressed(idx, false);
+                });
+
+                let prev_target = *insp_ref.current_target.borrow();
                 can_ref.select_key(idx);
                 insp_ref.set_target(InspectorTarget::Key(idx));
+
+                let mut toggled = false;
+                if prev_target == InspectorTarget::Key(idx) {
+                    let mut prof = prof_ref.borrow_mut();
+                    if let Some(page) = prof.current_page_mut() {
+                        if let Some(act) = page.keys.get_mut(&idx) {
+                            if act.states.len() > 1 {
+                                act.toggle_state();
+                                toggled = true;
+                            }
+                        }
+                    }
+                }
+
                 let prof = prof_ref.borrow();
+                if toggled {
+                    can_ref.render_profile_page(&prof);
+                    Self::sync_hardware(&devs_ref, *act_dev_ref.borrow(), &hw_ref, &prof);
+                }
                 if let Some(page) = prof.current_page() {
                     let act = page.keys.get(&idx);
                     insp_ref.set_key_action(act);
@@ -1237,9 +1393,9 @@ impl MainWindow {
             let swipe_gesture = gtk::GestureSwipe::new();
             let prof_swipe = profile.clone();
             let can_swipe = canvas.clone();
-            let hw_swipe = _hw.clone();
-            let devs_swipe = _devices.clone();
-            let act_swipe = _active_device_idx.clone();
+            let hw_swipe = hw.clone();
+            let devs_swipe = devices.clone();
+            let act_swipe = active_device_idx.clone();
             swipe_gesture.connect_swipe(move |_g, vx, _vy| {
                 let is_swipe_active = {
                     let p = prof_swipe.borrow();
@@ -1286,6 +1442,16 @@ fn get_target_mut(page: &mut crate::models::Page, target: InspectorTarget) -> &m
         InspectorTarget::Dial(d) => page.get_or_create_dial(d),
         InspectorTarget::Touchscreen => page.get_or_create_touchscreen(),
     }
+}
+
+fn mutate_target_appearance<F>(page: &mut crate::models::Page, target: InspectorTarget, state_idx: usize, f: F)
+where
+    F: FnOnce(&mut KeyAppearance),
+{
+    let action = get_target_mut(page, target);
+    let app = action.state_appearance_mut(state_idx);
+    f(app);
+    action.appearance = action.active_appearance().clone();
 }
 
 pub fn resolve_possible_ellipsis_path(path_str: &str) -> String {

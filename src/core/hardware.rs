@@ -430,22 +430,24 @@ impl HardwareManager {
         if let Some(page) = profile.current_page() {
             // Check if there is an active full panoramic touchscreen action
             let has_panoramic_content = page.touchscreen_action.as_ref().map_or(false, |act| {
-                !act.appearance.title.is_empty()
-                    || act.appearance.bg_color.is_some()
-                    || act.appearance.icon_path.is_some()
+                let app = act.active_appearance();
+                !app.title.is_empty()
+                    || app.bg_color.is_some()
+                    || app.icon_path.is_some()
                     || (act.action_id != "custom" && act.action_id != "touchscreen" && !act.action_name.is_empty())
             });
 
             if has_panoramic_content {
                 if let Some(ref action) = page.touchscreen_action {
-                    let title = if !action.appearance.show_title || action.appearance.title.is_empty() {
+                    let app = action.active_appearance();
+                    let title = if !app.show_title || app.title.is_empty() {
                         ""
                     } else {
-                        &action.appearance.title
+                        &app.title
                     };
 
                     // Only fill background if user explicitly chose a background color
-                    if let Some(ref bg_hex) = action.appearance.bg_color {
+                    if let Some(ref bg_hex) = app.bg_color {
                         if let Some((bg_r, bg_g, bg_b)) = parse_hex_color(bg_hex) {
                             cr.set_source_rgb(bg_r, bg_g, bg_b);
                             cr.rectangle(0.0, 0.0, 800.0, 100.0);
@@ -454,9 +456,9 @@ impl HardwareManager {
                     }
 
                     // Render Touch Strip Wallpaper
-                    if let Some(ref icon_path) = action.appearance.icon_path {
+                    if let Some(ref icon_path) = app.icon_path {
                         if Path::new(icon_path).exists() {
-                            let scale_pct = (action.appearance.icon_scale.clamp(20, 100) as f64) / 100.0;
+                            let scale_pct = (app.icon_scale.clamp(20, 100) as f64) / 100.0;
                             let target_w = (800.0 * scale_pct) as i32;
                             let target_h = (100.0 * scale_pct) as i32;
                             if let Ok(pixbuf) = gdk_pixbuf::Pixbuf::from_file_at_scale(icon_path, target_w, target_h, false) {
@@ -473,7 +475,7 @@ impl HardwareManager {
                     if !title.is_empty() {
                         let layout = pc::create_layout(&cr);
                         let mut font_desc = pango::FontDescription::new();
-                        font_desc.set_family(&action.appearance.font_family);
+                        font_desc.set_family(&app.font_family);
                         font_desc.set_size(15 * pango::SCALE);
                         font_desc.set_weight(pango::Weight::Bold);
                         layout.set_font_description(Some(&font_desc));
@@ -481,7 +483,7 @@ impl HardwareManager {
                         layout.set_alignment(pango::Alignment::Center);
                         layout.set_width(800 * pango::SCALE);
 
-                        let (fg_r, fg_g, fg_b) = parse_hex_color(&action.appearance.text_color).unwrap_or((1.0, 1.0, 1.0));
+                        let (fg_r, fg_g, fg_b) = parse_hex_color(&app.text_color).unwrap_or((1.0, 1.0, 1.0));
                         cr.set_source_rgb(fg_r, fg_g, fg_b);
                         cr.move_to(0.0, 36.0);
                         pc::show_layout(&cr, &layout);
@@ -581,7 +583,7 @@ impl HardwareManager {
         if let Some(page) = profile.current_page() {
             for key in 0..total_keys {
                 let action = page.keys.get(&key);
-                let appearance = action.map(|a| &a.appearance);
+                let appearance = action.map(|a| a.active_appearance());
                 let icon_name = action.and_then(|a| a.parameters.get("icon_name")).map(|s| s.as_str());
                 let is_active = action.is_some();
 
@@ -658,7 +660,7 @@ impl HardwareManager {
 
             let touch_gif_path = profile.current_page()
                 .and_then(|p| p.touchscreen_action.as_ref())
-                .and_then(|a| a.appearance.icon_path.as_deref())
+                .and_then(|a| a.active_appearance().icon_path.as_deref())
                 .filter(|p| p.to_lowercase().ends_with(".gif") && Path::new(p).exists());
 
             if let Some(path) = touch_gif_path {

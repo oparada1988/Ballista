@@ -3,6 +3,7 @@
 pub mod canvas;
 pub mod header;
 pub mod inspector;
+pub mod plugin_settings;
 pub mod settings;
 pub mod sidebar;
 pub mod store;

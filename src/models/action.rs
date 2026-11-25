@@ -61,6 +61,10 @@ pub struct KeyAction {
     pub action_id: String,
     pub action_name: String,
     pub appearance: KeyAppearance,
+    #[serde(default)]
+    pub states: Vec<KeyAppearance>,
+    #[serde(default)]
+    pub current_state: usize,
     pub parameters: HashMap<String, String>,
 }
 
@@ -71,14 +75,63 @@ impl KeyAction {
         action_id: impl Into<String>,
         action_name: impl Into<String>,
     ) -> Self {
+        let appearance = KeyAppearance::default();
         Self {
             uuid: glib::uuid_string_random().to_string(),
             plugin_id: plugin_id.into(),
             plugin_name: plugin_name.into(),
             action_id: action_id.into(),
             action_name: action_name.into(),
-            appearance: KeyAppearance::default(),
+            states: vec![appearance.clone()],
+            current_state: 0,
+            appearance,
             parameters: HashMap::new(),
+        }
+    }
+
+    pub fn active_appearance(&self) -> &KeyAppearance {
+        if !self.states.is_empty() {
+            let idx = self.current_state.min(self.states.len() - 1);
+            &self.states[idx]
+        } else {
+            &self.appearance
+        }
+    }
+
+    pub fn active_appearance_mut(&mut self) -> &mut KeyAppearance {
+        if self.states.is_empty() {
+            self.states.push(self.appearance.clone());
+        }
+        let idx = self.current_state.min(self.states.len() - 1);
+        &mut self.states[idx]
+    }
+
+    pub fn state_appearance(&self, state_idx: usize) -> Option<&KeyAppearance> {
+        self.states.get(state_idx).or(Some(&self.appearance))
+    }
+
+    pub fn state_appearance_mut(&mut self, state_idx: usize) -> &mut KeyAppearance {
+        if self.states.is_empty() {
+            self.states.push(self.appearance.clone());
+        }
+        while self.states.len() <= state_idx {
+            self.states.push(self.states.last().cloned().unwrap_or_default());
+        }
+        &mut self.states[state_idx]
+    }
+
+    pub fn toggle_state(&mut self) -> usize {
+        if self.states.len() > 1 {
+            self.current_state = (self.current_state + 1) % self.states.len();
+            self.appearance = self.states[self.current_state].clone();
+        }
+        self.current_state
+    }
+
+    pub fn set_active_state(&mut self, idx: usize) {
+        if !self.states.is_empty() {
+            self.current_state = idx.min(self.states.len() - 1);
+            self.appearance = self.states[self.current_state].clone();
         }
     }
 }

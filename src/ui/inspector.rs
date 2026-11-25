@@ -1,10 +1,10 @@
-use crate::core::InstalledApp;
+use crate::core::{ActionSettingType, InstalledApp, PluginManager};
 use crate::models::{KeyAction, TextVerticalAlign};
+use adw::prelude::*;
 use gtk::gdk::RGBA;
-use gtk::prelude::*;
 use gtk::{
     Box, Button, CheckButton, ColorDialog, ColorDialogButton, DropDown, Entry, FontDialog,
-    FontDialogButton, Label, Orientation, Overlay, Picture, SpinButton, Stack, StringList,
+    FontDialogButton, Label, Orientation, Overlay, Picture, SpinButton, Stack, StringList, Switch,
 };
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -19,6 +19,7 @@ pub enum InspectorTarget {
 pub struct PropertyInspector {
     pub container: Box,
     pub title_label: Label,
+    pub plugin_settings_button: Button,
     pub delete_button: Button,
     pub stack: Stack,
     pub tab_appearance_btn: Button,
@@ -48,6 +49,11 @@ pub struct PropertyInspector {
     pub scale_caption: Label,
     pub app_row: Box,
     pub args_row: Box,
+    pub empty_action_label: Label,
+    pub action_info_box: Box,
+    pub action_info_name: Label,
+    pub action_info_desc: Label,
+    pub dynamic_settings_box: Box,
     pub swipe_row: Box,
     pub swipe_dropdown: DropDown,
     pub app_dropdown: DropDown,
@@ -56,11 +62,19 @@ pub struct PropertyInspector {
     pub preview_icon: Picture,
     pub left_preview_col: Box,
     pub state_dots_box: Box,
+    pub radio_state_0: CheckButton,
+    pub radio_state_1: CheckButton,
+    pub selected_state_idx: Rc<Cell<usize>>,
     pub is_updating: Rc<Cell<bool>>,
     pub current_target: Rc<RefCell<InspectorTarget>>,
     pub current_key_idx: Rc<RefCell<Option<usize>>>,
     pub installed_apps: Rc<RefCell<Vec<InstalledApp>>>,
     pub active_preview_anim: Rc<RefCell<Option<glib::SourceId>>>,
+    pub current_plugin_id: Rc<RefCell<Option<String>>>,
+    pub current_plugin_name: Rc<RefCell<Option<String>>>,
+    pub on_open_plugin_settings: Rc<RefCell<Option<std::boxed::Box<dyn Fn(String, String)>>>>,
+    pub plugin_manager: Rc<RefCell<Option<PluginManager>>>,
+    pub on_parameter_changed: Rc<RefCell<Option<std::boxed::Box<dyn Fn(String, String)>>>>,
 }
 
 pub fn rgba_to_hex(rgba: &RGBA) -> String {
@@ -96,12 +110,34 @@ impl PropertyInspector {
         title_label.set_hexpand(true);
         title_label.set_xalign(0.0);
 
+        let current_plugin_id: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+        let current_plugin_name: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+        let on_open_plugin_settings: Rc<RefCell<Option<std::boxed::Box<dyn Fn(String, String)>>>> = Rc::new(RefCell::new(None));
+
+        let plugin_settings_button = Button::from_icon_name("preferences-system-symbolic");
+        plugin_settings_button.set_tooltip_text(Some("Plugin Settings"));
+        plugin_settings_button.add_css_class("flat");
+        plugin_settings_button.set_visible(false);
+
+        let cur_pid_btn = current_plugin_id.clone();
+        let cur_pname_btn = current_plugin_name.clone();
+        let on_open_cb_btn = on_open_plugin_settings.clone();
+        plugin_settings_button.connect_clicked(move |_| {
+            if let Some(ref pid) = *cur_pid_btn.borrow() {
+                let pname = cur_pname_btn.borrow().clone().unwrap_or_else(|| "Plugin".into());
+                if let Some(ref cb) = *on_open_cb_btn.borrow() {
+                    cb(pid.clone(), pname);
+                }
+            }
+        });
+
         let delete_button = Button::from_icon_name("user-trash-symbolic");
         delete_button.set_tooltip_text(Some("Clear Key Action"));
         delete_button.add_css_class("flat");
         delete_button.set_sensitive(false);
 
         header_box.append(&title_label);
+        header_box.append(&plugin_settings_button);
         header_box.append(&delete_button);
         container.append(&header_box);
 
@@ -309,8 +345,18 @@ impl PropertyInspector {
         let action_box = Box::new(Orientation::Vertical, 8);
         action_box.set_halign(gtk::Align::Start);
 
-        // Real Target Application Dropdown for AppLauncher
+        let empty_action_label = Label::new(Some("No action assigned to this key.\nDrag and drop an action from the library on the right to configure it."));
+        empty_action_label.set_wrap(true);
+        empty_action_label.set_justify(gtk::Justification::Center);
+        empty_action_label.set_halign(gtk::Align::Center);
+        empty_action_label.set_margin_top(14);
+        empty_action_label.set_margin_bottom(14);
+        empty_action_label.add_css_class("dim-label");
+        action_box.append(&empty_action_label);
+
+        // Target Application Dropdown for AppLauncher
         let app_row = Box::new(Orientation::Horizontal, 10);
+        app_row.set_visible(false);
         let app_caption = Label::new(Some("Application:"));
         app_caption.set_size_request(100, -1);
         app_caption.set_xalign(0.0);
@@ -325,6 +371,7 @@ impl PropertyInspector {
 
         // Parameter 2: Extra Launch arguments
         let args_row = Box::new(Orientation::Horizontal, 10);
+        args_row.set_visible(false);
         let args_caption = Label::new(Some("Arguments:"));
         args_caption.set_size_request(100, -1);
         args_caption.set_xalign(0.0);
@@ -336,6 +383,47 @@ impl PropertyInspector {
         args_row.append(&args_caption);
         args_row.append(&args_entry);
         action_box.append(&args_row);
+
+        // Action info row for actions with no extra settings (unified flat layout matching Appearance)
+        let action_info_box = Box::new(Orientation::Vertical, 10);
+        action_info_box.set_visible(false);
+        action_info_box.set_halign(gtk::Align::Start);
+
+        let info_name_row = Box::new(Orientation::Horizontal, 10);
+        let info_name_caption = Label::new(Some("Action:"));
+        info_name_caption.set_size_request(100, -1);
+        info_name_caption.set_xalign(0.0);
+
+        let action_info_name = Label::new(None);
+        action_info_name.set_xalign(0.0);
+        action_info_name.add_css_class("heading");
+
+        info_name_row.append(&info_name_caption);
+        info_name_row.append(&action_info_name);
+        action_info_box.append(&info_name_row);
+
+        let info_desc_row = Box::new(Orientation::Horizontal, 10);
+        let info_desc_caption = Label::new(Some("Description:"));
+        info_desc_caption.set_size_request(100, -1);
+        info_desc_caption.set_xalign(0.0);
+
+        let action_info_desc = Label::new(None);
+        action_info_desc.set_xalign(0.0);
+        action_info_desc.add_css_class("dim-label");
+
+        info_desc_row.append(&info_desc_caption);
+        info_desc_row.append(&action_info_desc);
+        action_info_box.append(&info_desc_row);
+
+        action_box.append(&action_info_box);
+
+        // Dynamic Action Settings Container (unified flat layout matching Appearance)
+        let dynamic_settings_box = Box::new(Orientation::Vertical, 10);
+        dynamic_settings_box.set_visible(false);
+        dynamic_settings_box.set_halign(gtk::Align::Start);
+        action_box.append(&dynamic_settings_box);
+
+        let on_parameter_changed: Rc<RefCell<Option<std::boxed::Box<dyn Fn(String, String)>>>> = Rc::new(RefCell::new(None));
 
         // Parameter 3: Touch Strip Swipe Setting (Official Stream Deck + model)
         let swipe_row = Box::new(Orientation::Vertical, 6);
@@ -391,6 +479,7 @@ impl PropertyInspector {
         Self {
             container,
             title_label,
+            plugin_settings_button,
             delete_button,
             stack,
             tab_appearance_btn,
@@ -420,6 +509,11 @@ impl PropertyInspector {
             scale_caption,
             app_row,
             args_row,
+            empty_action_label,
+            action_info_box,
+            action_info_name,
+            action_info_desc,
+            dynamic_settings_box,
             swipe_row,
             swipe_dropdown,
             app_dropdown,
@@ -428,11 +522,19 @@ impl PropertyInspector {
             preview_icon,
             left_preview_col,
             state_dots_box,
+            radio_state_0,
+            radio_state_1,
+            selected_state_idx: Rc::new(Cell::new(0)),
             is_updating: Rc::new(Cell::new(false)),
             current_target: Rc::new(RefCell::new(InspectorTarget::Key(0))),
             current_key_idx: Rc::new(RefCell::new(Some(0))),
             installed_apps: Rc::new(RefCell::new(Vec::new())),
             active_preview_anim: Rc::new(RefCell::new(None)),
+            current_plugin_id,
+            current_plugin_name,
+            on_open_plugin_settings,
+            plugin_manager: Rc::new(RefCell::new(None)),
+            on_parameter_changed,
         }
     }
 
@@ -457,10 +559,8 @@ impl PropertyInspector {
                 self.clear_icon_btn.set_label("Remove Icon");
                 self.scale_row.set_visible(true);
                 self.scale_caption.set_text("Icon Scale:");
-                self.app_row.set_visible(true);
-                self.args_row.set_visible(true);
                 self.swipe_row.set_visible(false);
-                self.state_dots_box.set_visible(true);
+                self.state_dots_box.set_visible(false);
                 self.preview_inner_label.set_visible(true);
                 self.preview_tile.set_size_request(80, 80);
             }
@@ -482,8 +582,6 @@ impl PropertyInspector {
                 self.clear_icon_btn.set_label("Remove Icon");
                 self.scale_row.set_visible(true);
                 self.scale_caption.set_text("Card Icon Scale:");
-                self.app_row.set_visible(true);
-                self.args_row.set_visible(true);
                 self.swipe_row.set_visible(false);
                 self.state_dots_box.set_visible(false);
                 self.preview_inner_label.set_visible(true);
@@ -553,33 +651,218 @@ impl PropertyInspector {
                 }
             }
             self.delete_button.set_sensitive(true);
-            self.title_entry.set_text(&act.appearance.title);
+
+            if !act.plugin_id.is_empty() && act.plugin_id != "system" {
+                *self.current_plugin_id.borrow_mut() = Some(act.plugin_id.clone());
+                *self.current_plugin_name.borrow_mut() = Some(act.plugin_name.clone());
+                self.plugin_settings_button.set_tooltip_text(Some(&format!("{} Settings", act.plugin_name)));
+                self.plugin_settings_button.set_visible(true);
+            } else {
+                *self.current_plugin_id.borrow_mut() = None;
+                *self.current_plugin_name.borrow_mut() = None;
+                self.plugin_settings_button.set_visible(false);
+            }
+
+            self.empty_action_label.set_visible(false);
+
+            let is_app_launcher = act.action_id.contains("AppLauncher") || act.action_id == "app_launcher.launch";
+            if is_app_launcher {
+                self.app_row.set_visible(true);
+                self.args_row.set_visible(true);
+                self.action_info_box.set_visible(false);
+                self.dynamic_settings_box.set_visible(false);
+            } else if !act.plugin_id.is_empty() && act.plugin_id != "system" {
+                self.app_row.set_visible(false);
+                self.args_row.set_visible(false);
+
+                // Seamless check: does this action have real interactive settings?
+                let config_rows = if let Some(ref pm) = *self.plugin_manager.borrow() {
+                    pm.get_action_config_rows(&act.plugin_id, &act.action_id)
+                } else {
+                    Vec::new()
+                };
+
+                if !config_rows.is_empty() {
+                    // Action HAS settings: hide info box, display actual action settings rows in unified flat layout matching Appearance tab
+                    self.action_info_box.set_visible(false);
+
+                    while let Some(child) = self.dynamic_settings_box.first_child() {
+                        self.dynamic_settings_box.remove(&child);
+                    }
+
+                    for row in &config_rows {
+                        let row_box = Box::new(Orientation::Horizontal, 10);
+
+                        let caption_text = if row.title().ends_with(':') {
+                            row.title().to_string()
+                        } else {
+                            format!("{}:", row.title())
+                        };
+                        let caption = Label::new(Some(&caption_text));
+                        caption.set_size_request(100, -1);
+                        caption.set_xalign(0.0);
+                        row_box.append(&caption);
+
+                        match &row.setting_type {
+                            ActionSettingType::Combo { title: _, subtitle: _, options, default_idx } => {
+                                let str_opts: Vec<&str> = options.iter().map(|s| s.as_str()).collect();
+                                let model = gtk::StringList::new(&str_opts);
+                                let dropdown = DropDown::new(Some(model), Option::<gtk::Expression>::None);
+                                dropdown.set_size_request(280, -1);
+
+                                if let Some(saved) = act.parameters.get(&row.key) {
+                                    if let Some(idx) = options.iter().position(|o| o == saved) {
+                                        dropdown.set_selected(idx as u32);
+                                    }
+                                } else {
+                                    dropdown.set_selected(*default_idx);
+                                }
+
+                                let on_param = self.on_parameter_changed.clone();
+                                let param_key = row.key.clone();
+                                let opts_clone = options.clone();
+                                dropdown.connect_selected_notify(move |dd| {
+                                    let idx = dd.selected() as usize;
+                                    if idx < opts_clone.len() {
+                                        if let Some(ref cb) = *on_param.borrow() {
+                                            cb(param_key.clone(), opts_clone[idx].clone());
+                                        }
+                                    }
+                                });
+
+                                row_box.append(&dropdown);
+                            }
+                            ActionSettingType::Switch { title: _, subtitle, default_active } => {
+                                let active = act.parameters.get(&row.key)
+                                    .and_then(|v| v.parse::<bool>().ok())
+                                    .unwrap_or(*default_active);
+
+                                let sw = Switch::new();
+                                sw.set_active(active);
+                                sw.set_valign(gtk::Align::Center);
+
+                                let on_param = self.on_parameter_changed.clone();
+                                let param_key = row.key.clone();
+                                sw.connect_active_notify(move |s| {
+                                    let val = s.is_active();
+                                    if let Some(ref cb) = *on_param.borrow() {
+                                        cb(param_key.clone(), val.to_string());
+                                    }
+                                });
+
+                                row_box.append(&sw);
+
+                                if !subtitle.is_empty() {
+                                    let sub_lbl = Label::new(Some(subtitle));
+                                    sub_lbl.add_css_class("dim-label");
+                                    sub_lbl.set_valign(gtk::Align::Center);
+                                    row_box.append(&sub_lbl);
+                                }
+                            }
+                            ActionSettingType::Text { title: _, subtitle: _, default_text } => {
+                                let text = act.parameters.get(&row.key).cloned().unwrap_or_else(|| default_text.clone());
+                                let entry = Entry::new();
+                                entry.set_text(&text);
+                                entry.set_size_request(280, -1);
+
+                                let on_param = self.on_parameter_changed.clone();
+                                let param_key = row.key.clone();
+                                entry.connect_changed(move |e| {
+                                    let val = e.text().to_string();
+                                    if let Some(ref cb) = *on_param.borrow() {
+                                        cb(param_key.clone(), val);
+                                    }
+                                });
+
+                                row_box.append(&entry);
+                            }
+                            ActionSettingType::Spin { title: _, subtitle: _, min, max, step, default_val } => {
+                                let val = act.parameters.get(&row.key)
+                                    .and_then(|v| v.parse::<f64>().ok())
+                                    .unwrap_or(*default_val);
+
+                                let spin = SpinButton::with_range(*min, *max, *step);
+                                spin.set_value(val);
+                                spin.set_size_request(100, -1);
+
+                                let on_param = self.on_parameter_changed.clone();
+                                let param_key = row.key.clone();
+                                spin.connect_value_changed(move |s| {
+                                    let val = s.value();
+                                    if let Some(ref cb) = *on_param.borrow() {
+                                        cb(param_key.clone(), val.to_string());
+                                    }
+                                });
+
+                                row_box.append(&spin);
+                            }
+                        }
+
+                        self.dynamic_settings_box.append(&row_box);
+                    }
+
+                    self.dynamic_settings_box.set_visible(true);
+                } else {
+                    // Action has NO interactive settings (e.g. Mute, Deafen)
+                    // Display the unified flat summary rows
+                    self.dynamic_settings_box.set_visible(false);
+
+                    self.action_info_name.set_text(&act.action_name);
+                    let desc = get_action_description(&act.action_id, &act.action_name, &act.plugin_name);
+                    self.action_info_desc.set_text(&desc);
+
+                    self.action_info_box.set_visible(true);
+                }
+            } else {
+                self.app_row.set_visible(false);
+                self.args_row.set_visible(false);
+                self.action_info_box.set_visible(false);
+                self.dynamic_settings_box.set_visible(false);
+            }
+
+            if act.states.len() > 1 {
+                self.state_dots_box.set_visible(true);
+                let st = act.current_state.min(act.states.len() - 1);
+                self.selected_state_idx.set(st);
+                if st == 0 {
+                    self.radio_state_0.set_active(true);
+                } else {
+                    self.radio_state_1.set_active(true);
+                }
+            } else {
+                self.state_dots_box.set_visible(false);
+                self.selected_state_idx.set(0);
+            }
+
+            let app = act.active_appearance();
+
+            self.title_entry.set_text(&app.title);
 
             // Font & Size
-            self.font_size_spin.set_value(act.appearance.font_size as f64);
-            let font_desc_str = format!("{} {}", act.appearance.font_family, act.appearance.font_size);
+            self.font_size_spin.set_value(app.font_size as f64);
+            let font_desc_str = format!("{} {}", app.font_family, app.font_size);
             self.font_dialog_button.set_font_desc(&pango::FontDescription::from_string(&font_desc_str));
 
             // Icon Scale
-            self.icon_scale_spin.set_value(act.appearance.icon_scale as f64);
+            self.icon_scale_spin.set_value(app.icon_scale as f64);
 
             // Update alignment button styling
             self.pos_top_btn.remove_css_class("suggested-action");
             self.pos_mid_btn.remove_css_class("suggested-action");
             self.pos_bot_btn.remove_css_class("suggested-action");
-            match act.appearance.vertical_align {
+            match app.vertical_align {
                 TextVerticalAlign::Top => self.pos_top_btn.add_css_class("suggested-action"),
                 TextVerticalAlign::Center => self.pos_mid_btn.add_css_class("suggested-action"),
                 TextVerticalAlign::Bottom => self.pos_bot_btn.add_css_class("suggested-action"),
             }
 
             // Update Color pickers
-            if let Some(ref bg) = act.appearance.bg_color {
+            if let Some(ref bg) = app.bg_color {
                 self.btn_color_picker.set_rgba(&hex_to_rgba(bg));
             } else {
                 self.btn_color_picker.set_rgba(&RGBA::new(0.098, 0.098, 0.125, 1.0));
             }
-            self.text_color_picker.set_rgba(&hex_to_rgba(&act.appearance.text_color));
+            self.text_color_picker.set_rgba(&hex_to_rgba(&app.text_color));
 
             if target == InspectorTarget::Touchscreen {
                 if act.action_id == "disabled" {
@@ -594,7 +877,7 @@ impl PropertyInspector {
             }
 
             // Update Preview tile with strictly bounded texture scaling
-            let scale_pct = (act.appearance.icon_scale.clamp(20, 100) as f64) / 100.0;
+            let scale_pct = (app.icon_scale.clamp(20, 100) as f64) / 100.0;
             let (base_w, base_h) = match target {
                 InspectorTarget::Touchscreen => (160, 20),
                 InspectorTarget::Dial(_) => (90, 48),
@@ -603,7 +886,7 @@ impl PropertyInspector {
             let icon_w = ((base_w as f64 * scale_pct) as i32).max(12);
             let icon_h = ((base_h as f64 * scale_pct) as i32).max(12);
 
-            let icon_path = act.appearance.icon_path.as_deref();
+            let icon_path = app.icon_path.as_deref();
             let icon_name = act.parameters.get("icon_name").map(|s| s.as_str())
                 .or_else(|| match act.action_id.as_str() {
                     "system.hotkey" => Some("input-keyboard-symbolic"),
@@ -694,22 +977,22 @@ impl PropertyInspector {
             } else {
                 self.preview_icon.set_visible(false);
             }
-            if act.appearance.show_title && !act.appearance.title.is_empty() {
-                self.preview_inner_label.set_text(&act.appearance.title);
+            if app.show_title && !app.title.is_empty() {
+                self.preview_inner_label.set_text(&app.title);
                 self.preview_inner_label.set_visible(true);
             } else {
                 self.preview_inner_label.set_text("");
                 self.preview_inner_label.set_visible(false);
             }
 
-            if act.appearance.show_title {
+            if app.show_title {
                 self.title_toggle_btn.set_icon_name("view-reveal-symbolic");
                 self.title_toggle_btn.set_tooltip_text(Some("Hide Title on Key"));
             } else {
                 self.title_toggle_btn.set_icon_name("view-conceal-symbolic");
                 self.title_toggle_btn.set_tooltip_text(Some("Show Title on Key"));
             }
-            match act.appearance.vertical_align {
+            match app.vertical_align {
                 TextVerticalAlign::Top => self.preview_inner_label.set_valign(gtk::Align::Start),
                 TextVerticalAlign::Center => self.preview_inner_label.set_valign(gtk::Align::Center),
                 TextVerticalAlign::Bottom => self.preview_inner_label.set_valign(gtk::Align::End),
@@ -734,6 +1017,16 @@ impl PropertyInspector {
                 }
             }
             self.delete_button.set_sensitive(false);
+            *self.current_plugin_id.borrow_mut() = None;
+            *self.current_plugin_name.borrow_mut() = None;
+            self.plugin_settings_button.set_visible(false);
+
+            self.state_dots_box.set_visible(false);
+            self.empty_action_label.set_visible(true);
+            self.app_row.set_visible(false);
+            self.args_row.set_visible(false);
+            self.action_info_box.set_visible(false);
+            self.dynamic_settings_box.set_visible(false);
             self.title_entry.set_text("");
             self.preview_icon.set_visible(false);
             self.preview_inner_label.set_text("");
@@ -759,5 +1052,59 @@ impl PropertyInspector {
             }
             _ => {}
         }
+    }
+}
+
+pub fn get_action_description(action_id: &str, action_name: &str, plugin_name: &str) -> String {
+    let lower_id = action_id.to_lowercase();
+    let lower_name = action_name.to_lowercase();
+
+    // DiscordSC Actions
+    if lower_id.contains("callmixer") || lower_name.contains("call mixer") {
+        "Controls Discord voice call volume and channel audio".into()
+    } else if lower_id.contains("deafen") || lower_name.contains("deafen") {
+        "Toggles deafen state on Discord".into()
+    } else if lower_id.contains("mute") || lower_name.contains("mute") {
+        "Toggles microphone mute state on Discord".into()
+    } else if lower_id.contains("inputmode") || lower_name.contains("input mode") {
+        "Switches between Voice Activity and Push-to-Talk".into()
+    } else if lower_id.contains("pushtotalk") || lower_name.contains("push to talk") {
+        "Transmits voice while active or held".into()
+    } else if lower_id.contains("notification") || lower_name.contains("notification") {
+        "Toggles Discord audio and desktop notifications".into()
+    } else if lower_id.contains("serverstatus") || lower_name.contains("server status") {
+        "Displays real-time status of connected Discord server".into()
+    } else if lower_id.contains("soundboard") || lower_name.contains("soundboard") {
+        "Plays selected sound from your Discord soundboard".into()
+    } else if lower_id.contains("textchannel") || lower_name.contains("text channel") {
+        "Navigates directly to assigned text channel".into()
+    } else if lower_id.contains("voicechannel") || lower_name.contains("voice channel") {
+        "Connects to assigned voice room or channel".into()
+    // Govee Actions
+    } else if lower_id.contains("power") || lower_name.contains("power") {
+        "Toggles device power on or off".into()
+    } else if lower_id.contains("brightness") || lower_name.contains("brightness") {
+        "Adjusts lighting brightness level".into()
+    } else if lower_id.contains("color") || lower_name.contains("color") {
+        "Sets lighting color or ambiance".into()
+    } else if lower_id.contains("scene") || lower_name.contains("scene") {
+        "Activates selected lighting scene".into()
+    // OBS Actions
+    } else if lower_id.contains("record") || lower_name.contains("record") {
+        "Starts or stops OBS recording".into()
+    } else if lower_id.contains("stream") || lower_name.contains("stream") {
+        "Starts or stops live broadcasting".into()
+    // App Launcher Actions
+    } else if lower_id.contains("applauncher") || lower_name.contains("launch app") {
+        "Launches the configured application".into()
+    // System Actions
+    } else if lower_id.contains("hotkey") {
+        "Sends keyboard shortcut combination".into()
+    } else if lower_id.contains("url") {
+        "Opens web URL in default browser".into()
+    } else if lower_id.contains("terminal") {
+        "Executes custom shell command".into()
+    } else {
+        format!("Action provided by {plugin_name}")
     }
 }

@@ -94,8 +94,12 @@ headerbar.ballista-headerbar {
     transform: none;
 }
 
-.deck-key:active {
-    background-color: #21212c;
+.deck-key:active,
+.deck-key.pressed {
+    background-color: #262635;
+    border-color: #b072ff;
+    box-shadow: inset 0 2px 6px rgba(0, 0, 0, 0.7), 0 0 10px rgba(145, 70, 255, 0.55);
+    filter: brightness(1.18);
     transition: none;
     transform: none;
 }
@@ -116,13 +120,13 @@ headerbar.ballista-headerbar {
 
 /* Stream Deck + Touchscreen Capsule */
 .deck-touchscreen-capsule {
-    background-color: #0b0b0e;
+    background-color: #191920;
     border: 2px solid rgba(255, 255, 255, 0.08);
-    border-radius: 12px;
+    border-radius: 13px;
     padding: 0;
     margin-top: 2px;
     margin-bottom: 2px;
-    box-shadow: inset 0 2px 6px rgba(0, 0, 0, 0.65);
+    box-shadow: none;
     transition: none;
     transform: none;
 }
@@ -160,12 +164,6 @@ headerbar.ballista-headerbar {
     background-color: rgba(145, 70, 255, 0.22);
     color: #ffffff;
     box-shadow: inset 0 0 0 2px #9146ff;
-}
-
-.deck-touch-separator {
-    min-width: 1px;
-    background-color: rgba(255, 255, 255, 0.07);
-    margin: 8px 0;
 }
 
 /* Stream Deck + Rotary Dial Knobs */
