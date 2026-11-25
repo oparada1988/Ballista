@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use crate::models::KeyAppearance;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -81,6 +82,10 @@ pub struct PluginManager {
     pub plugins_dir: PathBuf,
     pub plugins: HashMap<String, DiscoveredPlugin>,
     pub installed_apps: Vec<InstalledApp>,
+    pub bridge: super::plugin_bridge::PluginBridge,
+    pub live_config_rows: Arc<Mutex<HashMap<String, Vec<super::plugin_bridge::BridgeConfigRow>>>>,
+    pub live_plugin_settings_rows: Arc<Mutex<HashMap<String, Vec<super::plugin_bridge::BridgeConfigRow>>>>,
+    pub plugin_has_settings: Arc<Mutex<HashMap<String, bool>>>,
 }
 
 impl PluginManager {
@@ -88,15 +93,101 @@ impl PluginManager {
         let plugins_dir = glib::user_data_dir().join("ballista").join("plugins");
         let _ = fs::create_dir_all(&plugins_dir);
 
+        let bridge = super::plugin_bridge::PluginBridge::new();
+        if let Err(e) = bridge.start() {
+            tracing::warn!("Failed to start plugin bridge: {e}");
+        }
+
         let mut manager = Self {
             plugins_dir,
             plugins: HashMap::new(),
             installed_apps: Vec::new(),
+            bridge,
+            live_config_rows: Arc::new(Mutex::new(HashMap::new())),
+            live_plugin_settings_rows: Arc::new(Mutex::new(HashMap::new())),
+            plugin_has_settings: Arc::new(Mutex::new(HashMap::new())),
         };
 
         manager.scan_installed_apps();
         manager.rescan_plugins();
         manager
+    }
+
+    pub fn set_live_config_rows(&self, slot: &str, rows: Vec<super::plugin_bridge::BridgeConfigRow>) {
+        if let Ok(mut lock) = self.live_config_rows.lock() {
+            lock.insert(slot.to_string(), rows);
+        }
+    }
+
+    pub fn get_live_config_rows(&self, slot: &str) -> Option<Vec<super::plugin_bridge::BridgeConfigRow>> {
+        if let Ok(lock) = self.live_config_rows.lock() {
+            lock.get(slot).cloned()
+        } else {
+            None
+        }
+    }
+
+    pub fn clear_live_config_rows(&self, slot: &str) {
+        if let Ok(mut lock) = self.live_config_rows.lock() {
+            lock.remove(slot);
+        }
+    }
+
+    pub fn clear_all_live_config_rows(&self) {
+        if let Ok(mut lock) = self.live_config_rows.lock() {
+            lock.clear();
+        }
+    }
+
+    pub fn set_live_plugin_settings_rows(&self, plugin_id: &str, rows: Vec<super::plugin_bridge::BridgeConfigRow>) {
+        if let Ok(mut lock) = self.live_plugin_settings_rows.lock() {
+            lock.insert(plugin_id.to_string(), rows);
+        }
+    }
+
+    pub fn get_live_plugin_settings_rows(&self, plugin_id: &str) -> Option<Vec<super::plugin_bridge::BridgeConfigRow>> {
+        if let Ok(lock) = self.live_plugin_settings_rows.lock() {
+            lock.get(plugin_id).cloned()
+        } else {
+            None
+        }
+    }
+
+    pub fn apply_bridge_plugin_metadata(
+        &mut self,
+        plugin_id: &str,
+        plugin_name: &str,
+        has_settings: bool,
+        actions_meta: &[super::plugin_bridge::BridgeActionMeta],
+    ) {
+        if let Ok(mut lock) = self.plugin_has_settings.lock() {
+            lock.insert(plugin_id.to_string(), has_settings);
+        }
+        if let Some(plugin) = self.plugins.get_mut(plugin_id) {
+            if !plugin_name.is_empty() && plugin_name != plugin_id {
+                plugin.name = plugin_name.to_string();
+            }
+            if !actions_meta.is_empty() {
+                let mut updated_actions = Vec::new();
+                for am in actions_meta {
+                    let action_stem = am.action_id.split("::").last().unwrap_or(&am.action_id);
+                    let icon = if !am.icon_path.is_empty() && Path::new(&am.icon_path).exists() {
+                        am.icon_path.clone()
+                    } else if !am.icon_name.is_empty() && am.icon_name != "insert-image-symbolic" {
+                        am.icon_name.clone()
+                    } else {
+                        find_action_icon(&plugin.path, action_stem)
+                    };
+                    updated_actions.push(PluginActionInfo {
+                        id: am.action_id.clone(),
+                        name: am.action_name.clone(),
+                        icon_name_or_file: icon,
+                        config_rows: Vec::new(),
+                    });
+                }
+                plugin.actions = updated_actions;
+            }
+        }
     }
 
     pub fn scan_installed_apps(&mut self) {
@@ -254,14 +345,17 @@ impl PluginManager {
                                     actions.sort_by(|a, b| a.name.cmp(&b.name));
 
                                     self.plugins.insert(id.clone(), DiscoveredPlugin {
-                                        id,
+                                        id: id.clone(),
                                         name,
                                         author,
                                         version,
                                         description,
-                                        path: p,
+                                        path: p.clone(),
                                         actions,
                                     });
+
+                                    // Initialize plugin in Python compatibility bridge
+                                    self.bridge.init_plugin(&id, &p);
                                 }
                             }
                         }
@@ -271,7 +365,7 @@ impl PluginManager {
         }
     }
 
-    /// Sideload / Install from a local directory (e.g. /home/oscar/Github Projects/AppLauncher)
+    /// Sideload / Install from a local directory containing manifest.json
     pub fn install_from_dir(&mut self, source_dir: &Path) -> Result<String, String> {
         let manifest = source_dir.join("manifest.json");
         if !manifest.exists() {
@@ -287,34 +381,49 @@ impl PluginManager {
 
         // Copy directory recursively
         Self::copy_dir_all(source_dir, &dest).map_err(|e| format!("Failed to copy plugin: {e}"))?;
+        Self::run_plugin_install_hook(&dest);
 
         self.rescan_plugins();
         Ok(id.to_string())
     }
 
-    /// Download & Install a plugin directly from a zip archive URL (e.g. GitHub release or main branch)
-    pub fn install_from_url(&mut self, id: &str, download_url: &str) -> Result<String, String> {
-        let dest = self.plugins_dir.join(id);
-        let _ = fs::remove_dir_all(&dest);
-        let _ = fs::create_dir_all(&dest);
+    /// Download & Extract a plugin directly from a remote zip archive URL without touching UI or plugin state
+    pub fn download_and_extract_plugin(plugins_dir: &Path, id: &str, download_url: &str) -> Result<(), String> {
+        let url = download_url.trim();
+        if url.is_empty() || (!url.starts_with("https://") && !url.starts_with("http://")) {
+            return Err(format!("Invalid remote download URL for plugin '{id}': '{url}'"));
+        }
 
-        let temp_zip = std::env::temp_dir().join(format!("{id}.zip"));
-        let temp_extract = std::env::temp_dir().join(format!("{id}_extracted"));
+        tracing::info!("Downloading plugin '{}' directly from remote URL: {}", id, url);
+
+        let temp_zip = std::env::temp_dir().join(format!("ballista_{id}.zip"));
+        let temp_extract = std::env::temp_dir().join(format!("ballista_{id}_extracted"));
         let _ = fs::remove_file(&temp_zip);
         let _ = fs::remove_dir_all(&temp_extract);
 
         let status = std::process::Command::new("curl")
-            .arg("-L")
-            .arg("-s")
+            .arg("-fSL")
+            .arg("--connect-timeout")
+            .arg("10")
+            .arg("--max-time")
+            .arg("60")
             .arg("-o")
             .arg(&temp_zip)
-            .arg(download_url)
+            .arg(url)
             .status()
-            .map_err(|e| format!("Failed to download: {e}"))?;
+            .map_err(|e| format!("Failed to invoke curl for '{id}': {e}"))?;
 
         if !status.success() {
-            return Err("Failed to download plugin archive".into());
+            let _ = fs::remove_file(&temp_zip);
+            return Err(format!("Remote download failed for '{id}' from {url} (exit: {status})"));
         }
+
+        let zip_bytes = fs::metadata(&temp_zip).map(|m| m.len()).unwrap_or(0);
+        if zip_bytes == 0 {
+            let _ = fs::remove_file(&temp_zip);
+            return Err(format!("Downloaded archive for '{id}' from {url} is empty"));
+        }
+        tracing::info!("Downloaded {} bytes for plugin '{}' from {}", zip_bytes, id, url);
 
         let unzip_status = std::process::Command::new("unzip")
             .arg("-q")
@@ -323,38 +432,92 @@ impl PluginManager {
             .arg("-d")
             .arg(&temp_extract)
             .status()
-            .map_err(|e| format!("Failed to unzip: {e}"))?;
+            .map_err(|e| format!("Failed to unzip archive for '{id}': {e}"))?;
 
         if !unzip_status.success() {
-            return Err("Failed to extract plugin archive".into());
+            let _ = fs::remove_file(&temp_zip);
+            let _ = fs::remove_dir_all(&temp_extract);
+            return Err(format!("Failed to extract plugin archive for '{id}'"));
         }
 
-        // GitHub zips contain an inner folder (e.g. AppLauncher-main)
+        // GitHub zips contain an inner root folder (e.g. AppLauncher-main)
         // Find folder containing manifest.json
         let mut source_folder = temp_extract.clone();
-        if let Ok(entries) = fs::read_dir(&temp_extract) {
-            for entry in entries.flatten() {
-                if entry.path().is_dir() && entry.path().join("manifest.json").exists() {
-                    source_folder = entry.path();
-                    break;
+        if !source_folder.join("manifest.json").exists() {
+            if let Ok(entries) = fs::read_dir(&temp_extract) {
+                for entry in entries.flatten() {
+                    if entry.path().is_dir() && entry.path().join("manifest.json").exists() {
+                        source_folder = entry.path();
+                        break;
+                    }
                 }
             }
         }
 
-        Self::copy_dir_all(&source_folder, &dest).map_err(|e| format!("Failed to copy plugin: {e}"))?;
+        if !source_folder.join("manifest.json").exists() {
+            let _ = fs::remove_file(&temp_zip);
+            let _ = fs::remove_dir_all(&temp_extract);
+            return Err(format!("Extracted archive for '{id}' does not contain manifest.json"));
+        }
+
+        let dest = plugins_dir.join(id);
+        let _ = fs::remove_dir_all(&dest);
+        let _ = fs::create_dir_all(&dest);
+
+        Self::copy_dir_all(&source_folder, &dest).map_err(|e| format!("Failed to copy plugin '{id}': {e}"))?;
         let _ = fs::remove_file(&temp_zip);
         let _ = fs::remove_dir_all(&temp_extract);
 
+        // Execute StreamController plugin __install__.py hook if present (e.g. creates backend/.venv)
+        Self::run_plugin_install_hook(&dest);
+
+        tracing::info!("Installed plugin '{}' cleanly into {}", id, dest.display());
+        Ok(())
+    }
+
+    fn run_plugin_install_hook(plugin_dir: &Path) {
+        let install_py = plugin_dir.join("__install__.py");
+        if !install_py.exists() {
+            return;
+        }
+        tracing::info!("Running StreamController plugin install hook: {}", install_py.display());
+        let python_bin = super::plugin_bridge::PluginBridge::locate_python_executable();
+        let mut cmd = std::process::Command::new(&python_bin);
+        cmd.arg(&install_py).current_dir(plugin_dir);
+        if let Some(bridge_dir) = super::plugin_bridge::PluginBridge::locate_bridge_dir() {
+            let existing = std::env::var("PYTHONPATH").unwrap_or_default();
+            let combined = if existing.is_empty() {
+                bridge_dir.to_string_lossy().to_string()
+            } else {
+                format!("{}:{}", bridge_dir.display(), existing)
+            };
+            cmd.env("PYTHONPATH", combined);
+        }
+        if let Err(e) = cmd.status() {
+            tracing::warn!("Plugin install hook failed for {}: {e}", plugin_dir.display());
+        }
+    }
+
+    /// Download & Install a plugin directly from a zip archive URL (e.g. GitHub release or main branch)
+    pub fn install_from_url(&mut self, id: &str, download_url: &str) -> Result<String, String> {
+        Self::download_and_extract_plugin(&self.plugins_dir, id, download_url)?;
         self.rescan_plugins();
         Ok(id.to_string())
     }
 
     pub fn uninstall_plugin(&mut self, plugin_id: &str) -> Result<(), String> {
+        self.bridge.uninstall_plugin(plugin_id);
         let dest = self.plugins_dir.join(plugin_id);
         if dest.exists() {
             fs::remove_dir_all(&dest).map_err(|e| format!("Failed to remove plugin directory: {e}"))?;
         }
         self.plugins.remove(plugin_id);
+        if let Ok(mut lock) = self.live_plugin_settings_rows.lock() {
+            lock.remove(plugin_id);
+        }
+        if let Ok(mut lock) = self.plugin_has_settings.lock() {
+            lock.remove(plugin_id);
+        }
         self.rescan_plugins();
         Ok(())
     }

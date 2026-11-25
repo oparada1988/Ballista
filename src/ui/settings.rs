@@ -477,9 +477,9 @@ pub fn create_settings_window(
 }
 
 fn shellexpand_plugins_dir() -> String {
-    if let Ok(home) = std::env::var("HOME") {
-        format!("{home}/.local/share/ballista/plugins")
-    } else {
-        "/home/oscar/.local/share/ballista/plugins".into()
-    }
+    glib::user_data_dir()
+        .join("ballista")
+        .join("plugins")
+        .to_string_lossy()
+        .to_string()
 }

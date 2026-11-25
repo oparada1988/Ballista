@@ -1,0 +1,13 @@
+# Ballista StreamController Compatibility Bridge — Python Runtime Dependencies
+# Installed inside Ballista's dedicated --system-site-packages venv so every
+# StreamController plugin works natively without StreamController installed.
+loguru
+Pillow
+requests
+rpyc
+websocket-client
+pulsectl
+psutil
+packaging
+pynput
+cairosvg

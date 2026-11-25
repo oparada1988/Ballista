@@ -46,8 +46,24 @@ impl Header {
 
         if let Some(display) = gtk::gdk::Display::default() {
             let icon_theme = gtk::IconTheme::for_display(&display);
-            icon_theme.add_search_path("/home/oscar/Github Projects/Ballista/resources/icons");
-            icon_theme.add_search_path("resources/icons");
+            let mut icon_dirs = vec![
+                glib::user_data_dir().join("ballista").join("icons"),
+                std::path::PathBuf::from("/usr/local/share/ballista/icons"),
+                std::path::PathBuf::from("/usr/share/ballista/icons"),
+                std::path::PathBuf::from("resources/icons"),
+            ];
+            if let Ok(exe) = std::env::current_exe() {
+                if let Some(exe_dir) = exe.parent() {
+                    icon_dirs.push(exe_dir.join("resources").join("icons"));
+                    icon_dirs.push(exe_dir.join("..").join("share").join("ballista").join("icons"));
+                    icon_dirs.push(exe_dir.join("..").join("..").join("resources").join("icons"));
+                }
+            }
+            for dir in icon_dirs {
+                if dir.exists() {
+                    icon_theme.add_search_path(&dir);
+                }
+            }
         }
 
         let store_button = Button::from_icon_name("store-badge-symbolic");

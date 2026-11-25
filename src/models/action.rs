@@ -27,6 +27,12 @@ pub struct KeyAppearance {
     pub icon_path: Option<String>,
     #[serde(default = "default_icon_scale")]
     pub icon_scale: u32,
+    #[serde(default)]
+    pub top_label: Option<String>,
+    #[serde(default)]
+    pub center_label: Option<String>,
+    #[serde(default)]
+    pub bottom_label: Option<String>,
 }
 
 fn default_show_title() -> bool {
@@ -49,6 +55,36 @@ impl Default for KeyAppearance {
             vertical_align: TextVerticalAlign::Bottom,
             icon_path: None,
             icon_scale: 100,
+            top_label: None,
+            center_label: None,
+            bottom_label: None,
+        }
+    }
+}
+
+impl KeyAppearance {
+    pub fn has_plugin_labels(&self) -> bool {
+        self.top_label.is_some() || self.center_label.is_some() || self.bottom_label.is_some()
+    }
+
+    pub fn combined_display_summary(&self) -> String {
+        if self.has_plugin_labels() {
+            let mut parts = Vec::new();
+            if let Some(ref t) = self.top_label {
+                if !t.is_empty() { parts.push(t.as_str()); }
+            }
+            if let Some(ref c) = self.center_label {
+                if !c.is_empty() { parts.push(c.as_str()); }
+            }
+            if let Some(ref b) = self.bottom_label {
+                if !b.is_empty() { parts.push(b.as_str()); }
+            }
+            return parts.join("\n");
+        }
+        if self.show_title {
+            self.title.clone()
+        } else {
+            String::new()
         }
     }
 }
@@ -66,6 +102,8 @@ pub struct KeyAction {
     #[serde(default)]
     pub current_state: usize,
     pub parameters: HashMap<String, String>,
+    #[serde(default)]
+    pub raw_settings: HashMap<String, serde_json::Value>,
 }
 
 impl KeyAction {
@@ -86,7 +124,20 @@ impl KeyAction {
             current_state: 0,
             appearance,
             parameters: HashMap::new(),
+            raw_settings: HashMap::new(),
         }
+    }
+
+    pub fn merged_settings_json(&self) -> HashMap<String, serde_json::Value> {
+        let mut out: HashMap<String, serde_json::Value> = self
+            .parameters
+            .iter()
+            .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+            .collect();
+        for (k, v) in &self.raw_settings {
+            out.insert(k.clone(), v.clone());
+        }
+        out
     }
 
     pub fn active_appearance(&self) -> &KeyAppearance {

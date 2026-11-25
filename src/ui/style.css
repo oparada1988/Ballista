@@ -559,6 +559,27 @@ window.ballista-modal .boxed-list > row:last-child {
     background-color: #28b864;
 }
 
+.btn-downloading {
+    background-color: #7c3aed;
+    color: #ffffff;
+    font-weight: 700;
+    border-radius: 8px;
+    padding: 4px 14px;
+    font-size: 13px;
+    min-width: 90px;
+}
+
+.store-pbar progress {
+    background-color: #7c3aed;
+    border-radius: 4px;
+}
+
+.store-pbar trough {
+    background-color: rgba(255, 255, 255, 0.12);
+    border-radius: 4px;
+    min-height: 4px;
+}
+
 .btn-installed {
     background-color: rgba(217, 119, 6, 0.16);
     border: 1px solid rgba(217, 119, 6, 0.45);

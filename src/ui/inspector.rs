@@ -49,6 +49,7 @@ pub struct PropertyInspector {
     pub scale_caption: Label,
     pub app_row: Box,
     pub args_row: Box,
+    pub args_entry: Entry,
     pub empty_action_label: Label,
     pub action_info_box: Box,
     pub action_info_name: Label,
@@ -59,6 +60,8 @@ pub struct PropertyInspector {
     pub app_dropdown: DropDown,
     pub preview_tile: Overlay,
     pub preview_inner_label: Label,
+    pub preview_top_label: Label,
+    pub preview_center_label: Label,
     pub preview_icon: Picture,
     pub left_preview_col: Box,
     pub state_dots_box: Box,
@@ -75,6 +78,12 @@ pub struct PropertyInspector {
     pub on_open_plugin_settings: Rc<RefCell<Option<std::boxed::Box<dyn Fn(String, String)>>>>,
     pub plugin_manager: Rc<RefCell<Option<PluginManager>>>,
     pub on_parameter_changed: Rc<RefCell<Option<std::boxed::Box<dyn Fn(String, String)>>>>,
+    pub on_config_row_changed: Rc<RefCell<Option<std::boxed::Box<dyn Fn(String, usize, Option<usize>, Option<bool>, Option<String>, Option<String>, Option<f64>)>>>>,
+    pub on_config_button_clicked: Rc<RefCell<Option<std::boxed::Box<dyn Fn(String, usize)>>>>,
+    pub rendered_live_slot: Rc<RefCell<Option<String>>>,
+    pub rendered_live_rows: Rc<RefCell<Vec<crate::core::plugin_bridge::BridgeConfigRow>>>,
+    pub rendered_live_widgets: Rc<RefCell<Vec<gtk::Widget>>>,
+    pub is_live_syncing: Rc<Cell<bool>>,
 }
 
 pub fn rgba_to_hex(rgba: &RGBA) -> String {
@@ -192,14 +201,24 @@ impl PropertyInspector {
         preview_icon.set_size_request(80, 80);
         preview_icon.set_visible(false);
 
-        let preview_inner_label = Label::new(Some(""));
-        preview_inner_label.set_valign(gtk::Align::End);
-        preview_inner_label.set_halign(gtk::Align::Center);
-        preview_inner_label.set_wrap(true);
-        preview_inner_label.set_justify(gtk::Justification::Center);
-        preview_inner_label.add_css_class("deck-key-label");
+        let make_prev_label = |valign: gtk::Align| {
+            let lbl = Label::new(Some(""));
+            lbl.set_valign(valign);
+            lbl.set_halign(gtk::Align::Center);
+            lbl.set_wrap(true);
+            lbl.set_justify(gtk::Justification::Center);
+            lbl.add_css_class("deck-key-label");
+            lbl.set_visible(false);
+            lbl
+        };
+
+        let preview_inner_label = make_prev_label(gtk::Align::End);
+        let preview_top_label = make_prev_label(gtk::Align::Start);
+        let preview_center_label = make_prev_label(gtk::Align::Center);
 
         preview_tile.set_child(Some(&preview_icon));
+        preview_tile.add_overlay(&preview_top_label);
+        preview_tile.add_overlay(&preview_center_label);
         preview_tile.add_overlay(&preview_inner_label);
 
         // State dots
@@ -424,6 +443,8 @@ impl PropertyInspector {
         action_box.append(&dynamic_settings_box);
 
         let on_parameter_changed: Rc<RefCell<Option<std::boxed::Box<dyn Fn(String, String)>>>> = Rc::new(RefCell::new(None));
+        let on_config_row_changed: Rc<RefCell<Option<std::boxed::Box<dyn Fn(String, usize, Option<usize>, Option<bool>, Option<String>, Option<String>, Option<f64>)>>>> = Rc::new(RefCell::new(None));
+        let on_config_button_clicked: Rc<RefCell<Option<std::boxed::Box<dyn Fn(String, usize)>>>> = Rc::new(RefCell::new(None));
 
         // Parameter 3: Touch Strip Swipe Setting (Official Stream Deck + model)
         let swipe_row = Box::new(Orientation::Vertical, 6);
@@ -509,6 +530,7 @@ impl PropertyInspector {
             scale_caption,
             app_row,
             args_row,
+            args_entry,
             empty_action_label,
             action_info_box,
             action_info_name,
@@ -519,6 +541,8 @@ impl PropertyInspector {
             app_dropdown,
             preview_tile,
             preview_inner_label,
+            preview_top_label,
+            preview_center_label,
             preview_icon,
             left_preview_col,
             state_dots_box,
@@ -535,6 +559,12 @@ impl PropertyInspector {
             on_open_plugin_settings,
             plugin_manager: Rc::new(RefCell::new(None)),
             on_parameter_changed,
+            on_config_row_changed,
+            on_config_button_clicked,
+            rendered_live_slot: Rc::new(RefCell::new(None)),
+            rendered_live_rows: Rc::new(RefCell::new(Vec::new())),
+            rendered_live_widgets: Rc::new(RefCell::new(Vec::new())),
+            is_live_syncing: Rc::new(Cell::new(false)),
         }
     }
 
@@ -665,153 +695,197 @@ impl PropertyInspector {
 
             self.empty_action_label.set_visible(false);
 
-            let is_app_launcher = act.action_id.contains("AppLauncher") || act.action_id == "app_launcher.launch";
-            if is_app_launcher {
+            let is_builtin_app_launcher = act.action_id == "app_launcher.launch";
+            if is_builtin_app_launcher {
                 self.app_row.set_visible(true);
                 self.args_row.set_visible(true);
                 self.action_info_box.set_visible(false);
                 self.dynamic_settings_box.set_visible(false);
+                *self.rendered_live_slot.borrow_mut() = None;
+                self.rendered_live_rows.borrow_mut().clear();
+                self.rendered_live_widgets.borrow_mut().clear();
+
+                // Select current application in dropdown
+                if let Some(did) = act.parameters.get("desktop_id") {
+                    let apps = self.installed_apps.borrow();
+                    if let Some(pos) = apps.iter().position(|a| &a.desktop_id == did) {
+                        self.app_dropdown.set_selected(pos as u32);
+                    }
+                }
+                if let Some(args) = act.parameters.get("args") {
+                    self.args_entry.set_text(args);
+                } else {
+                    self.args_entry.set_text("");
+                }
             } else if !act.plugin_id.is_empty() && act.plugin_id != "system" {
                 self.app_row.set_visible(false);
                 self.args_row.set_visible(false);
 
-                // Seamless check: does this action have real interactive settings?
-                let config_rows = if let Some(ref pm) = *self.plugin_manager.borrow() {
-                    pm.get_action_config_rows(&act.plugin_id, &act.action_id)
-                } else {
-                    Vec::new()
+                let target = *self.current_target.borrow();
+                let slot = match target {
+                    InspectorTarget::Key(k) => format!("key_{k}"),
+                    InspectorTarget::Dial(d) => format!("dial_{d}"),
+                    InspectorTarget::Touchscreen => "touchscreen".into(),
                 };
 
-                if !config_rows.is_empty() {
-                    // Action HAS settings: hide info box, display actual action settings rows in unified flat layout matching Appearance tab
-                    self.action_info_box.set_visible(false);
-
-                    while let Some(child) = self.dynamic_settings_box.first_child() {
-                        self.dynamic_settings_box.remove(&child);
-                    }
-
-                    for row in &config_rows {
-                        let row_box = Box::new(Orientation::Horizontal, 10);
-
-                        let caption_text = if row.title().ends_with(':') {
-                            row.title().to_string()
-                        } else {
-                            format!("{}:", row.title())
-                        };
-                        let caption = Label::new(Some(&caption_text));
-                        caption.set_size_request(100, -1);
-                        caption.set_xalign(0.0);
-                        row_box.append(&caption);
-
-                        match &row.setting_type {
-                            ActionSettingType::Combo { title: _, subtitle: _, options, default_idx } => {
-                                let str_opts: Vec<&str> = options.iter().map(|s| s.as_str()).collect();
-                                let model = gtk::StringList::new(&str_opts);
-                                let dropdown = DropDown::new(Some(model), Option::<gtk::Expression>::None);
-                                dropdown.set_size_request(280, -1);
-
-                                if let Some(saved) = act.parameters.get(&row.key) {
-                                    if let Some(idx) = options.iter().position(|o| o == saved) {
-                                        dropdown.set_selected(idx as u32);
-                                    }
-                                } else {
-                                    dropdown.set_selected(*default_idx);
-                                }
-
-                                let on_param = self.on_parameter_changed.clone();
-                                let param_key = row.key.clone();
-                                let opts_clone = options.clone();
-                                dropdown.connect_selected_notify(move |dd| {
-                                    let idx = dd.selected() as usize;
-                                    if idx < opts_clone.len() {
-                                        if let Some(ref cb) = *on_param.borrow() {
-                                            cb(param_key.clone(), opts_clone[idx].clone());
-                                        }
-                                    }
-                                });
-
-                                row_box.append(&dropdown);
-                            }
-                            ActionSettingType::Switch { title: _, subtitle, default_active } => {
-                                let active = act.parameters.get(&row.key)
-                                    .and_then(|v| v.parse::<bool>().ok())
-                                    .unwrap_or(*default_active);
-
-                                let sw = Switch::new();
-                                sw.set_active(active);
-                                sw.set_valign(gtk::Align::Center);
-
-                                let on_param = self.on_parameter_changed.clone();
-                                let param_key = row.key.clone();
-                                sw.connect_active_notify(move |s| {
-                                    let val = s.is_active();
-                                    if let Some(ref cb) = *on_param.borrow() {
-                                        cb(param_key.clone(), val.to_string());
-                                    }
-                                });
-
-                                row_box.append(&sw);
-
-                                if !subtitle.is_empty() {
-                                    let sub_lbl = Label::new(Some(subtitle));
-                                    sub_lbl.add_css_class("dim-label");
-                                    sub_lbl.set_valign(gtk::Align::Center);
-                                    row_box.append(&sub_lbl);
-                                }
-                            }
-                            ActionSettingType::Text { title: _, subtitle: _, default_text } => {
-                                let text = act.parameters.get(&row.key).cloned().unwrap_or_else(|| default_text.clone());
-                                let entry = Entry::new();
-                                entry.set_text(&text);
-                                entry.set_size_request(280, -1);
-
-                                let on_param = self.on_parameter_changed.clone();
-                                let param_key = row.key.clone();
-                                entry.connect_changed(move |e| {
-                                    let val = e.text().to_string();
-                                    if let Some(ref cb) = *on_param.borrow() {
-                                        cb(param_key.clone(), val);
-                                    }
-                                });
-
-                                row_box.append(&entry);
-                            }
-                            ActionSettingType::Spin { title: _, subtitle: _, min, max, step, default_val } => {
-                                let val = act.parameters.get(&row.key)
-                                    .and_then(|v| v.parse::<f64>().ok())
-                                    .unwrap_or(*default_val);
-
-                                let spin = SpinButton::with_range(*min, *max, *step);
-                                spin.set_value(val);
-                                spin.set_size_request(100, -1);
-
-                                let on_param = self.on_parameter_changed.clone();
-                                let param_key = row.key.clone();
-                                spin.connect_value_changed(move |s| {
-                                    let val = s.value();
-                                    if let Some(ref cb) = *on_param.borrow() {
-                                        cb(param_key.clone(), val.to_string());
-                                    }
-                                });
-
-                                row_box.append(&spin);
-                            }
-                        }
-
-                        self.dynamic_settings_box.append(&row_box);
-                    }
-
-                    self.dynamic_settings_box.set_visible(true);
+                let live_rows = if let Some(ref pm) = *self.plugin_manager.borrow() {
+                    pm.get_live_config_rows(&slot)
                 } else {
-                    // Action has NO interactive settings (e.g. Mute, Deafen)
-                    // Display the unified flat summary rows
-                    self.dynamic_settings_box.set_visible(false);
+                    None
+                };
 
+                if let Some(ref rows) = live_rows {
                     self.action_info_name.set_text(&act.action_name);
                     let desc = get_action_description(&act.action_id, &act.action_name, &act.plugin_name);
                     self.action_info_desc.set_text(&desc);
+                    self.render_live_config_rows(&slot, rows);
+                } else {
+                    *self.rendered_live_slot.borrow_mut() = None;
+                    self.rendered_live_rows.borrow_mut().clear();
+                    self.rendered_live_widgets.borrow_mut().clear();
+                    // Trigger live config row fetch from compatibility bridge
+                    if let Some(ref pm) = *self.plugin_manager.borrow() {
+                        pm.bridge.get_action_config_rows(&slot);
+                    }
 
-                    self.action_info_box.set_visible(true);
+                    // Seamless check: does this action have real interactive settings?
+                    let config_rows = if let Some(ref pm) = *self.plugin_manager.borrow() {
+                        pm.get_action_config_rows(&act.plugin_id, &act.action_id)
+                    } else {
+                        Vec::new()
+                    };
+
+                    if !config_rows.is_empty() {
+                        // Action HAS settings: hide info box, display actual action settings rows in unified flat layout matching Appearance tab
+                        self.action_info_box.set_visible(false);
+
+                        while let Some(child) = self.dynamic_settings_box.first_child() {
+                            self.dynamic_settings_box.remove(&child);
+                        }
+
+                        for row in &config_rows {
+                            let row_box = Box::new(Orientation::Horizontal, 10);
+
+                            let caption_text = if row.title().ends_with(':') {
+                                row.title().to_string()
+                            } else {
+                                format!("{}:", row.title())
+                            };
+                            let caption = Label::new(Some(&caption_text));
+                            caption.set_size_request(100, -1);
+                            caption.set_xalign(0.0);
+                            row_box.append(&caption);
+
+                            match &row.setting_type {
+                                ActionSettingType::Combo { title: _, subtitle: _, options, default_idx } => {
+                                    let str_opts: Vec<&str> = options.iter().map(|s| s.as_str()).collect();
+                                    let model = gtk::StringList::new(&str_opts);
+                                    let dropdown = DropDown::new(Some(model), Option::<gtk::Expression>::None);
+                                    dropdown.set_size_request(280, -1);
+
+                                    if let Some(saved) = act.parameters.get(&row.key) {
+                                        if let Some(idx) = options.iter().position(|o| o == saved) {
+                                            dropdown.set_selected(idx as u32);
+                                        }
+                                    } else {
+                                        dropdown.set_selected(*default_idx);
+                                    }
+
+                                    let on_param = self.on_parameter_changed.clone();
+                                    let param_key = row.key.clone();
+                                    let opts_clone = options.clone();
+                                    dropdown.connect_selected_notify(move |dd| {
+                                        let idx = dd.selected() as usize;
+                                        if idx < opts_clone.len() {
+                                            if let Some(ref cb) = *on_param.borrow() {
+                                                cb(param_key.clone(), opts_clone[idx].clone());
+                                            }
+                                        }
+                                    });
+
+                                    row_box.append(&dropdown);
+                                }
+                                ActionSettingType::Switch { title: _, subtitle, default_active } => {
+                                    let active = act.parameters.get(&row.key)
+                                        .and_then(|v| v.parse::<bool>().ok())
+                                        .unwrap_or(*default_active);
+
+                                    let sw = Switch::new();
+                                    sw.set_active(active);
+                                    sw.set_valign(gtk::Align::Center);
+
+                                    let on_param = self.on_parameter_changed.clone();
+                                    let param_key = row.key.clone();
+                                    sw.connect_active_notify(move |s| {
+                                        let val = s.is_active();
+                                        if let Some(ref cb) = *on_param.borrow() {
+                                            cb(param_key.clone(), val.to_string());
+                                        }
+                                    });
+
+                                    row_box.append(&sw);
+
+                                    if !subtitle.is_empty() {
+                                        let sub_lbl = Label::new(Some(subtitle));
+                                        sub_lbl.add_css_class("dim-label");
+                                        sub_lbl.set_valign(gtk::Align::Center);
+                                        row_box.append(&sub_lbl);
+                                    }
+                                }
+                                ActionSettingType::Text { title: _, subtitle: _, default_text } => {
+                                    let text = act.parameters.get(&row.key).cloned().unwrap_or_else(|| default_text.clone());
+                                    let entry = Entry::new();
+                                    entry.set_text(&text);
+                                    entry.set_size_request(280, -1);
+
+                                    let on_param = self.on_parameter_changed.clone();
+                                    let param_key = row.key.clone();
+                                    entry.connect_changed(move |e| {
+                                        let val = e.text().to_string();
+                                        if let Some(ref cb) = *on_param.borrow() {
+                                            cb(param_key.clone(), val);
+                                        }
+                                    });
+
+                                    row_box.append(&entry);
+                                }
+                                ActionSettingType::Spin { title: _, subtitle: _, min, max, step, default_val } => {
+                                    let val = act.parameters.get(&row.key)
+                                        .and_then(|v| v.parse::<f64>().ok())
+                                        .unwrap_or(*default_val);
+
+                                    let spin = SpinButton::with_range(*min, *max, *step);
+                                    spin.set_value(val);
+                                    spin.set_size_request(100, -1);
+
+                                    let on_param = self.on_parameter_changed.clone();
+                                    let param_key = row.key.clone();
+                                    spin.connect_value_changed(move |s| {
+                                        let val = s.value();
+                                        if let Some(ref cb) = *on_param.borrow() {
+                                            cb(param_key.clone(), val.to_string());
+                                        }
+                                    });
+
+                                    row_box.append(&spin);
+                                }
+                            }
+
+                            self.dynamic_settings_box.append(&row_box);
+                        }
+
+                        self.dynamic_settings_box.set_visible(true);
+                    } else {
+                        // Action has NO interactive settings (e.g. Mute, Deafen)
+                        // Display the unified flat summary rows
+                        self.dynamic_settings_box.set_visible(false);
+
+                        self.action_info_name.set_text(&act.action_name);
+                        let desc = get_action_description(&act.action_id, &act.action_name, &act.plugin_name);
+                        self.action_info_desc.set_text(&desc);
+
+                        self.action_info_box.set_visible(true);
+                    }
                 }
             } else {
                 self.app_row.set_visible(false);
@@ -886,8 +960,8 @@ impl PropertyInspector {
             let icon_w = ((base_w as f64 * scale_pct) as i32).max(12);
             let icon_h = ((base_h as f64 * scale_pct) as i32).max(12);
 
-            let icon_path = app.icon_path.as_deref();
-            let icon_name = act.parameters.get("icon_name").map(|s| s.as_str())
+            let mut icon_path = app.icon_path.as_deref();
+            let mut icon_name = act.parameters.get("icon_name").map(|s| s.as_str())
                 .or_else(|| match act.action_id.as_str() {
                     "system.hotkey" => Some("input-keyboard-symbolic"),
                     "system.url" => Some("web-browser-symbolic"),
@@ -895,6 +969,22 @@ impl PropertyInspector {
                     "app_launcher.launch" => Some("system-run"),
                     _ => None,
                 });
+
+            // For App Launcher actions: ignore generic placeholder icons if an app has been configured
+            if act.action_id.contains("AppLauncher") || act.action_id == "app_launcher.launch" {
+                if let Some(p) = act.parameters.get("icon_path").filter(|s| !s.is_empty()) {
+                    if !p.ends_with("action_launch.png") && !p.ends_with("default_app.png") {
+                        icon_path = Some(p.as_str());
+                    }
+                } else if let Some(p) = icon_path {
+                    if p.ends_with("action_launch.png") || p.ends_with("default_app.png") {
+                        icon_path = None;
+                    }
+                }
+                if let Some(inm) = act.parameters.get("icon_name").filter(|s| !s.is_empty()) {
+                    icon_name = Some(inm.as_str());
+                }
+            }
 
             if let Some(icon) = icon_path {
                 if std::path::Path::new(icon).exists() {
@@ -977,12 +1067,36 @@ impl PropertyInspector {
             } else {
                 self.preview_icon.set_visible(false);
             }
-            if app.show_title && !app.title.is_empty() {
-                self.preview_inner_label.set_text(&app.title);
-                self.preview_inner_label.set_visible(true);
+            if app.has_plugin_labels() {
+                let top_txt = app.top_label.as_deref().unwrap_or("");
+                self.preview_top_label.set_text(top_txt);
+                self.preview_top_label.set_visible(!top_txt.is_empty());
+
+                let cen_txt = app.center_label.as_deref().unwrap_or("");
+                self.preview_center_label.set_text(cen_txt);
+                self.preview_center_label.set_visible(!cen_txt.is_empty());
+
+                let bot_txt = app.bottom_label.as_deref().unwrap_or("");
+                self.preview_inner_label.set_text(bot_txt);
+                self.preview_inner_label.set_visible(!bot_txt.is_empty());
+                self.preview_inner_label.set_valign(gtk::Align::End);
             } else {
-                self.preview_inner_label.set_text("");
-                self.preview_inner_label.set_visible(false);
+                self.preview_top_label.set_text("");
+                self.preview_top_label.set_visible(false);
+                self.preview_center_label.set_text("");
+                self.preview_center_label.set_visible(false);
+                if app.show_title && !app.title.is_empty() {
+                    self.preview_inner_label.set_text(&app.title);
+                    self.preview_inner_label.set_visible(true);
+                } else {
+                    self.preview_inner_label.set_text("");
+                    self.preview_inner_label.set_visible(false);
+                }
+                match app.vertical_align {
+                    TextVerticalAlign::Top => self.preview_inner_label.set_valign(gtk::Align::Start),
+                    TextVerticalAlign::Center => self.preview_inner_label.set_valign(gtk::Align::Center),
+                    TextVerticalAlign::Bottom => self.preview_inner_label.set_valign(gtk::Align::End),
+                }
             }
 
             if app.show_title {
@@ -992,15 +1106,13 @@ impl PropertyInspector {
                 self.title_toggle_btn.set_icon_name("view-conceal-symbolic");
                 self.title_toggle_btn.set_tooltip_text(Some("Show Title on Key"));
             }
-            match app.vertical_align {
-                TextVerticalAlign::Top => self.preview_inner_label.set_valign(gtk::Align::Start),
-                TextVerticalAlign::Center => self.preview_inner_label.set_valign(gtk::Align::Center),
-                TextVerticalAlign::Bottom => self.preview_inner_label.set_valign(gtk::Align::End),
-            }
         } else {
             if let Some(src) = self.active_preview_anim.borrow_mut().take() {
                 src.remove();
             }
+            *self.rendered_live_slot.borrow_mut() = None;
+            self.rendered_live_rows.borrow_mut().clear();
+            self.rendered_live_widgets.borrow_mut().clear();
             let target = *self.current_target.borrow();
             match target {
                 InspectorTarget::Touchscreen => {
@@ -1030,6 +1142,11 @@ impl PropertyInspector {
             self.title_entry.set_text("");
             self.preview_icon.set_visible(false);
             self.preview_inner_label.set_text("");
+            self.preview_inner_label.set_visible(false);
+            self.preview_top_label.set_text("");
+            self.preview_top_label.set_visible(false);
+            self.preview_center_label.set_text("");
+            self.preview_center_label.set_visible(false);
             self.btn_color_picker.set_rgba(&RGBA::new(0.098, 0.098, 0.125, 1.0));
             self.text_color_picker.set_rgba(&RGBA::new(1.0, 1.0, 1.0, 1.0));
             self.font_size_spin.set_value(11.0);
@@ -1039,6 +1156,459 @@ impl PropertyInspector {
         }
 
         self.is_updating.set(false);
+    }
+
+    /// Lightweight visual-only preview refresh (called on bridge SetMedia/SetLabel/SetBackgroundColor)
+    /// without tearing down or resetting dynamic_settings_box!
+    pub fn update_preview_only(&self, act: &KeyAction) {
+        self.is_updating.set(true);
+        let target = *self.current_target.borrow();
+        let app = act.active_appearance();
+
+        if let Some(ref bg) = app.bg_color {
+            self.btn_color_picker.set_rgba(&hex_to_rgba(bg));
+        } else {
+            self.btn_color_picker.set_rgba(&RGBA::new(0.098, 0.098, 0.125, 1.0));
+        }
+
+        let scale_pct = (app.icon_scale.clamp(20, 100) as f64) / 100.0;
+        let (base_w, base_h) = match target {
+            InspectorTarget::Touchscreen => (160, 20),
+            InspectorTarget::Dial(_) => (90, 48),
+            InspectorTarget::Key(_) => (80, 80),
+        };
+        let icon_w = ((base_w as f64 * scale_pct) as i32).max(12);
+        let icon_h = ((base_h as f64 * scale_pct) as i32).max(12);
+        let icon_path = app.icon_path.as_deref();
+        let icon_name = act.parameters.get("icon_name").map(|s| s.as_str());
+
+        if let Some(icon) = icon_path.filter(|p| !p.is_empty() && std::path::Path::new(p).exists()) {
+            if let Some(paintable) = crate::ui::canvas::lookup_icon_paintable(Some(icon), icon_name, icon_w, 10.0) {
+                self.preview_icon.set_paintable(Some(&paintable));
+            } else {
+                self.preview_icon.set_filename(Some(icon));
+            }
+            self.preview_icon.set_size_request(icon_w, icon_h);
+            self.preview_icon.set_visible(true);
+        } else if let Some(paintable) = crate::ui::canvas::lookup_icon_paintable(None, icon_name, icon_w, 10.0) {
+            self.preview_icon.set_paintable(Some(&paintable));
+            self.preview_icon.set_size_request(icon_w, icon_h);
+            self.preview_icon.set_visible(true);
+        } else {
+            self.preview_icon.set_visible(false);
+        }
+
+        if app.has_plugin_labels() {
+            let top_txt = app.top_label.as_deref().unwrap_or("");
+            self.preview_top_label.set_text(top_txt);
+            self.preview_top_label.set_visible(!top_txt.is_empty());
+
+            let cen_txt = app.center_label.as_deref().unwrap_or("");
+            self.preview_center_label.set_text(cen_txt);
+            self.preview_center_label.set_visible(!cen_txt.is_empty());
+
+            let bot_txt = app.bottom_label.as_deref().unwrap_or("");
+            self.preview_inner_label.set_text(bot_txt);
+            self.preview_inner_label.set_visible(!bot_txt.is_empty());
+            self.preview_inner_label.set_valign(gtk::Align::End);
+        } else {
+            self.preview_top_label.set_text("");
+            self.preview_top_label.set_visible(false);
+            self.preview_center_label.set_text("");
+            self.preview_center_label.set_visible(false);
+            if app.show_title && !app.title.is_empty() {
+                self.preview_inner_label.set_text(&app.title);
+                self.preview_inner_label.set_visible(true);
+            } else {
+                self.preview_inner_label.set_text("");
+                self.preview_inner_label.set_visible(false);
+            }
+        }
+        self.is_updating.set(false);
+    }
+
+    pub fn render_live_config_rows(&self, slot: &str, rows: &[crate::core::plugin_bridge::BridgeConfigRow]) {
+        let visible_rows: Vec<crate::core::plugin_bridge::BridgeConfigRow> =
+            rows.iter().filter(|r| r.visible).cloned().collect();
+
+        let has_interactive = visible_rows.iter().any(|r| {
+            matches!(
+                r.row_type.as_str(),
+                "ComboRow" | "SwitchRow" | "EntryRow" | "PasswordRow" | "SpinRow" | "ScaleRow" | "ColorRow" | "ButtonRow"
+            )
+        });
+
+        if !has_interactive {
+            while let Some(child) = self.dynamic_settings_box.first_child() {
+                self.dynamic_settings_box.remove(&child);
+            }
+            *self.rendered_live_slot.borrow_mut() = Some(slot.to_string());
+            self.rendered_live_rows.borrow_mut().clear();
+            self.rendered_live_widgets.borrow_mut().clear();
+            self.dynamic_settings_box.set_visible(false);
+            // If plugin returned an informational ActionRow, display its title & subtitle cleanly
+            if let Some(info_row) = visible_rows.first() {
+                if !info_row.title.is_empty() {
+                    self.action_info_name.set_text(&info_row.title);
+                }
+                if !info_row.subtitle.is_empty() {
+                    self.action_info_desc.set_text(&info_row.subtitle);
+                }
+            }
+            self.action_info_box.set_visible(true);
+            return;
+        }
+
+        // Smart in-place patch check: avoid destroying widgets (losing Entry focus / Scale drag!) when structure matches
+        let can_patch = {
+            let prev_slot = self.rendered_live_slot.borrow();
+            let prev_rows = self.rendered_live_rows.borrow();
+            let prev_widgets = self.rendered_live_widgets.borrow();
+            prev_slot.as_deref() == Some(slot)
+                && prev_rows.len() == visible_rows.len()
+                && prev_widgets.len() == visible_rows.len()
+                && prev_rows.iter().zip(visible_rows.iter()).all(|(a, b)| {
+                    a.index == b.index && a.row_type == b.row_type && a.title == b.title
+                })
+        };
+
+        if can_patch {
+            self.is_live_syncing.set(true);
+            let prev_rows = self.rendered_live_rows.borrow().clone();
+            let widgets = self.rendered_live_widgets.borrow();
+            for ((prev, row), widget) in prev_rows.iter().zip(visible_rows.iter()).zip(widgets.iter()) {
+                widget.set_sensitive(row.sensitive);
+                match row.row_type.as_str() {
+                    "ComboRow" => {
+                        if let Some(dd) = widget.downcast_ref::<DropDown>() {
+                            if prev.options != row.options {
+                                let str_opts: Vec<&str> = row.options.iter().map(|s| s.as_str()).collect();
+                                let model = gtk::StringList::new(&str_opts);
+                                dd.set_model(Some(&model));
+                            }
+                            if row.selected < row.options.len() && dd.selected() as usize != row.selected {
+                                dd.set_selected(row.selected as u32);
+                            }
+                        }
+                    }
+                    "SwitchRow" => {
+                        if let Some(sw) = widget.downcast_ref::<Switch>() {
+                            if sw.is_active() != row.active {
+                                sw.set_active(row.active);
+                            }
+                        }
+                    }
+                    "EntryRow" => {
+                        if let Some(entry) = widget.downcast_ref::<Entry>() {
+                            entry.set_editable(row.editable);
+                            if !entry.has_focus() && entry.text().as_str() != row.text {
+                                entry.set_text(&row.text);
+                            }
+                        }
+                    }
+                    "PasswordRow" => {
+                        if let Some(pe) = widget.downcast_ref::<gtk::PasswordEntry>() {
+                            pe.set_editable(row.editable);
+                            if !pe.has_focus() && pe.text().as_str() != row.text {
+                                pe.set_text(&row.text);
+                            }
+                        }
+                    }
+                    "SpinRow" => {
+                        if let Some(spin) = widget.downcast_ref::<SpinButton>() {
+                            if !spin.has_focus() && (spin.value() - row.value).abs() > 1e-6 {
+                                spin.set_value(row.value);
+                            }
+                        }
+                    }
+                    "ScaleRow" => {
+                        if let Some(scale) = widget.downcast_ref::<gtk::Scale>() {
+                            if (scale.value() - row.value).abs() > 1e-6 {
+                                scale.set_value(row.value);
+                            }
+                        }
+                    }
+                    "ColorRow" => {
+                        if let Some(cb) = widget.downcast_ref::<ColorDialogButton>() {
+                            if prev.color != row.color {
+                                cb.set_rgba(&hex_to_rgba(&row.color));
+                            }
+                        }
+                    }
+                    "ButtonRow" => {
+                        if let Some(btn) = widget.downcast_ref::<Button>() {
+                            if !row.button_label.is_empty() {
+                                btn.set_label(&row.button_label);
+                            }
+                            if row.suggested {
+                                btn.add_css_class("suggested-action");
+                            } else {
+                                btn.remove_css_class("suggested-action");
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            drop(widgets);
+            *self.rendered_live_rows.borrow_mut() = visible_rows;
+            self.is_live_syncing.set(false);
+            self.action_info_box.set_visible(false);
+            self.dynamic_settings_box.set_visible(true);
+            return;
+        }
+
+        // Full rebuild for new slot or structural row change
+        while let Some(child) = self.dynamic_settings_box.first_child() {
+            self.dynamic_settings_box.remove(&child);
+        }
+        self.rendered_live_widgets.borrow_mut().clear();
+
+        self.action_info_box.set_visible(false);
+        self.is_live_syncing.set(true);
+
+        for row in &visible_rows {
+            let row_box = Box::new(Orientation::Horizontal, 10);
+
+            let caption_text = if row.title.ends_with(':') {
+                row.title.clone()
+            } else {
+                format!("{}:", row.title)
+            };
+            let caption = Label::new(Some(&caption_text));
+            caption.set_size_request(120, -1);
+            caption.set_xalign(0.0);
+            caption.set_wrap(true);
+            row_box.append(&caption);
+
+            let slot_clone = slot.to_string();
+            let row_idx = row.index;
+            let sync_flag = self.is_live_syncing.clone();
+
+            match row.row_type.as_str() {
+                "ComboRow" => {
+                    let str_opts: Vec<&str> = row.options.iter().map(|s| s.as_str()).collect();
+                    let model = gtk::StringList::new(&str_opts);
+                    let dd = DropDown::new(Some(model), Option::<gtk::Expression>::None);
+                    dd.set_size_request(280, -1);
+                    dd.set_enable_search(row.options.len() > 8);
+                    dd.set_sensitive(row.sensitive);
+                    if row.selected < row.options.len() {
+                        dd.set_selected(row.selected as u32);
+                    }
+
+                    let on_row_changed = self.on_config_row_changed.clone();
+                    dd.connect_selected_notify(move |combo| {
+                        if sync_flag.get() {
+                            return;
+                        }
+                        let sel = combo.selected() as usize;
+                        if let Some(ref cb) = *on_row_changed.borrow() {
+                            cb(slot_clone.clone(), row_idx, Some(sel), None, None, None, None);
+                        }
+                    });
+
+                    row_box.append(&dd);
+                    self.rendered_live_widgets.borrow_mut().push(dd.upcast());
+                }
+                "SwitchRow" => {
+                    let sw = Switch::new();
+                    sw.set_active(row.active);
+                    sw.set_valign(gtk::Align::Center);
+                    sw.set_sensitive(row.sensitive);
+
+                    let on_row_changed = self.on_config_row_changed.clone();
+                    sw.connect_active_notify(move |s| {
+                        if sync_flag.get() {
+                            return;
+                        }
+                        let act = s.is_active();
+                        if let Some(ref cb) = *on_row_changed.borrow() {
+                            cb(slot_clone.clone(), row_idx, None, Some(act), None, None, None);
+                        }
+                    });
+
+                    row_box.append(&sw);
+                    self.rendered_live_widgets.borrow_mut().push(sw.upcast());
+
+                    if !row.subtitle.is_empty() {
+                        let sub = Label::new(Some(&row.subtitle));
+                        sub.add_css_class("dim-label");
+                        sub.set_valign(gtk::Align::Center);
+                        row_box.append(&sub);
+                    }
+                }
+                "EntryRow" => {
+                    let entry = Entry::new();
+                    entry.set_text(&row.text);
+                    entry.set_editable(row.editable);
+                    entry.set_sensitive(row.sensitive);
+                    entry.set_size_request(280, -1);
+
+                    let on_row_changed = self.on_config_row_changed.clone();
+                    entry.connect_changed(move |e| {
+                        if sync_flag.get() {
+                            return;
+                        }
+                        let val = e.text().to_string();
+                        if let Some(ref cb) = *on_row_changed.borrow() {
+                            cb(slot_clone.clone(), row_idx, None, None, Some(val), None, None);
+                        }
+                    });
+
+                    row_box.append(&entry);
+                    self.rendered_live_widgets.borrow_mut().push(entry.upcast());
+                }
+                "PasswordRow" => {
+                    let entry = gtk::PasswordEntry::new();
+                    entry.set_text(&row.text);
+                    entry.set_show_peek_icon(true);
+                    entry.set_editable(row.editable);
+                    entry.set_sensitive(row.sensitive);
+                    entry.set_size_request(280, -1);
+
+                    let on_row_changed = self.on_config_row_changed.clone();
+                    entry.connect_changed(move |e| {
+                        if sync_flag.get() {
+                            return;
+                        }
+                        let val = e.text().to_string();
+                        if let Some(ref cb) = *on_row_changed.borrow() {
+                            cb(slot_clone.clone(), row_idx, None, None, Some(val), None, None);
+                        }
+                    });
+
+                    row_box.append(&entry);
+                    self.rendered_live_widgets.borrow_mut().push(entry.upcast());
+                }
+                "SpinRow" => {
+                    let step = if row.step > 0.0 { row.step } else { 1.0 };
+                    let max_v = if row.max > row.min { row.max } else { row.min + 100.0 };
+                    let spin = SpinButton::with_range(row.min, max_v, step);
+                    spin.set_digits(row.digits);
+                    spin.set_value(row.value);
+                    spin.set_sensitive(row.sensitive);
+                    spin.set_size_request(110, -1);
+
+                    let on_row_changed = self.on_config_row_changed.clone();
+                    spin.connect_value_changed(move |s| {
+                        if sync_flag.get() {
+                            return;
+                        }
+                        let val = s.value();
+                        if let Some(ref cb) = *on_row_changed.borrow() {
+                            cb(slot_clone.clone(), row_idx, None, None, None, None, Some(val));
+                        }
+                    });
+
+                    row_box.append(&spin);
+                    self.rendered_live_widgets.borrow_mut().push(spin.upcast());
+                }
+                "ScaleRow" => {
+                    let step = if row.step > 0.0 { row.step } else { 1.0 };
+                    let max_v = if row.max > row.min { row.max } else { row.min + 100.0 };
+                    let scale = gtk::Scale::with_range(Orientation::Horizontal, row.min, max_v, step);
+                    scale.set_digits(row.digits as i32);
+                    scale.set_draw_value(true);
+                    scale.set_value_pos(gtk::PositionType::Right);
+                    scale.set_value(row.value);
+                    scale.set_sensitive(row.sensitive);
+                    scale.set_size_request(280, -1);
+                    scale.set_valign(gtk::Align::Center);
+
+                    let on_row_changed = self.on_config_row_changed.clone();
+                    scale.connect_value_changed(move |s| {
+                        if sync_flag.get() {
+                            return;
+                        }
+                        let val = s.value();
+                        if let Some(ref cb) = *on_row_changed.borrow() {
+                            cb(slot_clone.clone(), row_idx, None, None, None, None, Some(val));
+                        }
+                    });
+
+                    row_box.append(&scale);
+                    self.rendered_live_widgets.borrow_mut().push(scale.upcast());
+                }
+                "ColorRow" => {
+                    let bg_dialog = ColorDialog::builder().with_alpha(false).build();
+                    let color_btn = ColorDialogButton::new(Some(bg_dialog));
+                    color_btn.set_rgba(&hex_to_rgba(&row.color));
+                    color_btn.set_valign(gtk::Align::Center);
+                    color_btn.set_sensitive(row.sensitive);
+
+                    let on_row_changed = self.on_config_row_changed.clone();
+                    color_btn.connect_rgba_notify(move |cb_btn| {
+                        if sync_flag.get() {
+                            return;
+                        }
+                        let rgba = cb_btn.rgba();
+                        let hex = rgba_to_hex(&rgba);
+                        if let Some(ref cb) = *on_row_changed.borrow() {
+                            cb(slot_clone.clone(), row_idx, None, None, None, Some(hex), None);
+                        }
+                    });
+
+                    row_box.append(&color_btn);
+                    self.rendered_live_widgets.borrow_mut().push(color_btn.upcast());
+
+                    if !row.subtitle.is_empty() {
+                        let sub = Label::new(Some(&row.subtitle));
+                        sub.add_css_class("dim-label");
+                        sub.set_valign(gtk::Align::Center);
+                        row_box.append(&sub);
+                    }
+                }
+                "ButtonRow" => {
+                    let btn = if !row.button_label.is_empty() {
+                        Button::with_label(&row.button_label)
+                    } else if !row.button_icon.is_empty() {
+                        Button::from_icon_name(&row.button_icon)
+                    } else {
+                        Button::with_label("Refresh")
+                    };
+                    btn.set_valign(gtk::Align::Center);
+                    btn.set_sensitive(row.sensitive);
+                    if row.suggested {
+                        btn.add_css_class("suggested-action");
+                    } else {
+                        btn.add_css_class("flat");
+                    }
+
+                    let on_btn = self.on_config_button_clicked.clone();
+                    btn.connect_clicked(move |_| {
+                        if let Some(ref cb) = *on_btn.borrow() {
+                            cb(slot_clone.clone(), row_idx);
+                        }
+                    });
+
+                    row_box.append(&btn);
+                    self.rendered_live_widgets.borrow_mut().push(btn.upcast());
+
+                    if !row.subtitle.is_empty() {
+                        let sub = Label::new(Some(&row.subtitle));
+                        sub.add_css_class("dim-label");
+                        sub.set_valign(gtk::Align::Center);
+                        row_box.append(&sub);
+                    }
+                }
+                _ => {
+                    let sub = Label::new(Some(&row.subtitle));
+                    sub.add_css_class("dim-label");
+                    sub.set_valign(gtk::Align::Center);
+                    sub.set_wrap(true);
+                    row_box.append(&sub);
+                    self.rendered_live_widgets.borrow_mut().push(sub.upcast());
+                }
+            }
+
+            self.dynamic_settings_box.append(&row_box);
+        }
+
+        *self.rendered_live_slot.borrow_mut() = Some(slot.to_string());
+        *self.rendered_live_rows.borrow_mut() = visible_rows;
+        self.is_live_syncing.set(false);
+        self.dynamic_settings_box.set_visible(true);
     }
 
     pub fn mark_assigned(&self) {

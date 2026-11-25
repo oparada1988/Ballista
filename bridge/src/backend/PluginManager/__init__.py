@@ -1,0 +1,1 @@
+"""StreamController PluginManager emulation"""

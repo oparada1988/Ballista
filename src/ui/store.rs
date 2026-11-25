@@ -9,6 +9,7 @@ use gtk::{
     ScrolledWindow, SearchEntry, Stack, StackTransitionType,
 };
 use std::cell::RefCell;
+#[allow(unused_imports)]
 use std::path::PathBuf;
 use std::rc::Rc;
 
@@ -58,14 +59,7 @@ fn load_marketplace_catalog() -> Vec<PluginInfo> {
                     let category = p.get("category").and_then(|v| v.as_str()).unwrap_or("Utility").to_string();
                     let description = p.get("description").and_then(|v| v.as_str()).unwrap_or("").to_string();
                     let download_url = p.get("download_url").and_then(|v| v.as_str()).map(|s| s.to_string());
-
-                    // Check for local project path on workstation
-                    let local_path = match id.as_str() {
-                        "com_oparada_AppLauncher" => Some("/home/oscar/Github Projects/AppLauncher".to_string()),
-                        "com_oparada_DiscordSC" => Some("/home/oscar/Github Projects/DiscordSC".to_string()),
-                        "com_oparada_GoveeStreamController" => Some("/home/oscar/Github Projects/Govee-Streamcontroller".to_string()),
-                        _ => None,
-                    };
+                    let local_path: Option<String> = None;
 
                     // Cache and resolve thumbnail
                     let thumb_url = p.get("thumbnail").and_then(|v| v.as_str());
@@ -148,7 +142,7 @@ fn load_marketplace_catalog() -> Vec<PluginInfo> {
         }
     }
 
-    // Bundled fallback
+    // Bundled offline fallback (100% portable using XDG cache dirs and remote GitHub URLs)
     vec![
         PluginInfo {
             id: "com_oparada_AppLauncher".into(),
@@ -157,12 +151,15 @@ fn load_marketplace_catalog() -> Vec<PluginInfo> {
             author: "oparada1988".into(),
             version: "0.1.0".into(),
             icon: "action_launch.png".into(),
-            thumbnail: Some("/home/oscar/.cache/ballista/market_images/com_oparada_AppLauncher_thumb.png".into()),
+            thumbnail: {
+                let p = img_cache_dir.join("com_oparada_AppLauncher_thumb.png");
+                p.exists().then(|| p.to_string_lossy().to_string())
+            },
             is_file_icon: true,
             fallback_grad: "thumb-grad-utility".into(),
             description: "Easily launch any installed host desktop application from your Stream Deck keys with automatic freedesktop icon and label setup.".into(),
             download_url: Some("https://github.com/oparada1988/AppLauncher/archive/refs/heads/main.zip".into()),
-            local_path: Some("/home/oscar/Github Projects/AppLauncher".into()),
+            local_path: None,
         },
         PluginInfo {
             id: "com_oparada_DiscordSC".into(),
@@ -171,12 +168,15 @@ fn load_marketplace_catalog() -> Vec<PluginInfo> {
             author: "oparada1988".into(),
             version: "1.2.4".into(),
             icon: "user-available-symbolic".into(),
-            thumbnail: Some("/home/oscar/.cache/ballista/market_images/com_oparada_DiscordSC_thumb.png".into()),
+            thumbnail: {
+                let p = img_cache_dir.join("com_oparada_DiscordSC_thumb.png");
+                p.exists().then(|| p.to_string_lossy().to_string())
+            },
             is_file_icon: false,
             fallback_grad: "thumb-grad-streaming".into(),
             description: "Control your Discord client's mute, deafen, notifications, server status, and input modes directly from your Stream Deck.".into(),
             download_url: Some("https://github.com/oparada1988/DiscordSC/archive/refs/heads/main.zip".into()),
-            local_path: Some("/home/oscar/Github Projects/DiscordSC".into()),
+            local_path: None,
         },
         PluginInfo {
             id: "com_oparada_GoveeStreamController".into(),
@@ -185,12 +185,15 @@ fn load_marketplace_catalog() -> Vec<PluginInfo> {
             author: "oparada1988".into(),
             version: "1.0.1".into(),
             icon: "lightbulb-symbolic".into(),
-            thumbnail: Some("/home/oscar/.cache/ballista/market_images/com_oparada_GoveeStreamController_thumb.png".into()),
+            thumbnail: {
+                let p = img_cache_dir.join("com_oparada_GoveeStreamController_thumb.png");
+                p.exists().then(|| p.to_string_lossy().to_string())
+            },
             is_file_icon: false,
             fallback_grad: "thumb-grad-utility".into(),
             description: "Control Govee smart lights, LED strips, and home appliances directly from your Stream Deck.".into(),
             download_url: Some("https://github.com/oparada1988/Govee-Streamcontroller/archive/refs/heads/main.zip".into()),
-            local_path: Some("/home/oscar/Github Projects/Govee-Streamcontroller".into()),
+            local_path: None,
         },
     ]
 }
@@ -199,6 +202,7 @@ pub fn create_store_window(
     parent: &impl IsA<gtk::Window>,
     plugin_manager: Rc<RefCell<PluginManager>>,
     on_plugin_installed: Rc<dyn Fn()>,
+    on_open_plugin_settings: Rc<dyn Fn(String, String)>,
 ) -> Window {
     let _saved_state = WindowState::load();
 
@@ -348,10 +352,17 @@ pub fn create_store_window(
     detail_title_col.append(&detail_meta_lbl);
     detail_header_card.append(&detail_title_col);
 
+    let detail_action_col = Box::new(Orientation::Vertical, 4);
+    detail_action_col.set_valign(gtk::Align::Center);
     let detail_action_btn = Button::with_label("Install");
     detail_action_btn.add_css_class("btn-install");
-    detail_action_btn.set_valign(gtk::Align::Center);
-    detail_header_card.append(&detail_action_btn);
+    let detail_pbar = gtk::ProgressBar::new();
+    detail_pbar.add_css_class("store-pbar");
+    detail_pbar.set_size_request(88, 4);
+    detail_pbar.set_visible(false);
+    detail_action_col.append(&detail_action_btn);
+    detail_action_col.append(&detail_pbar);
+    detail_header_card.append(&detail_action_col);
 
     detail_scroll_content.append(&detail_header_card);
 
@@ -502,14 +513,19 @@ pub fn create_store_window(
     // Run initial header check on open
     refresh_header_status();
 
+    // Shared hook so installing/updating/uninstalling from ANY page syncs the Main Popular catalog cards
+    let refresh_main_catalog_cell: Rc<RefCell<Option<Rc<dyn Fn()>>>> = Rc::new(RefCell::new(None));
+
     let render_installed_list_cell: Rc<RefCell<Option<Rc<dyn Fn()>>>> = Rc::new(RefCell::new(None));
     let render_installed_list = {
         let list_box_inner = list_box_ref.clone();
         let pm_inner = pm_inst_refresh.clone();
         let on_cb_inner = on_inst_refresh_cb.clone();
         let refresh_hdr = refresh_header_status.clone();
+        let refresh_main_cat = refresh_main_catalog_cell.clone();
         let catalog_copy = plugins_catalog.clone();
         let self_cell = render_installed_list_cell.clone();
+        let on_settings_inner = on_open_plugin_settings.clone();
 
         Rc::new(move || {
             while let Some(child) = list_box_inner.first_child() {
@@ -536,8 +552,21 @@ pub fn create_store_window(
                         .subtitle(escaped_desc.as_str())
                         .build();
 
-                    let icon_path = p_obj.path.join("assets").join("action_launch.png");
-                    if icon_path.exists() {
+                    // Resolve best icon from catalog cache or plugin assets directory
+                    let cat_match = catalog_copy.iter().find(|c| c.id == *p_id);
+                    let resolved_icon_file = cat_match
+                        .filter(|c| c.is_file_icon && std::path::Path::new(&c.icon).exists())
+                        .map(|c| std::path::PathBuf::from(&c.icon))
+                        .or_else(|| {
+                            for cand in ["icon.png", "action_launch.png", "govee.png", "store.png"] {
+                                let p = p_obj.path.join("assets").join(cand);
+                                if p.exists() {
+                                    return Some(p);
+                                }
+                            }
+                            None
+                        });
+                    if let Some(icon_path) = resolved_icon_file {
                         let img = Image::from_file(&icon_path);
                         img.set_pixel_size(36);
                         row.add_prefix(&img);
@@ -551,8 +580,7 @@ pub fn create_store_window(
                     btn_box.set_valign(gtk::Align::Center);
                     btn_box.set_halign(gtk::Align::End);
 
-                    // Check if catalog offers an update
-                    let cat_match = catalog_copy.iter().find(|c| c.id == *p_id);
+                    // Check if catalog offers an update (downloads fresh remote archive from download_url)
                     if let Some(cat_item) = cat_match {
                         let inst_ver = p_obj.version.trim_start_matches('v');
                         let cat_ver = cat_item.version.trim_start_matches('v');
@@ -562,36 +590,74 @@ pub fn create_store_window(
                             update_btn.set_valign(gtk::Align::Center);
                             update_btn.set_halign(gtk::Align::End);
 
-                            let manifest_path = p_obj.path.join("manifest.json");
-                            let new_ver = cat_ver.to_string();
+                            let btn_up_clone = update_btn.clone();
                             let pm_up = pm_inner.clone();
-                            let on_uninst_cb = on_cb_inner.clone();
+                            let on_up_cb = on_cb_inner.clone();
                             let refresh_hdr_click = refresh_hdr.clone();
+                            let refresh_cat_click = refresh_main_cat.clone();
                             let self_cell_clone = self_cell.clone();
+                            let d_url_up = cat_item.download_url.clone().unwrap_or_default();
+                            let pid_up = p_id.clone();
 
                             update_btn.connect_clicked(move |_| {
-                                if manifest_path.exists() {
-                                    if let Ok(content) = std::fs::read_to_string(&manifest_path) {
-                                        if let Ok(mut val) = serde_json::from_str::<serde_json::Value>(&content) {
-                                            if let Some(obj) = val.as_object_mut() {
-                                                obj.insert("version".to_string(), serde_json::Value::String(new_ver.clone()));
-                                                if let Ok(updated_str) = serde_json::to_string_pretty(&val) {
-                                                    let _ = std::fs::write(&manifest_path, updated_str);
+                                btn_up_clone.set_label("Updating...");
+                                btn_up_clone.set_sensitive(false);
+
+                                let (tx, rx) = async_channel::bounded::<Result<(), String>>(1);
+                                let d_url = d_url_up.clone();
+                                let pid_dl = pid_up.clone();
+                                let p_dir = pm_up.borrow().plugins_dir.clone();
+
+                                std::thread::spawn(move || {
+                                    let res = PluginManager::download_and_extract_plugin(&p_dir, &pid_dl, &d_url);
+                                    let _ = tx.send_blocking(res);
+                                });
+
+                                let btn_done = btn_up_clone.clone();
+                                let pm_done = pm_up.clone();
+                                let on_done = on_up_cb.clone();
+                                let ref_hdr = refresh_hdr_click.clone();
+                                let ref_cat = refresh_cat_click.clone();
+                                let self_done = self_cell_clone.clone();
+
+                                glib::spawn_future_local(async move {
+                                    if let Ok(res) = rx.recv().await {
+                                        match res {
+                                            Ok(()) => {
+                                                pm_done.borrow_mut().rescan_plugins();
+                                                on_done();
+                                                ref_hdr();
+                                                if let Some(ref rc) = *ref_cat.borrow() {
+                                                    rc();
                                                 }
+                                                if let Some(ref r) = *self_done.borrow() {
+                                                    r();
+                                                }
+                                            }
+                                            Err(e) => {
+                                                tracing::error!("Failed to update plugin: {e}");
+                                                btn_done.set_label("Retry Update");
+                                                btn_done.set_sensitive(true);
                                             }
                                         }
                                     }
-                                }
-                                pm_up.borrow_mut().rescan_plugins();
-                                on_uninst_cb();
-                                refresh_hdr_click();
-                                if let Some(ref r) = *self_cell_clone.borrow() {
-                                    r();
-                                }
+                                });
                             });
                             btn_box.append(&update_btn);
                         }
                     }
+
+                    let settings_btn = Button::from_icon_name("preferences-system-symbolic");
+                    settings_btn.add_css_class("flat");
+                    settings_btn.set_tooltip_text(Some(&format!("{} Settings", p_obj.name)));
+                    settings_btn.set_valign(gtk::Align::Center);
+                    let pid_set = p_id.clone();
+                    let pname_set = p_obj.name.clone();
+                    let on_set_cb = on_settings_inner.clone();
+                    settings_btn.connect_clicked(move |_| {
+                        on_set_cb(pid_set.clone(), pname_set.clone());
+                    });
+                    btn_box.append(&settings_btn);
 
                     let uninst_btn = Button::with_label("Uninstall");
                     uninst_btn.add_css_class("btn-uninstall");
@@ -601,17 +667,32 @@ pub fn create_store_window(
                     let pid_clone = p_id.clone();
                     let pm_uninst = pm_inner.clone();
                     let on_uninst_cb = on_cb_inner.clone();
-                    let card_clone = card.clone();
-                    let list_box_sub = list_box_inner.clone();
                     let refresh_hdr_uninst = refresh_hdr.clone();
+                    let refresh_cat_uninst = refresh_main_cat.clone();
+                    let self_uninst = self_cell.clone();
 
-                    uninst_btn.connect_clicked(move |_| {
+                    uninst_btn.connect_clicked(move |btn| {
+                        btn.set_sensitive(false);
                         let mut pm_mut = pm_uninst.borrow_mut();
                         let _ = pm_mut.uninstall_plugin(&pid_clone);
                         drop(pm_mut);
-                        list_box_sub.remove(&card_clone);
-                        on_uninst_cb();
-                        refresh_hdr_uninst();
+
+                        // Defer widget removal until after GTK finishes handling this click event
+                        // (prevents Gtk-CRITICAL: gtk_list_box_row_grab_focus on destroyed row)
+                        let on_cb = on_uninst_cb.clone();
+                        let ref_hdr = refresh_hdr_uninst.clone();
+                        let ref_cat = refresh_cat_uninst.clone();
+                        let self_ref = self_uninst.clone();
+                        glib::idle_add_local_once(move || {
+                            on_cb();
+                            ref_hdr();
+                            if let Some(ref rc) = *ref_cat.borrow() {
+                                rc();
+                            }
+                            if let Some(ref r) = *self_ref.borrow() {
+                                r();
+                            }
+                        });
                     });
 
                     btn_box.append(&uninst_btn);
@@ -643,6 +724,85 @@ pub fn create_store_window(
     let pm_detail = plugin_manager.clone();
     let on_installed_detail = on_plugin_installed.clone();
 
+    // Single persistent click handler for Detail Page Install button (prevents stacked duplicate downloads!)
+    let current_detail_plugin: Rc<RefCell<Option<PluginInfo>>> = Rc::new(RefCell::new(None));
+    {
+        let cur_plugin_click = current_detail_plugin.clone();
+        let btn_clone = detail_action_btn.clone();
+        let pbar_clone = detail_pbar.clone();
+        let pm_action = pm_detail.clone();
+        let on_inst_action = on_installed_detail.clone();
+        let ref_hdr_action = refresh_header_status.clone();
+        let ref_cat_action = refresh_main_catalog_cell.clone();
+
+        detail_action_btn.connect_clicked(move |_| {
+            let Some(plugin) = cur_plugin_click.borrow().clone() else {
+                return;
+            };
+            btn_clone.set_label("Downloading...");
+            btn_clone.remove_css_class("btn-install");
+            btn_clone.add_css_class("btn-downloading");
+            btn_clone.set_sensitive(false);
+            pbar_clone.set_visible(true);
+            pbar_clone.pulse();
+
+            let pbar_pulse = pbar_clone.clone();
+            let pulse_source = glib::timeout_add_local(std::time::Duration::from_millis(80), move || {
+                pbar_pulse.pulse();
+                glib::ControlFlow::Continue
+            });
+            let pulse_cell = std::rc::Rc::new(std::cell::Cell::new(Some(pulse_source)));
+
+            let (tx, rx) = async_channel::bounded::<Result<(), String>>(1);
+            let d_url = plugin.download_url.clone().unwrap_or_default();
+            let p_id = plugin.id.clone();
+            let p_dir = pm_action.borrow().plugins_dir.clone();
+
+            std::thread::spawn(move || {
+                let res = PluginManager::download_and_extract_plugin(&p_dir, &p_id, &d_url);
+                let _ = tx.send_blocking(res);
+            });
+
+            let btn_done = btn_clone.clone();
+            let pbar_done = pbar_clone.clone();
+            let on_inst_done = on_inst_action.clone();
+            let ref_hdr_done = ref_hdr_action.clone();
+            let ref_cat_done = ref_cat_action.clone();
+            let pm_done = pm_action.clone();
+            let pulse_done = pulse_cell.clone();
+
+            glib::spawn_future_local(async move {
+                if let Ok(res) = rx.recv().await {
+                    if let Some(src) = pulse_done.take() {
+                        src.remove();
+                    }
+                    pbar_done.set_visible(false);
+                    match res {
+                        Ok(()) => {
+                            pm_done.borrow_mut().rescan_plugins();
+                            btn_done.set_label("Installed");
+                            btn_done.remove_css_class("btn-downloading");
+                            btn_done.add_css_class("btn-installed");
+                            btn_done.set_sensitive(false);
+                            on_inst_done();
+                            ref_hdr_done();
+                            if let Some(ref rc) = *ref_cat_done.borrow() {
+                                rc();
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!("Failed to install plugin: {e}");
+                            btn_done.set_label("Install");
+                            btn_done.remove_css_class("btn-downloading");
+                            btn_done.add_css_class("btn-install");
+                            btn_done.set_sensitive(true);
+                        }
+                    }
+                }
+            });
+        });
+    }
+
     let open_plugin_detail = Rc::new({
         let stack_inner = stack_ref.clone();
         let back_btn_inner = back_btn_ref.clone();
@@ -653,11 +813,13 @@ pub fn create_store_window(
         let desc_lbl = desc_lbl.clone();
         let icon_img = detail_icon.clone();
         let action_btn = detail_action_btn.clone();
+        let pbar = detail_pbar.clone();
         let shot1 = shot_pic_1.clone();
         let pm_inner = pm_detail.clone();
-        let on_inst_inner = on_installed_detail.clone();
+        let cur_plugin_set = current_detail_plugin.clone();
 
         move |plugin: PluginInfo| {
+            *cur_plugin_set.borrow_mut() = Some(plugin.clone());
             name_lbl.set_text(&plugin.name);
             meta_lbl.set_text(&format!("by {} • {} • {}", plugin.author, plugin.version, plugin.category));
             desc_lbl.set_text(&plugin.description);
@@ -692,7 +854,9 @@ pub fn create_store_window(
             // Check if installed
             let is_installed = pm_inner.borrow().plugins.contains_key(&plugin.id);
             action_btn.remove_css_class("btn-install");
+            action_btn.remove_css_class("btn-downloading");
             action_btn.remove_css_class("btn-installed");
+            pbar.set_visible(false);
 
             if is_installed {
                 action_btn.set_label("Installed");
@@ -702,39 +866,6 @@ pub fn create_store_window(
                 action_btn.set_label("Install");
                 action_btn.add_css_class("btn-install");
                 action_btn.set_sensitive(true);
-
-                let btn_clone = action_btn.clone();
-                let pm_action = pm_inner.clone();
-                let on_inst_action = on_inst_inner.clone();
-                let local_path = plugin.local_path.clone();
-                let download_url = plugin.download_url.clone();
-                let plugin_id = plugin.id.clone();
-
-                action_btn.connect_clicked(move |_| {
-                    let mut installed = false;
-                    if let Some(ref path_str) = local_path {
-                        let path = PathBuf::from(path_str);
-                        if path.exists() {
-                            if pm_action.borrow_mut().install_from_dir(&path).is_ok() {
-                                installed = true;
-                            }
-                        }
-                    }
-                    if !installed {
-                        if let Some(ref d_url) = download_url {
-                            if pm_action.borrow_mut().install_from_url(&plugin_id, d_url).is_ok() {
-                                installed = true;
-                            }
-                        }
-                    }
-                    if installed {
-                        btn_clone.set_label("Installed");
-                        btn_clone.remove_css_class("btn-install");
-                        btn_clone.add_css_class("btn-installed");
-                        btn_clone.set_sensitive(false);
-                        on_inst_action();
-                    }
-                });
             }
 
             install_local_inner.set_visible(false);
@@ -1022,30 +1153,18 @@ pub fn create_store_window(
     center_content_box.append(&pop_header_box);
 
     let list_box = Box::new(Orientation::Vertical, 10);
-    let mut catalog_items: Vec<(Box, String, String)> = Vec::new();
-
-    for item in plugins_catalog.iter() {
-        let is_installed = plugin_manager.borrow().plugins.contains_key(&item.id);
-        let card = create_catalog_card(item, is_installed, open_plugin_detail.clone(), plugin_manager.clone(), on_plugin_installed.clone(), refresh_header_status.clone());
-        list_box.append(&card);
-        catalog_items.push((card, item.name.clone(), item.category.clone()));
-    }
-    center_content_box.append(&list_box);
-    center_clamp.set_child(Some(&center_content_box));
-    scroll_content.append(&center_clamp);
-
-    let catalog_items_rc = Rc::new(catalog_items);
+    let catalog_items_rc: Rc<RefCell<Vec<(Box, String, String)>>> = Rc::new(RefCell::new(Vec::new()));
     let active_cat = Rc::new(RefCell::new(Option::<String>::None));
 
     let filter_catalog = {
         let items = catalog_items_rc.clone();
         let search_ent = search_entry.clone();
         let active_cat_ref = active_cat.clone();
-        move || {
+        Rc::new(move || {
             let query = search_ent.text().to_string().to_lowercase();
             let cur_cat = active_cat_ref.borrow().clone();
 
-            for (card, title, cats) in items.iter() {
+            for (card, title, cats) in items.borrow().iter() {
                 let matches_cat = match &cur_cat {
                     Some(c) => cats.contains(c.as_str()),
                     None => true,
@@ -1053,8 +1172,46 @@ pub fn create_store_window(
                 let matches_search = query.is_empty() || title.to_lowercase().contains(&query);
                 card.set_visible(matches_cat && matches_search);
             }
-        }
+        })
     };
+
+    let rebuild_main_catalog: Rc<dyn Fn()> = {
+        let lb = list_box.clone();
+        let items_store = catalog_items_rc.clone();
+        let cat_data = plugins_catalog.clone();
+        let pm_cat_main = plugin_manager.clone();
+        let open_det = open_plugin_detail.clone();
+        let on_inst = on_plugin_installed.clone();
+        let ref_hdr = refresh_header_status.clone();
+        let filt = filter_catalog.clone();
+        Rc::new(move || {
+            while let Some(child) = lb.first_child() {
+                lb.remove(&child);
+            }
+            let mut new_items = Vec::new();
+            for item in cat_data.iter() {
+                let is_installed = pm_cat_main.borrow().plugins.contains_key(&item.id);
+                let card = create_catalog_card(
+                    item,
+                    is_installed,
+                    open_det.clone(),
+                    pm_cat_main.clone(),
+                    on_inst.clone(),
+                    ref_hdr.clone(),
+                );
+                lb.append(&card);
+                new_items.push((card, item.name.clone(), item.category.clone()));
+            }
+            *items_store.borrow_mut() = new_items;
+            filt();
+        })
+    };
+    *refresh_main_catalog_cell.borrow_mut() = Some(rebuild_main_catalog.clone());
+    rebuild_main_catalog();
+
+    center_content_box.append(&list_box);
+    center_clamp.set_child(Some(&center_content_box));
+    scroll_content.append(&center_clamp);
 
     for (cat_name, btn) in cat_buttons {
         let open_cat = open_category_page.clone();
@@ -1084,6 +1241,8 @@ pub fn create_store_window(
     // Handle "Install Local Plugin..." dialog
     let pm_local = plugin_manager.clone();
     let on_installed_local = on_plugin_installed.clone();
+    let ref_hdr_local = refresh_header_status.clone();
+    let ref_cat_local = refresh_main_catalog_cell.clone();
     let window_ref = window.clone();
     install_local_btn.connect_clicked(move |_| {
         let dialog = FileDialog::builder()
@@ -1092,12 +1251,18 @@ pub fn create_store_window(
 
         let pm_inner = pm_local.clone();
         let cb_inner = on_installed_local.clone();
+        let ref_hdr_in = ref_hdr_local.clone();
+        let ref_cat_in = ref_cat_local.clone();
         dialog.select_folder(Some(&window_ref), Option::<&gio::Cancellable>::None, move |result| {
             if let Ok(file) = result {
                 if let Some(path) = file.path() {
                     let res = pm_inner.borrow_mut().install_from_dir(&path);
                     if res.is_ok() {
                         cb_inner();
+                        ref_hdr_in();
+                        if let Some(ref rc) = *ref_cat_in.borrow() {
+                            rc();
+                        }
                     }
                 }
             }
@@ -1192,9 +1357,19 @@ fn create_catalog_card(
         .build();
 
     let img = if item.is_file_icon {
-        let full_path = format!("/home/oscar/.local/share/ballista/plugins/com_oparada_AppLauncher/assets/{}", item.icon);
-        if std::path::Path::new(&full_path).exists() {
-            let img = Image::from_file(&full_path);
+        let direct = std::path::PathBuf::from(&item.icon);
+        let asset_path = glib::user_data_dir()
+            .join("ballista")
+            .join("plugins")
+            .join(&item.id)
+            .join("assets")
+            .join(&item.icon);
+        if direct.exists() {
+            let img = Image::from_file(&direct);
+            img.set_pixel_size(32);
+            img
+        } else if asset_path.exists() {
+            let img = Image::from_file(&asset_path);
             img.set_pixel_size(32);
             img
         } else {
@@ -1209,20 +1384,30 @@ fn create_catalog_card(
     };
     row.add_prefix(&img);
 
+    let action_box = Box::new(Orientation::Vertical, 4);
+    action_box.set_valign(gtk::Align::Center);
+    action_box.set_halign(gtk::Align::End);
+
     let btn = Button::with_label(if is_installed { "Installed" } else { "Install" });
     btn.set_valign(gtk::Align::Center);
     btn.set_halign(gtk::Align::End);
 
+    let pbar = gtk::ProgressBar::new();
+    pbar.add_css_class("store-pbar");
+    pbar.set_size_request(82, 4);
+    pbar.set_visible(false);
+
+    action_box.append(&btn);
+    action_box.append(&pbar);
+
     if is_installed {
         let pm_b = plugin_manager.borrow();
         let mut has_update = false;
-        let mut manifest_path_opt = None;
         if let Some(inst) = pm_b.plugins.get(&item.id) {
             let inst_ver = inst.version.trim_start_matches('v');
             let cat_ver = item.version.trim_start_matches('v');
             if cat_ver > inst_ver {
                 has_update = true;
-                manifest_path_opt = Some(inst.path.join("manifest.json"));
             }
         }
         drop(pm_b);
@@ -1236,30 +1421,68 @@ fn create_catalog_card(
             let on_inst_action = on_plugin_installed.clone();
             let on_ref_hdr = on_refresh_header.clone();
             let btn_clone = btn.clone();
-            let new_ver = item.version.trim_start_matches('v').to_string();
+            let pbar_clone = pbar.clone();
+            let d_url_up = item.download_url.clone().unwrap_or_default();
+            let pid_up = item.id.clone();
 
             btn.connect_clicked(move |_| {
-                if let Some(ref m_path) = manifest_path_opt {
-                    if m_path.exists() {
-                        if let Ok(content) = std::fs::read_to_string(m_path) {
-                            if let Ok(mut val) = serde_json::from_str::<serde_json::Value>(&content) {
-                                if let Some(obj) = val.as_object_mut() {
-                                    obj.insert("version".to_string(), serde_json::Value::String(new_ver.clone()));
-                                    if let Ok(updated_str) = serde_json::to_string_pretty(&val) {
-                                        let _ = std::fs::write(m_path, updated_str);
-                                    }
-                                }
+                btn_clone.set_label("Updating...");
+                btn_clone.remove_css_class("store-updates-amber-btn");
+                btn_clone.add_css_class("btn-downloading");
+                btn_clone.set_sensitive(false);
+                pbar_clone.set_visible(true);
+                pbar_clone.pulse();
+
+                let pbar_pulse = pbar_clone.clone();
+                let pulse_source = glib::timeout_add_local(std::time::Duration::from_millis(80), move || {
+                    pbar_pulse.pulse();
+                    glib::ControlFlow::Continue
+                });
+                let pulse_cell = std::rc::Rc::new(std::cell::Cell::new(Some(pulse_source)));
+
+                let (tx, rx) = async_channel::bounded::<Result<(), String>>(1);
+                let d_url = d_url_up.clone();
+                let p_id = pid_up.clone();
+                let p_dir = pm_update.borrow().plugins_dir.clone();
+
+                std::thread::spawn(move || {
+                    let res = PluginManager::download_and_extract_plugin(&p_dir, &p_id, &d_url);
+                    let _ = tx.send_blocking(res);
+                });
+
+                let btn_done = btn_clone.clone();
+                let pbar_done = pbar_clone.clone();
+                let on_inst_done = on_inst_action.clone();
+                let on_ref_done = on_ref_hdr.clone();
+                let pm_done = pm_update.clone();
+                let pulse_done = pulse_cell.clone();
+
+                glib::spawn_future_local(async move {
+                    if let Ok(res) = rx.recv().await {
+                        if let Some(src) = pulse_done.take() {
+                            src.remove();
+                        }
+                        pbar_done.set_visible(false);
+                        match res {
+                            Ok(()) => {
+                                pm_done.borrow_mut().rescan_plugins();
+                                btn_done.set_label("Installed");
+                                btn_done.remove_css_class("btn-downloading");
+                                btn_done.add_css_class("btn-installed");
+                                btn_done.set_sensitive(false);
+                                on_inst_done();
+                                on_ref_done();
+                            }
+                            Err(e) => {
+                                tracing::error!("Failed to update plugin: {e}");
+                                btn_done.set_label("Update");
+                                btn_done.remove_css_class("btn-downloading");
+                                btn_done.add_css_class("store-updates-amber-btn");
+                                btn_done.set_sensitive(true);
                             }
                         }
                     }
-                }
-                pm_update.borrow_mut().rescan_plugins();
-                btn_clone.set_label("Installed");
-                btn_clone.remove_css_class("store-updates-amber-btn");
-                btn_clone.add_css_class("btn-installed");
-                btn_clone.set_sensitive(false);
-                on_inst_action();
-                on_ref_hdr();
+                });
             });
         } else {
             btn.add_css_class("btn-installed");
@@ -1268,41 +1491,74 @@ fn create_catalog_card(
     } else {
         btn.add_css_class("btn-install");
         let btn_clone = btn.clone();
+        let pbar_clone = pbar.clone();
         let pm_inner = plugin_manager.clone();
         let on_inst_inner = on_plugin_installed.clone();
         let on_ref_hdr = on_refresh_header.clone();
-        let local_path = item.local_path.clone();
         let download_url = item.download_url.clone();
         let plugin_id = item.id.clone();
 
         btn.connect_clicked(move |_| {
-            let mut installed = false;
-            if let Some(ref path_str) = local_path {
-                let path = PathBuf::from(path_str);
-                if path.exists() {
-                    if pm_inner.borrow_mut().install_from_dir(&path).is_ok() {
-                        installed = true;
+            btn_clone.set_label("Downloading...");
+            btn_clone.remove_css_class("btn-install");
+            btn_clone.add_css_class("btn-downloading");
+            btn_clone.set_sensitive(false);
+            pbar_clone.set_visible(true);
+            pbar_clone.pulse();
+
+            let pbar_pulse = pbar_clone.clone();
+            let pulse_source = glib::timeout_add_local(std::time::Duration::from_millis(80), move || {
+                pbar_pulse.pulse();
+                glib::ControlFlow::Continue
+            });
+            let pulse_cell = std::rc::Rc::new(std::cell::Cell::new(Some(pulse_source)));
+
+            let (tx, rx) = async_channel::bounded::<Result<(), String>>(1);
+            let d_url = download_url.clone().unwrap_or_default();
+            let p_id = plugin_id.clone();
+            let p_dir = pm_inner.borrow().plugins_dir.clone();
+
+            std::thread::spawn(move || {
+                let res = PluginManager::download_and_extract_plugin(&p_dir, &p_id, &d_url);
+                let _ = tx.send_blocking(res);
+            });
+
+            let btn_done = btn_clone.clone();
+            let pbar_done = pbar_clone.clone();
+            let on_inst_done = on_inst_inner.clone();
+            let on_ref_done = on_ref_hdr.clone();
+            let pm_done = pm_inner.clone();
+            let pulse_done = pulse_cell.clone();
+
+            glib::spawn_future_local(async move {
+                if let Ok(res) = rx.recv().await {
+                    if let Some(src) = pulse_done.take() {
+                        src.remove();
+                    }
+                    pbar_done.set_visible(false);
+                    match res {
+                        Ok(()) => {
+                            pm_done.borrow_mut().rescan_plugins();
+                            btn_done.set_label("Installed");
+                            btn_done.remove_css_class("btn-downloading");
+                            btn_done.add_css_class("btn-installed");
+                            btn_done.set_sensitive(false);
+                            on_inst_done();
+                            on_ref_done();
+                        }
+                        Err(e) => {
+                            tracing::error!("Failed to install plugin: {e}");
+                            btn_done.set_label("Install");
+                            btn_done.remove_css_class("btn-downloading");
+                            btn_done.add_css_class("btn-install");
+                            btn_done.set_sensitive(true);
+                        }
                     }
                 }
-            }
-            if !installed {
-                if let Some(ref d_url) = download_url {
-                    if pm_inner.borrow_mut().install_from_url(&plugin_id, d_url).is_ok() {
-                        installed = true;
-                    }
-                }
-            }
-            if installed {
-                btn_clone.set_label("Installed");
-                btn_clone.remove_css_class("btn-install");
-                btn_clone.add_css_class("btn-installed");
-                btn_clone.set_sensitive(false);
-                on_inst_inner();
-                on_ref_hdr();
-            }
+            });
         });
     }
-    row.add_suffix(&btn);
+    row.add_suffix(&action_box);
     card.append(&row);
 
     let author_line = format!("by {} • {} • {}", item.author, item.version, item.category);

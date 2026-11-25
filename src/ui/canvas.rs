@@ -1,9 +1,69 @@
 use crate::models::{DeviceKind, Profile, TextVerticalAlign};
+use gio::prelude::FileExt;
 use gtk::cairo;
 use gtk::prelude::*;
 use gtk::{Box, Button, CenterBox, DrawingArea, Grid, Label, Orientation, Overlay, Picture};
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+
+pub fn resolve_icon_path(icon_name_or_path: &str, size: i32) -> Option<String> {
+    if icon_name_or_path.is_empty() {
+        return None;
+    }
+    // 1. Direct path check
+    let p = std::path::Path::new(icon_name_or_path);
+    if p.is_absolute() && p.exists() {
+        return Some(icon_name_or_path.to_string());
+    }
+
+    let clean_name = p.file_name().and_then(|n| n.to_str()).unwrap_or(icon_name_or_path);
+
+    // 2. GtkIconTheme lookup (fastest & respects active desktop icon theme: Papirus, Yaru, Adwaita, etc.)
+    if let Some(display) = gtk::gdk::Display::default() {
+        let theme = gtk::IconTheme::for_display(&display);
+        if theme.has_icon(clean_name) {
+            let paintable = theme.lookup_icon(clean_name, &[], size, 1, gtk::TextDirection::None, gtk::IconLookupFlags::empty());
+            if let Some(file) = paintable.file() {
+                if let Some(fp) = file.path() {
+                    if fp.exists() {
+                        return Some(fp.to_string_lossy().to_string());
+                    }
+                }
+            }
+        }
+        let short = clean_name.rsplit('.').next().unwrap_or(clean_name);
+        if short != clean_name && theme.has_icon(short) {
+            let paintable = theme.lookup_icon(short, &[], size, 1, gtk::TextDirection::None, gtk::IconLookupFlags::empty());
+            if let Some(file) = paintable.file() {
+                if let Some(fp) = file.path() {
+                    if fp.exists() {
+                        return Some(fp.to_string_lossy().to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. Fallback filesystem searches in common system and cache directories
+    let home = std::env::var("HOME").unwrap_or_default();
+    let candidates = [
+        format!("{}/.cache/streamcontroller_apps/icons/{clean_name}.png", home),
+        format!("{}/.cache/streamcontroller_apps/icons/{clean_name}.svg", home),
+        format!("/usr/share/pixmaps/{clean_name}.png"),
+        format!("/usr/share/pixmaps/{clean_name}.svg"),
+        format!("/usr/share/icons/hicolor/scalable/apps/{clean_name}.svg"),
+        format!("/usr/share/icons/hicolor/256x256/apps/{clean_name}.png"),
+        format!("/usr/share/icons/hicolor/128x128/apps/{clean_name}.png"),
+        format!("/usr/share/icons/hicolor/48x48/apps/{clean_name}.png"),
+    ];
+    for cand in &candidates {
+        if std::path::Path::new(cand).exists() {
+            return Some(cand.clone());
+        }
+    }
+
+    None
+}
 
 pub fn create_rounded_texture(path: &str, width: i32, height: i32, radius: f64, preserve_aspect: bool) -> Option<gtk::gdk::Texture> {
     use gtk::gdk::prelude::GdkCairoContextExt;
@@ -64,6 +124,14 @@ pub fn lookup_icon_paintable(
     // 2. Icon name (app icon, system icon, or freedesktop path)
     if let Some(name) = icon_name {
         if !name.is_empty() {
+            // Check resolve_icon_path (resolves via GtkIconTheme, theme cache, or system directories)
+            if let Some(resolved) = resolve_icon_path(name, size) {
+                if let Some(texture) = create_rounded_texture(&resolved, size, size, radius, true) {
+                    return Some(texture.upcast());
+                } else if let Ok(pb) = gdk_pixbuf::Pixbuf::from_file_at_scale(&resolved, size, size, true) {
+                    return Some(gtk::gdk::Texture::for_pixbuf(&pb).upcast());
+                }
+            }
             // Direct path check if name is a filepath
             if std::path::Path::new(name).exists() {
                 if let Some(texture) = create_rounded_texture(name, size, size, radius, true) {
@@ -118,12 +186,18 @@ pub fn lookup_icon_paintable(
                     return Some(paintable.upcast());
                 }
             }
-            // Fallback to default_app.png if available
-            let fallback_app = "/home/oscar/.local/share/ballista/plugins/com_oparada_AppLauncher/assets/default_app.png";
-            if std::path::Path::new(fallback_app).exists() {
-                if let Some(texture) = create_rounded_texture(fallback_app, size, size, radius, true) {
+            // Fallback to AppLauncher default_app.png if installed
+            let fallback_app = glib::user_data_dir()
+                .join("ballista")
+                .join("plugins")
+                .join("com_oparada_AppLauncher")
+                .join("assets")
+                .join("default_app.png");
+            if fallback_app.exists() {
+                let fallback_str = fallback_app.to_string_lossy();
+                if let Some(texture) = create_rounded_texture(&fallback_str, size, size, radius, true) {
                     return Some(texture.upcast());
-                } else if let Ok(pb) = gdk_pixbuf::Pixbuf::from_file_at_scale(fallback_app, size, size, true) {
+                } else if let Ok(pb) = gdk_pixbuf::Pixbuf::from_file_at_scale(&fallback_app, size, size, true) {
                     return Some(gtk::gdk::Texture::for_pixbuf(&pb).upcast());
                 }
             }
@@ -137,6 +211,8 @@ pub struct Canvas {
     pub hardware_area: Box,
     pub key_buttons: Rc<RefCell<Vec<Button>>>,
     pub key_labels: Rc<RefCell<Vec<Label>>>,
+    pub key_top_labels: Rc<RefCell<Vec<Label>>>,
+    pub key_center_labels: Rc<RefCell<Vec<Label>>>,
     pub key_icons: Rc<RefCell<Vec<Picture>>>,
     pub key_overlays: Rc<RefCell<Vec<Overlay>>>,
     pub touch_segments: Rc<RefCell<Vec<Box>>>,
@@ -145,6 +221,8 @@ pub struct Canvas {
     pub touch_capsule: Rc<RefCell<Option<Box>>>,
     pub touch_overlay: Rc<RefCell<Option<Overlay>>>,
     pub touch_wallpaper_pic: Rc<RefCell<Option<Picture>>>,
+    pub dials_row_box: Rc<RefCell<Option<Box>>>,
+    pub neo_info_label: Rc<RefCell<Option<Label>>>,
     pub dial_draw_areas: Rc<RefCell<Vec<DrawingArea>>>,
     pub dial_angles: Rc<RefCell<Vec<Rc<Cell<f64>>>>>,
     pub selected_dial_idx: Rc<RefCell<Option<usize>>>,
@@ -223,6 +301,8 @@ impl Canvas {
             hardware_area,
             key_buttons: Rc::new(RefCell::new(Vec::new())),
             key_labels: Rc::new(RefCell::new(Vec::new())),
+            key_top_labels: Rc::new(RefCell::new(Vec::new())),
+            key_center_labels: Rc::new(RefCell::new(Vec::new())),
             key_icons: Rc::new(RefCell::new(Vec::new())),
             key_overlays: Rc::new(RefCell::new(Vec::new())),
             touch_segments: Rc::new(RefCell::new(Vec::new())),
@@ -231,6 +311,8 @@ impl Canvas {
             touch_capsule: Rc::new(RefCell::new(None)),
             touch_overlay: Rc::new(RefCell::new(None)),
             touch_wallpaper_pic: Rc::new(RefCell::new(None)),
+            dials_row_box: Rc::new(RefCell::new(None)),
+            neo_info_label: Rc::new(RefCell::new(None)),
             dial_draw_areas: Rc::new(RefCell::new(Vec::new())),
             dial_angles: Rc::new(RefCell::new(Vec::new())),
             selected_dial_idx: Rc::new(RefCell::new(None)),
@@ -274,17 +356,24 @@ impl Canvas {
         }
         self.key_buttons.borrow_mut().clear();
         self.key_labels.borrow_mut().clear();
+        self.key_top_labels.borrow_mut().clear();
+        self.key_center_labels.borrow_mut().clear();
         self.key_icons.borrow_mut().clear();
         self.key_overlays.borrow_mut().clear();
         self.touch_segments.borrow_mut().clear();
         self.touch_labels.borrow_mut().clear();
         self.touch_icons.borrow_mut().clear();
+        *self.touch_capsule.borrow_mut() = None;
+        *self.touch_overlay.borrow_mut() = None;
+        *self.touch_wallpaper_pic.borrow_mut() = None;
+        *self.dials_row_box.borrow_mut() = None;
+        *self.neo_info_label.borrow_mut() = None;
         self.dial_draw_areas.borrow_mut().clear();
         self.dial_angles.borrow_mut().clear();
 
         let (rows, cols) = kind.grid_dimensions();
 
-        // 1. Unified Grid System (Locking Keys, Touchscreen, and Dials to identical column positions)
+        // 1. Unified Grid System
         let grid = Grid::new();
         grid.set_halign(gtk::Align::Center);
         grid.set_valign(gtk::Align::Center);
@@ -292,21 +381,29 @@ impl Canvas {
         grid.set_vexpand(false);
 
         let (btn_size, spacing) = match kind {
-            DeviceKind::StreamDeckXL => (74, 10),
-            DeviceKind::StreamDeckPlusXL => (68, 8),
+            DeviceKind::StreamDeckStudio => (44, 6),
+            DeviceKind::StreamDeckPlusXL => (64, 8),
+            DeviceKind::StreamDeckXL => (72, 10),
             DeviceKind::StreamDeckMini => (94, 14),
             DeviceKind::StreamDeckPedal => (120, 18),
-            _ => (86, 12), // StreamDeckMK2 (15) and StreamDeckPlus (8)
+            _ => (86, 12), // Original, MK.2, Neo, Plus
+        };
+        let btn_height = if kind == DeviceKind::StreamDeckStudio {
+            (btn_size as f64 * 1.45) as i32
+        } else {
+            btn_size
         };
         self.current_btn_size.set(btn_size);
 
         grid.set_row_spacing(spacing);
         grid.set_column_spacing(spacing);
         grid.set_column_homogeneous(true);
-        grid.set_row_homogeneous(true);
+        grid.set_row_homogeneous(false);
 
         let mut key_buttons = Vec::new();
         let mut key_labels = Vec::new();
+        let mut key_top_labels = Vec::new();
+        let mut key_center_labels = Vec::new();
         let mut key_icons = Vec::new();
         let mut key_overlays = Vec::new();
 
@@ -317,7 +414,7 @@ impl Canvas {
                 let btn = Button::new();
                 btn.add_css_class("deck-key");
                 btn.add_css_class(&format!("deck-key-slot-{}", idx));
-                btn.set_size_request(btn_size, btn_size);
+                btn.set_size_request(btn_size, btn_height);
                 btn.set_hexpand(false);
                 btn.set_vexpand(false);
                 btn.set_overflow(gtk::Overflow::Hidden);
@@ -342,7 +439,7 @@ impl Canvas {
                 let overlay = Overlay::new();
                 overlay.set_can_target(false);
                 overlay.set_overflow(gtk::Overflow::Hidden);
-                overlay.set_size_request(btn_size, btn_size);
+                overlay.set_size_request(btn_size, btn_height);
                 overlay.set_hexpand(false);
                 overlay.set_vexpand(false);
 
@@ -351,48 +448,61 @@ impl Canvas {
                 icon.set_content_fit(gtk::ContentFit::Contain);
                 icon.set_halign(gtk::Align::Center);
                 icon.set_valign(gtk::Align::Center);
-                icon.set_size_request(btn_size, btn_size);
+                icon.set_size_request(btn_size, btn_height);
                 icon.set_visible(false);
                 icon.set_can_target(false);
 
-                let label = Label::new(None);
-                label.add_css_class("deck-key-label");
-                label.set_wrap(true);
-                label.set_justify(gtk::Justification::Center);
-                label.set_halign(gtk::Align::Center);
-                label.set_valign(gtk::Align::End);
-                label.set_margin_start(4);
-                label.set_margin_end(4);
-                label.set_margin_top(4);
-                label.set_margin_bottom(4);
-                label.set_visible(false);
-                label.set_can_target(false);
+                let make_key_label = |valign: gtk::Align| {
+                    let lbl = Label::new(None);
+                    lbl.add_css_class("deck-key-label");
+                    lbl.set_wrap(true);
+                    lbl.set_justify(gtk::Justification::Center);
+                    lbl.set_halign(gtk::Align::Center);
+                    lbl.set_valign(valign);
+                    lbl.set_margin_start(4);
+                    lbl.set_margin_end(4);
+                    lbl.set_margin_top(4);
+                    lbl.set_margin_bottom(4);
+                    lbl.set_visible(false);
+                    lbl.set_can_target(false);
+                    lbl
+                };
+
+                let label = make_key_label(gtk::Align::End);
+                let top_label = make_key_label(gtk::Align::Start);
+                let center_label = make_key_label(gtk::Align::Center);
 
                 overlay.set_child(Some(&icon));
+                overlay.add_overlay(&top_label);
+                overlay.add_overlay(&center_label);
                 overlay.add_overlay(&label);
                 btn.set_child(Some(&overlay));
 
                 grid.attach(&btn, c as i32, r as i32, 1, 1);
                 key_buttons.push(btn);
                 key_labels.push(label);
+                key_top_labels.push(top_label);
+                key_center_labels.push(center_label);
                 key_icons.push(icon);
                 key_overlays.push(overlay);
             }
         }
 
-        // 2. Stream Deck Plus / Stream Deck Plus XL: Touchscreen Capsule & Dials
-        if kind.has_dials() {
-            let dial_count = kind.dial_count();
-            let strip_width = cols as i32 * btn_size + (cols as i32 - 1) * spacing as i32;
-            let strip_height = 52;
+        let strip_width = cols as i32 * btn_size + (cols as i32 - 1) * spacing as i32;
 
-            // Row `rows`: Continuous Touchscreen Capsule spanning the entire width
+        // 2a. Stream Deck Plus / Stream Deck Plus XL: Full-Width Touchscreen Capsule
+        if kind.has_touchscreen() {
+            let dial_count = kind.dial_count();
+            let strip_height = (btn_size as f64 * 0.62).clamp(44.0, 60.0) as i32;
+
+            // Row `rows`: Continuous Touchscreen Capsule spanning all `cols` columns
             let touch_overlay = Overlay::new();
             touch_overlay.add_css_class("deck-touchscreen-capsule");
             touch_overlay.set_hexpand(false);
             touch_overlay.set_vexpand(false);
             touch_overlay.set_halign(gtk::Align::Center);
             touch_overlay.set_valign(gtk::Align::Center);
+            touch_overlay.set_margin_top(6);
             touch_overlay.set_size_request(strip_width, strip_height);
 
             let touch_wallpaper_pic = Picture::new();
@@ -404,6 +514,7 @@ impl Canvas {
             touch_overlay.set_child(Some(&touch_wallpaper_pic));
 
             let touch_capsule = Box::new(Orientation::Horizontal, 0);
+            touch_capsule.set_homogeneous(true);
             touch_capsule.set_hexpand(false);
             touch_capsule.set_vexpand(false);
             touch_capsule.set_size_request(strip_width, strip_height);
@@ -416,9 +527,9 @@ impl Canvas {
                 let slot_box = Box::new(Orientation::Vertical, 2);
                 slot_box.add_css_class("deck-touch-slot");
                 slot_box.add_css_class(&format!("deck-touch-slot-{}", slot_idx));
-                slot_box.set_hexpand(false);
+                slot_box.set_hexpand(true);
                 slot_box.set_vexpand(false);
-                slot_box.set_size_request(btn_size, strip_height);
+                slot_box.set_size_request(-1, strip_height);
 
                 let slot_icon = Picture::new();
                 slot_icon.set_can_shrink(true);
@@ -496,17 +607,37 @@ impl Canvas {
             *self.touch_capsule.borrow_mut() = Some(touch_capsule);
             *self.touch_overlay.borrow_mut() = Some(touch_overlay);
             *self.touch_wallpaper_pic.borrow_mut() = Some(touch_wallpaper_pic);
+        }
 
-            // Row `rows + 1`: Rotary Dials centered directly under column 0..cols!
-            let dial_row = (rows + 1) as i32;
+        // 2b. Stream Deck Plus (4 dials), Stream Deck Plus XL (6 dials), Stream Deck Studio (2 dials):
+        // Evenly distributed full-width homogeneous row directly aligned with the touchscreen cards above!
+        if kind.has_dials() {
+            let dial_count = kind.dial_count();
+            let dial_row = if kind.has_touchscreen() {
+                (rows + 1) as i32
+            } else {
+                rows as i32
+            };
+            let dial_size = (btn_size as f64 * 0.72).clamp(48.0, 68.0) as i32;
+
+            let dials_row_box = Box::new(Orientation::Horizontal, 0);
+            dials_row_box.set_homogeneous(true);
+            dials_row_box.set_halign(gtk::Align::Center);
+            dials_row_box.set_valign(gtk::Align::Center);
+            dials_row_box.set_hexpand(false);
+            dials_row_box.set_vexpand(false);
+            dials_row_box.set_margin_top(6);
+            dials_row_box.set_size_request(strip_width, -1);
+
             let mut dial_draw_areas = Vec::new();
             let mut dial_angles = Vec::new();
 
             for dial_idx in 0..dial_count {
                 let dial_wrapper = Box::new(Orientation::Vertical, 0);
-                dial_wrapper.set_halign(gtk::Align::Center);
+                dial_wrapper.set_hexpand(true);
+                dial_wrapper.set_halign(gtk::Align::Fill);
                 dial_wrapper.set_valign(gtk::Align::Center);
-                dial_wrapper.set_size_request(btn_size, btn_size);
+                dial_wrapper.set_size_request(-1, dial_size + 12);
 
                 // Drag and Drop Target for Actions dropped onto Rotary Dial
                 let dial_drop = gtk::DropTarget::new(glib::Type::STRING, gtk::gdk::DragAction::COPY);
@@ -526,9 +657,9 @@ impl Canvas {
                 dial_wrapper.add_controller(dial_drop);
 
                 let da = DrawingArea::new();
-                da.set_size_request(62, 62);
-                da.set_content_width(62);
-                da.set_content_height(62);
+                da.set_size_request(dial_size, dial_size);
+                da.set_content_width(dial_size);
+                da.set_content_height(dial_size);
                 da.set_halign(gtk::Align::Center);
                 da.set_valign(gtk::Align::Center);
                 da.set_cursor_from_name(Some("grab"));
@@ -718,19 +849,54 @@ impl Canvas {
                 da.add_controller(scroll);
 
                 dial_wrapper.append(&da);
-                grid.attach(&dial_wrapper, dial_idx as i32, dial_row, 1, 1);
+                dials_row_box.append(&dial_wrapper);
                 dial_draw_areas.push(da);
             }
+            grid.attach(&dials_row_box, 0, dial_row, cols as i32, 1);
+            *self.dials_row_box.borrow_mut() = Some(dials_row_box);
             *self.dial_draw_areas.borrow_mut() = dial_draw_areas;
             *self.dial_angles.borrow_mut() = dial_angles;
-        } else {
-            *self.touch_capsule.borrow_mut() = None;
+        }
+
+        // 2c. Stream Deck Neo: Info Bar LCD + Left/Right Touch Points
+        if kind.has_info_screen() {
+            let neo_bar_box = Box::new(Orientation::Horizontal, 16);
+            neo_bar_box.set_halign(gtk::Align::Center);
+            neo_bar_box.set_valign(gtk::Align::Center);
+            neo_bar_box.set_margin_top(8);
+
+            let left_dot = Label::new(Some("◀"));
+            left_dot.add_css_class("dim-label");
+
+            let info_capsule = Box::new(Orientation::Horizontal, 0);
+            info_capsule.add_css_class("deck-touchscreen-capsule");
+            info_capsule.set_size_request(180, 38);
+            info_capsule.set_halign(gtk::Align::Center);
+            info_capsule.set_valign(gtk::Align::Center);
+
+            let info_lbl = Label::new(Some("Page 1 / 1"));
+            info_lbl.add_css_class("deck-touch-slot-label");
+            info_lbl.set_hexpand(true);
+            info_lbl.set_halign(gtk::Align::Center);
+            info_lbl.set_valign(gtk::Align::Center);
+            info_capsule.append(&info_lbl);
+
+            let right_dot = Label::new(Some("▶"));
+            right_dot.add_css_class("dim-label");
+
+            neo_bar_box.append(&left_dot);
+            neo_bar_box.append(&info_capsule);
+            neo_bar_box.append(&right_dot);
+            grid.attach(&neo_bar_box, 0, rows as i32, cols as i32, 1);
+            *self.neo_info_label.borrow_mut() = Some(info_lbl);
         }
 
         self.hardware_area.append(&grid);
         *self.grid.borrow_mut() = Some(grid);
         *self.key_buttons.borrow_mut() = key_buttons;
         *self.key_labels.borrow_mut() = key_labels;
+        *self.key_top_labels.borrow_mut() = key_top_labels;
+        *self.key_center_labels.borrow_mut() = key_center_labels;
         *self.key_icons.borrow_mut() = key_icons;
         *self.key_overlays.borrow_mut() = key_overlays;
     }
@@ -763,33 +929,52 @@ impl Canvas {
     pub fn update_scale(&self, available_h: i32) {
         let kind = *self.current_kind.borrow();
         let (rows, cols) = kind.grid_dimensions();
-        let row_count = if kind.has_dials() {
+        let row_count = if kind.has_touchscreen() && kind.has_dials() {
             rows as f64 + 1.8
+        } else if kind.has_dials() || kind.has_info_screen() {
+            rows as f64 + 1.0
         } else {
             rows as f64 + 0.6
         };
 
-        let target_size = (((available_h - 110) as f64 / row_count) as i32).clamp(74, 115);
+        let (min_sz, max_sz) = match kind {
+            DeviceKind::StreamDeckStudio => (38, 56),
+            DeviceKind::StreamDeckPlusXL => (52, 78),
+            DeviceKind::StreamDeckXL => (58, 88),
+            _ => (74, 115),
+        };
+
+        let target_size = (((available_h - 110) as f64 / row_count) as i32).clamp(min_sz, max_sz);
         if target_size == self.current_btn_size.get() {
             return;
         }
         self.current_btn_size.set(target_size);
 
-        let spacing = (target_size as f64 * 0.14).clamp(8.0, 16.0) as u32;
+        let target_h = if kind == DeviceKind::StreamDeckStudio {
+            (target_size as f64 * 1.45) as i32
+        } else {
+            target_size
+        };
+
+        let spacing = match kind {
+            DeviceKind::StreamDeckStudio => (target_size as f64 * 0.12).clamp(4.0, 8.0) as u32,
+            DeviceKind::StreamDeckPlusXL => (target_size as f64 * 0.13).clamp(6.0, 12.0) as u32,
+            _ => (target_size as f64 * 0.14).clamp(8.0, 16.0) as u32,
+        };
         if let Some(ref g) = *self.grid.borrow() {
             g.set_row_spacing(spacing);
             g.set_column_spacing(spacing);
         }
 
         for btn in self.key_buttons.borrow().iter() {
-            btn.set_size_request(target_size, target_size);
+            btn.set_size_request(target_size, target_h);
         }
         for ov in self.key_overlays.borrow().iter() {
-            ov.set_size_request(target_size, target_size);
+            ov.set_size_request(target_size, target_h);
         }
 
         let strip_w = cols as i32 * target_size + (cols as i32 - 1) * spacing as i32;
-        let strip_h = (target_size as f64 * 0.60).clamp(44.0, 68.0) as i32;
+        let strip_h = (target_size as f64 * 0.62).clamp(44.0, 68.0) as i32;
         if let Some(ref to) = *self.touch_overlay.borrow() {
             to.set_size_request(strip_w, strip_h);
         }
@@ -800,10 +985,13 @@ impl Canvas {
             tw.set_size_request(strip_w, strip_h);
         }
         for t_btn in self.touch_segments.borrow().iter() {
-            t_btn.set_size_request(target_size, strip_h);
+            t_btn.set_size_request(-1, strip_h);
+        }
+        if let Some(ref db) = *self.dials_row_box.borrow() {
+            db.set_size_request(strip_w, -1);
         }
 
-        let dial_size = (target_size as f64 * 0.72).clamp(52.0, 82.0) as i32;
+        let dial_size = (target_size as f64 * 0.72).clamp(48.0, 76.0) as i32;
         for da in self.dial_draw_areas.borrow().iter() {
             da.set_size_request(dial_size, dial_size);
             da.set_content_width(dial_size);
@@ -943,29 +1131,62 @@ impl Canvas {
         self.add_page_btn.set_sensitive(total_pages < 10);
         self.remove_page_btn.set_sensitive(total_pages > 1);
 
+        if let Some(ref neo_lbl) = *self.neo_info_label.borrow() {
+            neo_lbl.set_text(&format!("Page {} / {}", cur_idx + 1, total_pages.max(1)));
+        }
+
         let mut css = String::new();
         if let Some(page) = profile.current_page() {
             let keys = self.key_buttons.borrow();
             let labels = self.key_labels.borrow();
+            let top_labels = self.key_top_labels.borrow();
+            let center_labels = self.key_center_labels.borrow();
             let icons = self.key_icons.borrow();
 
             // 1. Primary LCD Keys
             for (idx, _btn) in keys.iter().enumerate() {
                 if let Some(action) = page.keys.get(&idx) {
                     let app = action.active_appearance();
-                    let display_title = if !app.show_title || app.title.is_empty() {
-                        ""
-                    } else {
-                        &app.title
-                    };
 
-                    if let Some(label) = labels.get(idx) {
-                        label.set_text(display_title);
-                        label.set_visible(!display_title.is_empty());
-                        match app.vertical_align {
-                            TextVerticalAlign::Top => label.set_valign(gtk::Align::Start),
-                            TextVerticalAlign::Center => label.set_valign(gtk::Align::Center),
-                            TextVerticalAlign::Bottom => label.set_valign(gtk::Align::End),
+                    if app.has_plugin_labels() {
+                        if let Some(t_lbl) = top_labels.get(idx) {
+                            let txt = app.top_label.as_deref().unwrap_or("");
+                            t_lbl.set_text(txt);
+                            t_lbl.set_visible(!txt.is_empty());
+                        }
+                        if let Some(c_lbl) = center_labels.get(idx) {
+                            let txt = app.center_label.as_deref().unwrap_or("");
+                            c_lbl.set_text(txt);
+                            c_lbl.set_visible(!txt.is_empty());
+                        }
+                        if let Some(b_lbl) = labels.get(idx) {
+                            let txt = app.bottom_label.as_deref().unwrap_or("");
+                            b_lbl.set_text(txt);
+                            b_lbl.set_visible(!txt.is_empty());
+                            b_lbl.set_valign(gtk::Align::End);
+                        }
+                    } else {
+                        if let Some(t_lbl) = top_labels.get(idx) {
+                            t_lbl.set_text("");
+                            t_lbl.set_visible(false);
+                        }
+                        if let Some(c_lbl) = center_labels.get(idx) {
+                            c_lbl.set_text("");
+                            c_lbl.set_visible(false);
+                        }
+                        let display_title = if !app.show_title || app.title.is_empty() {
+                            ""
+                        } else {
+                            &app.title
+                        };
+                        if let Some(label) = labels.get(idx) {
+                            label.set_text(display_title);
+                            label.set_visible(!display_title.is_empty());
+                            match app.vertical_align {
+                                TextVerticalAlign::Top => label.set_valign(gtk::Align::Start),
+                                TextVerticalAlign::Center => label.set_valign(gtk::Align::Center),
+                                TextVerticalAlign::Bottom => label.set_valign(gtk::Align::End),
+                            }
                         }
                     }
 
@@ -978,7 +1199,7 @@ impl Canvas {
                         let scale_pct = (app.icon_scale.clamp(20, 100) as f64) / 100.0;
                         let icon_sz = ((btn_sz * scale_pct) as i32).max(12);
 
-                        let icon_path = app.icon_path.as_deref();
+                        let mut icon_path = app.icon_path.as_deref();
                         let icon_name = action.parameters.get("icon_name").map(|s| s.as_str())
                             .or_else(|| match action.action_id.as_str() {
                                 "system.hotkey" => Some("input-keyboard-symbolic"),
@@ -987,6 +1208,17 @@ impl Canvas {
                                 "app_launcher.launch" => Some("system-run"),
                                 _ => None,
                             });
+
+                        // For App Launcher actions: ignore generic placeholder icons if an app has been configured
+                        if action.action_id.contains("AppLauncher") || action.action_id == "app_launcher.launch" {
+                            if action.parameters.contains_key("desktop_id") || action.parameters.contains_key("icon_name") {
+                                if let Some(p) = icon_path {
+                                    if p.ends_with("action_launch.png") || p.ends_with("default_app.png") {
+                                        icon_path = action.parameters.get("icon_path").map(|s| s.as_str());
+                                    }
+                                }
+                            }
+                        }
 
                         if let Some(path) = icon_path {
                             if path.to_lowercase().ends_with(".gif") && std::path::Path::new(path).exists() {
@@ -1082,6 +1314,14 @@ impl Canvas {
                         label.set_text("");
                         label.set_visible(false);
                     }
+                    if let Some(label) = top_labels.get(idx) {
+                        label.set_text("");
+                        label.set_visible(false);
+                    }
+                    if let Some(label) = center_labels.get(idx) {
+                        label.set_text("");
+                        label.set_visible(false);
+                    }
                     if let Some(icon) = icons.get(idx) {
                         icon.set_visible(false);
                     }
@@ -1159,14 +1399,10 @@ impl Canvas {
                 for (idx, _seg) in touch_segs.iter().enumerate() {
                     if let Some(action) = page.dial_actions.get(&idx) {
                         let app = action.active_appearance();
-                        let display_title = if !app.show_title || app.title.is_empty() {
-                            ""
-                        } else {
-                            &app.title
-                        };
+                        let display_title = app.combined_display_summary();
 
                         if let Some(label) = touch_labels.get(idx) {
-                            label.set_text(display_title);
+                            label.set_text(&display_title);
                             label.set_visible(!display_title.is_empty());
                             match app.vertical_align {
                                 TextVerticalAlign::Top => label.set_valign(gtk::Align::Start),

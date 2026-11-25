@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Ballista
+GenericName=Stream Deck Controller
+Comment=Fast, native Elgato Stream Deck controller for Linux with full StreamController plugin compatibility
+Exec=ballista
+Icon=io.github.oparada1988.Ballista
+Terminal=false
+Categories=Utility;HardwareSettings;GTK;
+Keywords=Elgato;StreamDeck;Stream Deck;StreamController;Macro;Deck;
+StartupNotify=true
+StartupWMClass=io.github.oparada1988.Ballista
