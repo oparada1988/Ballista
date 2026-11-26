@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 
@@ -26,6 +26,9 @@ pub struct WindowState {
     /// Per-device brightness (keyed by device serial or fallback path), 0..=100
     #[serde(default)]
     pub device_brightness: HashMap<String, u8>,
+    /// Plugin IDs whose category group is collapsed in the Actions sidebar
+    #[serde(default)]
+    pub collapsed_sidebar_plugins: HashSet<String>,
 }
 
 fn default_store_width() -> i32 {
@@ -47,6 +50,7 @@ impl Default for WindowState {
             store_height: 840,
             close_behavior: CloseBehavior::Ask,
             device_brightness: HashMap::new(),
+            collapsed_sidebar_plugins: HashSet::new(),
         }
     }
 }
@@ -96,5 +100,39 @@ impl WindowState {
     pub fn set_brightness_for(&mut self, device_key: &str, pct: u8) {
         self.device_brightness
             .insert(device_key.to_string(), pct.min(100));
+    }
+
+    pub fn is_sidebar_plugin_collapsed(&self, plugin_id: &str) -> bool {
+        self.collapsed_sidebar_plugins.contains(plugin_id)
+    }
+
+    pub fn set_sidebar_plugin_collapsed(&mut self, plugin_id: &str, collapsed: bool) {
+        if collapsed {
+            self.collapsed_sidebar_plugins.insert(plugin_id.to_string());
+        } else {
+            self.collapsed_sidebar_plugins.remove(plugin_id);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sidebar_collapsed_state_persists_through_serde() {
+        let mut st = WindowState::default();
+        assert!(!st.is_sidebar_plugin_collapsed("com_oparada_MusicAssistant"));
+        st.set_sidebar_plugin_collapsed("com_oparada_MusicAssistant", true);
+        assert!(st.is_sidebar_plugin_collapsed("com_oparada_MusicAssistant"));
+
+        let json = serde_json::to_string(&st).unwrap();
+        let restored: WindowState = serde_json::from_str(&json).unwrap();
+        assert!(restored.is_sidebar_plugin_collapsed("com_oparada_MusicAssistant"));
+        assert!(!restored.is_sidebar_plugin_collapsed("com.ballista.core"));
+
+        let mut restored = restored;
+        restored.set_sidebar_plugin_collapsed("com_oparada_MusicAssistant", false);
+        assert!(!restored.is_sidebar_plugin_collapsed("com_oparada_MusicAssistant"));
     }
 }

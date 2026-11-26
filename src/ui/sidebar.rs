@@ -1,4 +1,5 @@
 use crate::core::PluginManager;
+use crate::models::WindowState;
 use crate::native_sdk::TargetCaps;
 use gtk::prelude::*;
 use gtk::{
@@ -23,7 +24,7 @@ pub struct Sidebar {
     pub container: Box,
     pub search_entry: SearchEntry,
     pub list_box: ListBox,
-    pub filter_items: Rc<RefCell<Vec<(Box, Revealer, Image, String)>>>,
+    pub filter_items: Rc<RefCell<Vec<(Box, Revealer, Image, String, String)>>>,
     pub active_drag_caps: Rc<Cell<Option<TargetCaps>>>,
 }
 
@@ -59,23 +60,35 @@ impl Sidebar {
         scrolled.set_child(Some(&list_box));
         container.append(&scrolled);
 
-        let filter_items: Rc<RefCell<Vec<(Box, Revealer, Image, String)>>> =
+        let filter_items: Rc<RefCell<Vec<(Box, Revealer, Image, String, String)>>> =
             Rc::new(RefCell::new(Vec::new()));
 
-        // Wire search filtering
+        // Wire search filtering (restores persisted collapsed state when search is cleared)
         let items_search = filter_items.clone();
         search_entry.connect_search_changed(move |entry| {
             let q = entry.text().trim().to_lowercase();
             let items = items_search.borrow();
-            for (row, revealer, arrow, search_text) in items.iter() {
-                if q.is_empty() {
+            if q.is_empty() {
+                let saved = WindowState::load();
+                for (row, revealer, arrow, plugin_id, _) in items.iter() {
                     row.set_visible(true);
-                } else if search_text.contains(&q) {
-                    row.set_visible(true);
-                    revealer.set_reveal_child(true);
-                    arrow.set_icon_name(Some("pan-down-symbolic"));
-                } else {
-                    row.set_visible(false);
+                    let expanded = !saved.is_sidebar_plugin_collapsed(plugin_id);
+                    revealer.set_reveal_child(expanded);
+                    arrow.set_icon_name(Some(if expanded {
+                        "pan-down-symbolic"
+                    } else {
+                        "pan-end-symbolic"
+                    }));
+                }
+            } else {
+                for (row, revealer, arrow, _, search_text) in items.iter() {
+                    if search_text.contains(&q) {
+                        row.set_visible(true);
+                        revealer.set_reveal_child(true);
+                        arrow.set_icon_name(Some("pan-down-symbolic"));
+                    } else {
+                        row.set_visible(false);
+                    }
                 }
             }
         });
@@ -142,7 +155,10 @@ impl Sidebar {
 
             self.list_box.append(&empty_hint);
         } else {
-            for (plugin_id, plugin) in &plugin_manager.plugins {
+            let mut sorted_plugins: Vec<(&String, &crate::core::plugin_manager::DiscoveredPlugin)> =
+                plugin_manager.plugins.iter().collect();
+            sorted_plugins.sort_by(|a, b| a.1.name.to_lowercase().cmp(&b.1.name.to_lowercase()));
+            for (plugin_id, plugin) in sorted_plugins {
                 let actions_tuples: Vec<(&str, &str, &str, Option<TargetCaps>)> = plugin
                     .actions
                     .iter()
@@ -182,7 +198,13 @@ impl Sidebar {
         header_content.set_margin_top(7);
         header_content.set_margin_bottom(7);
 
-        let arrow_icon = Image::from_icon_name("pan-down-symbolic");
+        let initial_expanded = !WindowState::load().is_sidebar_plugin_collapsed(plugin_id);
+
+        let arrow_icon = Image::from_icon_name(if initial_expanded {
+            "pan-down-symbolic"
+        } else {
+            "pan-end-symbolic"
+        });
         arrow_icon.set_pixel_size(12);
         arrow_icon.add_css_class("sidebar-category-arrow");
 
@@ -199,10 +221,10 @@ impl Sidebar {
         header_content.append(&count_badge);
         header_btn.set_child(Some(&header_content));
 
-        // Revealer for smooth expand / collapse animation
+        // Revealer for smooth expand / collapse animation (restores persisted state)
         let revealer = Revealer::new();
         revealer.set_transition_type(RevealerTransitionType::SlideDown);
-        revealer.set_reveal_child(true);
+        revealer.set_reveal_child(initial_expanded);
 
         let actions_box = Box::new(Orientation::Vertical, 2);
         actions_box.set_margin_start(4);
@@ -371,15 +393,17 @@ impl Sidebar {
                 row,
                 revealer.clone(),
                 arrow_icon.clone(),
+                plugin_id.to_string(),
                 format!("{} {}", category_name.to_lowercase(), action_name.to_lowercase()),
             ));
         }
 
         revealer.set_child(Some(&actions_box));
 
-        // Connect Header Click to toggle Revealer and Arrow
+        // Connect Header Click to toggle Revealer, Arrow, and persist collapsed state immediately
         let rev_toggle = revealer.clone();
         let arrow_toggle = arrow_icon.clone();
+        let pid_toggle = plugin_id.to_string();
         header_btn.connect_clicked(move |_| {
             let will_reveal = !rev_toggle.reveals_child();
             rev_toggle.set_reveal_child(will_reveal);
@@ -388,6 +412,9 @@ impl Sidebar {
             } else {
                 "pan-end-symbolic"
             }));
+            let mut ws = WindowState::load();
+            ws.set_sidebar_plugin_collapsed(&pid_toggle, !will_reveal);
+            ws.save();
         });
 
         group_box.append(&header_btn);
