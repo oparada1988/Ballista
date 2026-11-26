@@ -1,0 +1,12 @@
+[Unit]
+Description=Ballista - Elgato Stream Deck Boot & Login Screen Branding
+After=local-fs.target systemd-udevd.service systemd-udev-trigger.service
+Before=display-manager.service
+
+[Service]
+Type=oneshot
+ExecStart=@BALLISTA_BIN@ --boot-splash
+TimeoutStartSec=10
+
+[Install]
+WantedBy=multi-user.target

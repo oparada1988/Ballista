@@ -14,6 +14,30 @@ const APP_ID: &str = "io.github.oparada1988.Ballista";
 fn main() -> glib::ExitCode {
     tracing_subscriber::fmt::init();
 
+    // Headless boot/branding CLI modes — run BEFORE GTK/Wayland/D-Bus initialization
+    // so early systemd boot (ballista-boot.service) can paint Ballista branding with no display server.
+    let cli_args: Vec<String> = std::env::args().skip(1).collect();
+    if cli_args
+        .iter()
+        .any(|a| a == "--boot-splash" || a == "--splash" || a == "--blank")
+    {
+        let is_blank = cli_args.iter().any(|a| a == "--blank");
+        let no_fade = cli_args.iter().any(|a| a == "--no-fade");
+        let hold_fade_off = cli_args.iter().any(|a| a == "--hold-fade-off");
+        let brightness = if is_blank {
+            0
+        } else {
+            cli_args
+                .windows(2)
+                .find(|w| w[0] == "--brightness")
+                .and_then(|w| w[1].parse::<u8>().ok())
+                .unwrap_or(75)
+                .min(100)
+        };
+        core::HardwareManager::run_boot_splash(brightness, !no_fade, hold_fade_off);
+        return glib::ExitCode::SUCCESS;
+    }
+
     let app = adw::Application::builder()
         .application_id(APP_ID)
         .flags(gio::ApplicationFlags::HANDLES_COMMAND_LINE)

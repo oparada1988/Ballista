@@ -65,6 +65,7 @@ impl MainWindow {
         hardware_manager.borrow().set_native_host(native_host.clone());
         let devices = hardware_manager.borrow().scan_devices();
 
+        let initially_locked = PowerMonitor::query_screen_locked_now();
         let boot_targets: Vec<_> = devices
             .iter()
             .map(|d| {
@@ -92,10 +93,20 @@ impl MainWindow {
             })
             .collect();
         if !boot_targets.is_empty() {
-            hardware_manager.borrow().sync_all_devices_async(boot_targets);
+            if initially_locked {
+                let lock_targets: Vec<_> = boot_targets
+                    .iter()
+                    .map(|(p, _, kind, _, bright)| (p.clone(), *kind, *bright))
+                    .collect();
+                hardware_manager
+                    .borrow()
+                    .fade_to_branding_all_async(lock_targets, false);
+            } else {
+                hardware_manager.borrow().sync_all_devices_async(boot_targets);
+            }
         }
         tracing::info!(
-            "Phase-1 boot hardware dispatch queued for {} device(s) in {:?}",
+            "Phase-1 boot hardware dispatch queued for {} device(s) (locked={initially_locked}) in {:?}",
             devices.len(),
             boot_t0.elapsed()
         );
@@ -289,11 +300,14 @@ impl MainWindow {
             initial_tray_names,
         )));
 
-        // Full Graceful Quit Helper (triggered ONLY by Tray "Quit Ballista", Ctrl+Q, or Close Dialog "Quit")
+        // Full Graceful Quit Helper (triggered by Tray "Quit Ballista", Ctrl+Q, Close Dialog "Quit",
+        // or SIGTERM/SIGINT on logout/service stop)
         let power_monitor_cell: Rc<RefCell<Option<Rc<PowerMonitor>>>> = Rc::new(RefCell::new(None));
         let is_quitting = Rc::new(Cell::new(false));
-        let perform_full_quit: Rc<dyn Fn()> = {
+        let shutdown_transition_done = Rc::new(Cell::new(false));
+        let perform_graceful_exit: Rc<dyn Fn(bool)> = {
             let quitting = is_quitting.clone();
+            let shut_done = shutdown_transition_done.clone();
             let win_q = window.clone();
             let paned_q = paned.clone();
             let work_paned_q = work_paned.clone();
@@ -304,11 +318,13 @@ impl MainWindow {
             let persist_q = persist_profiles.clone();
             let hold_q = hold_guard.clone();
             let app_q = app.clone();
-            Rc::new(move || {
+            Rc::new(move |fade_to_zero_after_hold: bool| {
                 if quitting.replace(true) {
                     return;
                 }
-                tracing::info!("Shutting down Ballista cleanly...");
+                tracing::info!(
+                    "Shutting down Ballista cleanly (fade_to_zero={fade_to_zero_after_hold})..."
+                );
                 let w = win_q.width().max(600);
                 let h = win_q.height().max(400);
                 let s = WindowState {
@@ -320,16 +336,61 @@ impl MainWindow {
                 };
                 s.save();
                 persist_q();
+                if !shut_done.replace(true) {
+                    hw_q.borrow().prepare_for_shutdown(fade_to_zero_after_hold);
+                } else {
+                    hw_q.borrow().shutdown();
+                }
                 if let Some(ref pm) = *power_q.borrow() {
                     pm.shutdown();
                 }
                 tray_q.borrow().shutdown();
                 pm_q.borrow().bridge.shutdown();
-                hw_q.borrow().shutdown();
                 *hold_q.borrow_mut() = None;
                 app_q.quit();
             })
         };
+        let perform_full_quit: Rc<dyn Fn()> = {
+            let exit_cb = perform_graceful_exit.clone();
+            Rc::new(move || exit_cb(true))
+        };
+
+        // Handle SIGTERM / SIGINT cleanly (async-signal-safe atomic flag polled on GLib main loop):
+        // - If PrepareForShutdown already ran Option A (fade -> logo -> 0%), exit immediately.
+        // - Otherwise (e.g. desktop logout to GDM or service restart), fade into Ballista branding
+        //   and keep it lit for the GDM login screen before closing USB handles.
+        {
+            use std::sync::atomic::{AtomicI32, Ordering};
+            static PENDING_EXIT_SIGNAL: AtomicI32 = AtomicI32::new(0);
+
+            extern "C" fn handle_exit_signal(sig: libc::c_int) {
+                PENDING_EXIT_SIGNAL.store(sig, Ordering::SeqCst);
+            }
+
+            unsafe {
+                let mut sa: libc::sigaction = std::mem::zeroed();
+                sa.sa_sigaction = handle_exit_signal as *const () as usize;
+                sa.sa_flags = libc::SA_RESTART;
+                libc::sigemptyset(&mut sa.sa_mask);
+                libc::sigaction(libc::SIGTERM, &sa, std::ptr::null_mut());
+                libc::sigaction(libc::SIGINT, &sa, std::ptr::null_mut());
+            }
+
+            let exit_sig = perform_graceful_exit.clone();
+            glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+                let sig = PENDING_EXIT_SIGNAL.swap(0, Ordering::SeqCst);
+                if sig == libc::SIGTERM {
+                    tracing::info!("Received SIGTERM — running graceful Ballista branding exit");
+                    exit_sig(false);
+                    return glib::ControlFlow::Break;
+                } else if sig == libc::SIGINT {
+                    tracing::info!("Received SIGINT — running graceful Ballista branding exit");
+                    exit_sig(true);
+                    return glib::ControlFlow::Break;
+                }
+                glib::ControlFlow::Continue
+            });
+        }
 
         // Register Ctrl+Q application quit shortcut
         {
@@ -536,6 +597,7 @@ impl MainWindow {
         // ===================== Native Rust Plugin Host Command Dispatcher =====================
         let deck_sleeping: Rc<RefCell<HashMap<String, bool>>> = Rc::new(RefCell::new(HashMap::new()));
         let system_sleeping = Rc::new(Cell::new(false));
+        let screen_locked = Rc::new(Cell::new(initially_locked));
         let (multi_ui_tx, multi_ui_rx) = async_channel::unbounded::<(String, MultiActionStep)>();
 
         let dispatch_native: NativeCommandDispatcher = {
@@ -1258,8 +1320,9 @@ impl MainWindow {
             let nh_tick = native_host.clone();
             let disp_tick = dispatch_native.clone();
             let sys_sleep_tick = system_sleeping.clone();
+            let locked_tick = screen_locked.clone();
             glib::timeout_add_local(std::time::Duration::from_millis(250), move || {
-                if sys_sleep_tick.get() {
+                if sys_sleep_tick.get() || locked_tick.get() {
                     return glib::ControlFlow::Continue;
                 }
                 for (dev_key, slot, cmds) in nh_tick.tick_due() {
@@ -1887,6 +1950,7 @@ impl MainWindow {
         let disp_hw = dispatch_native.clone();
         let sleep_hw = deck_sleeping.clone();
         let sys_sleep_hw = system_sleeping.clone();
+        let locked_hw = screen_locked.clone();
         let rescan_hw_cell = rescan_cb_cell.clone();
         let last_rec_hw = last_auto_recovery.clone();
         let devs_hw = connected_devices.clone();
@@ -1926,6 +1990,11 @@ impl MainWindow {
                             }
                         },
                     );
+                    continue;
+                }
+
+                // Block all hardware keys, dials, and touch input while screen is locked or suspending
+                if sys_sleep_hw.get() || locked_hw.get() {
                     continue;
                 }
 
@@ -2530,6 +2599,7 @@ impl MainWindow {
             let disp_r = dispatch_native.clone();
             let act_idx_r = active_device_idx.clone();
             let sleep_r = deck_sleeping.clone();
+            let locked_r = screen_locked.clone();
             let sync_dd_r = syncing_device_dropdown.clone();
 
             Rc::new(move |reason: &str, force_reset_transport: bool| -> usize {
@@ -2624,7 +2694,17 @@ impl MainWindow {
                 }
                 drop(pm_guard);
                 if !targets.is_empty() {
-                    hw_r.borrow().sync_all_devices_async(targets);
+                    if locked_r.get() {
+                        let brand_targets: Vec<_> = targets
+                            .iter()
+                            .map(|(p, _, kind, _, b)| (p.clone(), *kind, *b))
+                            .collect();
+                        hw_r.borrow()
+                            .fade_to_branding_all_async(brand_targets, force_reset_transport);
+                    } else {
+                        let assumed = if force_reset_transport { Some(0) } else { None };
+                        hw_r.borrow().fade_in_all_devices_async(targets, assumed);
+                    }
                 }
 
                 tracing::info!(
@@ -2668,31 +2748,135 @@ impl MainWindow {
             });
         }
 
-        // ===================== System Suspend / Resume Power Monitor =====================
+        // ===================== System Power (Suspend/Shutdown) & Lock Screen Monitor =====================
         {
             let hw_pwr = hardware_manager.clone();
             let devs_pwr = connected_devices.clone();
+            let prof_pwr = profile.clone();
+            let profs_pwr = profiles.clone();
+            let act_map_pwr = active_by_device.clone();
+            let nh_pwr = native_host.clone();
+            let disp_pwr = dispatch_native.clone();
+            let sleep_decks_pwr = deck_sleeping.clone();
             let persist_pwr = persist_profiles.clone();
             let sys_sleep_pwr = system_sleeping.clone();
+            let locked_pwr = screen_locked.clone();
+            let shut_done_pwr = shutdown_transition_done.clone();
             let rescan_pwr = rescan_and_sync_hardware.clone();
             let pm_cell_cb = power_monitor_cell.clone();
             let expected_before_sleep = Rc::new(Cell::new(connected_devices.borrow().len()));
             let resume_gen = Rc::new(Cell::new(0u64));
 
             let monitor = Rc::new(PowerMonitor::start(move |ev| match ev {
+                PowerEvent::ScreenLocked => {
+                    locked_pwr.set(true);
+                    if sys_sleep_pwr.get() {
+                        return;
+                    }
+                    let devs = devs_pwr.borrow().clone();
+                    let st = WindowState::load();
+                    let brand_targets: Vec<_> = devs
+                        .iter()
+                        .map(|d| {
+                            let skey = d.stable_key();
+                            let b = if sleep_decks_pwr.borrow().get(&skey).copied().unwrap_or(false)
+                            {
+                                0
+                            } else {
+                                st.brightness_for(&skey)
+                            };
+                            (d.dev_path.clone(), d.kind, b)
+                        })
+                        .collect();
+                    tracing::info!(
+                        "Screen locked — blocking Stream Deck input and fading {} device(s) to Ballista branding",
+                        brand_targets.len()
+                    );
+                    if !brand_targets.is_empty() {
+                        hw_pwr
+                            .borrow()
+                            .fade_to_branding_all_async(brand_targets, false);
+                    } else {
+                        hw_pwr.borrow().set_branding_locked(true);
+                    }
+                }
+                PowerEvent::ScreenUnlocked => {
+                    locked_pwr.set(false);
+                    if sys_sleep_pwr.get() {
+                        return;
+                    }
+                    // Immediately advance due native plugin ticks (Clock, System Metrics, Media)
+                    // BEFORE fading in so unlocked decks display the exact current time on frame 1!
+                    for (dev_key, slot, cmds) in nh_pwr.tick_due() {
+                        let upd = nh_pwr.get_slot_settings(&dev_key, &slot);
+                        disp_pwr(dev_key, slot, cmds, upd);
+                    }
+
+                    let devs = devs_pwr.borrow().clone();
+                    let st = WindowState::load();
+                    let active_gui_prof = prof_pwr.borrow().clone();
+                    let mut profs_snap = profs_pwr.borrow().clone();
+                    if let Some(slot) = profs_snap.iter_mut().find(|p| p.id == active_gui_prof.id) {
+                        *slot = active_gui_prof;
+                    }
+                    let store_snap = ProfileStore {
+                        profiles: profs_snap,
+                        active_by_device: act_map_pwr.borrow().clone(),
+                    };
+                    let targets: Vec<_> = devs
+                        .iter()
+                        .map(|d| {
+                            let skey = d.stable_key();
+                            let p = store_snap.active_profile_for(&skey, d.kind);
+                            let b = if sleep_decks_pwr.borrow().get(&skey).copied().unwrap_or(false)
+                            {
+                                0
+                            } else {
+                                st.brightness_for(&skey)
+                            };
+                            (d.dev_path.clone(), skey, d.kind, p, b)
+                        })
+                        .collect();
+                    tracing::info!(
+                        "Screen unlocked — fading {} device(s) back into live Action UI",
+                        targets.len()
+                    );
+                    if !targets.is_empty() {
+                        hw_pwr.borrow().fade_in_all_devices_async(targets, None);
+                    } else {
+                        hw_pwr.borrow().set_branding_locked(false);
+                    }
+                }
+                PowerEvent::ShuttingDown => {
+                    resume_gen.set(resume_gen.get().wrapping_add(1));
+                    sys_sleep_pwr.set(true);
+                    locked_pwr.set(true);
+                    tracing::info!(
+                        "System preparing for shutdown/reboot — fading {} device(s) to Ballista branding -> 0%...",
+                        devs_pwr.borrow().len()
+                    );
+                    persist_pwr();
+                    if !shut_done_pwr.replace(true) {
+                        hw_pwr.borrow().prepare_for_shutdown(true);
+                    }
+                    if let Some(ref pm) = *pm_cell_cb.borrow() {
+                        pm.release_shutdown_inhibitor();
+                        pm.release_sleep_inhibitor();
+                    }
+                }
                 PowerEvent::Suspending => {
                     resume_gen.set(resume_gen.get().wrapping_add(1));
                     let dev_count = devs_pwr.borrow().len();
                     expected_before_sleep.set(dev_count);
                     sys_sleep_pwr.set(true);
                     tracing::info!(
-                        "System preparing for suspend — pausing ticks, dimming {} device(s), and releasing USB HID handles...",
+                        "System preparing for suspend — fading {} device(s) to Ballista branding -> 0% and releasing USB HID handles...",
                         dev_count
                     );
                     persist_pwr();
                     hw_pwr.borrow().prepare_for_suspend();
                     if let Some(ref pm) = *pm_cell_cb.borrow() {
-                        pm.release_inhibitor();
+                        pm.release_sleep_inhibitor();
                     }
                 }
                 PowerEvent::Resumed => {
@@ -2703,20 +2887,30 @@ impl MainWindow {
                         "System resumed from sleep/suspend — scheduling Stream Deck restoration..."
                     );
                     if let Some(ref pm) = *pm_cell_cb.borrow() {
-                        pm.acquire_inhibitor();
+                        pm.acquire_sleep_inhibitor();
                     }
 
                     let rescan_1 = rescan_pwr.clone();
                     let sys_sleep_1 = sys_sleep_pwr.clone();
+                    let locked_1 = locked_pwr.clone();
+                    let pm_cell_1 = pm_cell_cb.clone();
                     let gen_1 = resume_gen.clone();
                     let expected = expected_before_sleep.get();
 
-                    // Pass 1 (+750ms): Allow USB root hubs to settle, recreate libusb context, and restore all decks
+                    // Pass 1 (+750ms): Allow USB root hubs to settle, recreate libusb context,
+                    // check whether GNOME woke onto the Lock Screen, and fade in branding or Action UI
                     glib::timeout_add_local_once(
                         std::time::Duration::from_millis(750),
                         move || {
                             if gen_1.get() != cur_gen {
                                 return;
+                            }
+                            if let Some(ref pm) = *pm_cell_1.borrow() {
+                                let is_locked = pm.is_screen_locked();
+                                locked_1.set(is_locked);
+                                tracing::info!(
+                                    "Resume pass 1 screen lock state: locked={is_locked}"
+                                );
                             }
                             sys_sleep_1.set(false);
                             let found = rescan_1("system resume", true);

@@ -1,4 +1,5 @@
 use crate::core::animation::{apply_hardware_transform, encode_hardware_image, GifAnimation};
+use crate::core::branding::branding_frames_for;
 use crate::models::{
     DeviceKind, KeyAppearance, KeyImageFormat, Profile, TextVerticalAlign, ELGATO_VENDOR_ID,
 };
@@ -10,7 +11,7 @@ use pangocairo::functions as pc;
 use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -237,6 +238,10 @@ pub struct HardwareManager {
     active_animations: Arc<Mutex<HashMap<String, (String, Arc<AtomicBool>)>>>,
     native_host: Arc<Mutex<Option<crate::native_sdk::NativePluginHost>>>,
     suspended: Arc<AtomicBool>,
+    branding_locked: Arc<AtomicBool>,
+    branding_painted: Arc<Mutex<HashMap<PathBuf, bool>>>,
+    current_brightness: Arc<Mutex<HashMap<PathBuf, u8>>>,
+    transition_gen: Arc<AtomicU64>,
 }
 
 /// Sleeps up to `duration` in short slices, waking immediately if `stop_flag` becomes true.
@@ -332,11 +337,23 @@ impl HardwareManager {
             active_animations: Arc::new(Mutex::new(HashMap::new())),
             native_host: Arc::new(Mutex::new(None)),
             suspended: Arc::new(AtomicBool::new(false)),
+            branding_locked: Arc::new(AtomicBool::new(false)),
+            branding_painted: Arc::new(Mutex::new(HashMap::new())),
+            current_brightness: Arc::new(Mutex::new(HashMap::new())),
+            transition_gen: Arc::new(AtomicU64::new(0)),
         }
     }
 
     pub fn is_suspended(&self) -> bool {
         self.suspended.load(Ordering::SeqCst)
+    }
+
+    pub fn is_branding_locked(&self) -> bool {
+        self.branding_locked.load(Ordering::SeqCst)
+    }
+
+    pub fn set_branding_locked(&self, locked: bool) {
+        self.branding_locked.store(locked, Ordering::SeqCst);
     }
 
     pub fn set_native_host(&self, host: crate::native_sdk::NativePluginHost) {
@@ -430,7 +447,19 @@ impl HardwareManager {
         let c_path = CString::new(path_str.as_bytes())
             .map_err(|e| format!("Invalid HID device path '{}': {e}", path_str))?;
 
+        // Serialize concurrent opens on the same USB interface via `hid_api` and re-check
+        // `open_handles` while holding it so startup threads (e.g. fade-in + input listener)
+        // never race to call `api.open_path()` twice on the same device.
         let api_guard = self.hid_api.lock().unwrap();
+        if self.is_suspended() {
+            return Err("Hardware transport is suspended".to_string());
+        }
+        {
+            let handles = self.open_handles.lock().unwrap();
+            if let Some(existing) = handles.get(dev_path) {
+                return Ok(existing.clone());
+            }
+        }
         let api = api_guard
             .as_ref()
             .ok_or_else(|| "HIDAPI transport is not initialized".to_string())?;
@@ -478,10 +507,107 @@ impl HardwareManager {
         }
     }
 
+    /// Writes the Ballista branding frames (centered 2x2 logo + black surround keys +
+    /// touch strip / Neo info bar) directly to an already-open `HidDevice`.
+    pub fn write_branding_direct(dev: &HidDevice, kind: DeviceKind) -> Result<(), String> {
+        if !kind.is_visual() {
+            return Ok(());
+        }
+        let frames = branding_frames_for(kind);
+        let total_keys = kind.total_keys();
+        for key in 0..total_keys {
+            let bytes = frames.logo_keys.get(&key).unwrap_or(&frames.black_key);
+            if !bytes.is_empty() {
+                Self::write_key_image_direct(dev, kind, key, bytes)?;
+            }
+        }
+        if let (Some((tw, th)), Some(ref jpeg)) = (kind.touchscreen_size(), frames.touchscreen_jpeg) {
+            Self::write_touchscreen_image_direct(dev, kind, 0, 0, tw as u16, th as u16, jpeg)?;
+        }
+        if kind.has_info_screen() {
+            if let Some(ref jpeg) = frames.neo_info_bar_jpeg {
+                Self::write_neo_screen_image_direct(dev, jpeg)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Smoothly fades hardware backlight brightness between `from` and `to` using a cosine
+    /// ease-in-out curve (~60Hz). Returns `false` if cancelled by a newer `transition_gen`.
+    fn fade_brightness_interruptible(
+        dev_arc: &Arc<Mutex<HidDevice>>,
+        dev_path: &Path,
+        kind: DeviceKind,
+        from: u8,
+        to: u8,
+        duration_ms: u64,
+        steps: u32,
+        cur_bright_map: &Arc<Mutex<HashMap<PathBuf, u8>>>,
+        gen_guard: Option<(&Arc<AtomicU64>, u64)>,
+    ) -> bool {
+        if !kind.is_visual() {
+            return true;
+        }
+        let from = from.min(100);
+        let to = to.min(100);
+        if from == to || steps == 0 || duration_ms == 0 {
+            if let Some((gen_arc, expected)) = gen_guard {
+                if gen_arc.load(Ordering::SeqCst) != expected {
+                    return false;
+                }
+            }
+            if let Ok(dev) = dev_arc.lock() {
+                let _ = Self::send_brightness_direct(&dev, kind, to);
+            }
+            cur_bright_map
+                .lock()
+                .unwrap()
+                .insert(dev_path.to_path_buf(), to);
+            return true;
+        }
+
+        let step_ms = (duration_ms / steps as u64).max(10);
+        let mut last_sent: Option<u8> = None;
+
+        for i in 1..=steps {
+            if let Some((gen_arc, expected)) = gen_guard {
+                if gen_arc.load(Ordering::SeqCst) != expected {
+                    return false;
+                }
+            }
+            let t = i as f64 / steps as f64;
+            let eased = 0.5 - 0.5 * (std::f64::consts::PI * t).cos();
+            let val = (from as f64 + (to as f64 - from as f64) * eased)
+                .round()
+                .clamp(0.0, 100.0) as u8;
+            if last_sent != Some(val) {
+                if let Ok(dev) = dev_arc.lock() {
+                    let _ = Self::send_brightness_direct(&dev, kind, val);
+                }
+                cur_bright_map
+                    .lock()
+                    .unwrap()
+                    .insert(dev_path.to_path_buf(), val);
+                last_sent = Some(val);
+            }
+            if i < steps {
+                thread::sleep(Duration::from_millis(step_ms));
+            }
+        }
+        true
+    }
+
     /// Safely stops all listeners/animations, drains open `HidDevice` handles while waiting
     /// for worker threads to release cloned `Arc` references (so `hid_close` completes before
-    /// `hid_exit`), optionally dims screens to 0% before closing, and tears down `HidApi`.
-    fn teardown_transport(&self, dim_screens: bool) {
+    /// `hid_exit`), optionally runs the Ballista branding transition (and Option A fade to 0%)
+    /// in parallel across all connected decks, and tears down `HidApi`.
+    fn teardown_transport_with_transition(
+        &self,
+        show_branding: bool,
+        fade_to_zero_after_hold: bool,
+        default_brightness: u8,
+    ) {
+        self.transition_gen.fetch_add(1, Ordering::SeqCst);
         self.stop_all_listeners();
         self.stop_all_animations();
 
@@ -490,8 +616,8 @@ impl HardwareManager {
             handles.drain().collect()
         };
 
-        // Wait briefly for listener/animation threads to exit their interruptible sleeps and drop
-        // their cloned Arc<Mutex<HidDevice>> handles before we close devices and tear down libusb.
+        // Wait briefly for listener/animation/fade threads to exit and drop their cloned
+        // Arc<Mutex<HidDevice>> handles before we run the final power transition and close USB.
         let wait_deadline = std::time::Instant::now() + Duration::from_millis(250);
         while drained.iter().any(|(_, arc)| Arc::strong_count(arc) > 1)
             && std::time::Instant::now() < wait_deadline
@@ -499,47 +625,119 @@ impl HardwareManager {
             thread::sleep(Duration::from_millis(5));
         }
 
-        if dim_screens {
+        if show_branding && !drained.is_empty() {
             let kinds = self.device_kinds.lock().unwrap().clone();
-            for (path, dev_arc) in &drained {
-                let kind = kinds
-                    .get(path)
-                    .copied()
-                    .unwrap_or(DeviceKind::StreamDeckMK2);
-                if kind.is_visual() {
-                    if let Ok(dev) = dev_arc.lock() {
-                        if let Err(e) = Self::send_brightness_direct(&dev, kind, 0) {
-                            tracing::warn!(
-                                "Failed to dim {} ({}) before suspend: {e}",
-                                kind.name(),
-                                path.display()
+            let painted_snap = self.branding_painted.lock().unwrap().clone();
+            let bright_snap = self.current_brightness.lock().unwrap().clone();
+            let bright_map = self.current_brightness.clone();
+
+            thread::scope(|s| {
+                for (path, dev_arc) in &drained {
+                    let kind = kinds
+                        .get(path)
+                        .copied()
+                        .unwrap_or(DeviceKind::StreamDeckMK2);
+                    if !kind.is_visual() {
+                        continue;
+                    }
+                    let already_branded = painted_snap.get(path).copied().unwrap_or(false);
+                    let cur_b = bright_snap.get(path).copied().unwrap_or(default_brightness);
+                    let bm = bright_map.clone();
+                    let p = path.clone();
+
+                    s.spawn(move || {
+                        if already_branded {
+                            // Branding is already on screen (e.g. suspending/shutting down from Lock Screen)
+                            if fade_to_zero_after_hold && cur_b > 0 {
+                                Self::fade_brightness_interruptible(
+                                    dev_arc, &p, kind, cur_b, 0, 320, 18, &bm, None,
+                                );
+                            } else if fade_to_zero_after_hold {
+                                if let Ok(dev) = dev_arc.lock() {
+                                    let _ = Self::send_brightness_direct(&dev, kind, 0);
+                                }
+                            }
+                            return;
+                        }
+
+                        if cur_b > 0 {
+                            // 1. Fade Action UI out cleanly to 0%
+                            Self::fade_brightness_interruptible(
+                                dev_arc, &p, kind, cur_b, 0, 240, 14, &bm, None,
+                            );
+                        } else if let Ok(dev) = dev_arc.lock() {
+                            let _ = Self::send_brightness_direct(&dev, kind, 0);
+                        }
+
+                        // 2. Paint Ballista 2x2 logo + touch strip while dark (zero tearing)
+                        if let Ok(dev) = dev_arc.lock() {
+                            if let Err(e) = Self::write_branding_direct(&dev, kind) {
+                                tracing::warn!(
+                                    "Failed to write Ballista branding to {} ({}): {e}",
+                                    kind.name(),
+                                    p.display()
+                                );
+                            }
+                        }
+
+                        if cur_b == 0 {
+                            // Manually slept deck: branding is now safely in framebuffer, stay dark
+                            return;
+                        }
+
+                        // 3. Fade Ballista branding smoothly in
+                        let target_b = cur_b.max(35);
+                        Self::fade_brightness_interruptible(
+                            dev_arc, &p, kind, 0, target_b, 260, 15, &bm, None,
+                        );
+
+                        if fade_to_zero_after_hold {
+                            // 4. Option A: Hold Ballista branding briefly, then fade cleanly to 0% black
+                            thread::sleep(Duration::from_millis(550));
+                            Self::fade_brightness_interruptible(
+                                dev_arc, &p, kind, target_b, 0, 320, 18, &bm, None,
                             );
                         }
-                    }
+                    });
                 }
-            }
+            });
         }
 
         // Explicitly close all HidDevice handles BEFORE dropping HidApi (hid_exit / libusb_exit).
         drop(drained);
         self.device_kinds.lock().unwrap().clear();
+        self.branding_painted.lock().unwrap().clear();
+        self.current_brightness.lock().unwrap().clear();
         *self.hid_api.lock().unwrap() = None;
     }
 
-    /// Prepares hardware for system suspend: pauses new I/O, dims connected visual decks to 0%,
-    /// stops listeners & animations, closes USB handles, and tears down the pre-suspend libusb context.
+    /// Prepares hardware for system suspend (Option A): fades Action UI into Ballista branding,
+    /// holds briefly, fades backlight to 0%, stops listeners & animations, and releases USB HID.
     pub fn prepare_for_suspend(&self) {
-        tracing::info!("Preparing Elgato Stream Deck hardware for system suspend...");
+        tracing::info!("Preparing Elgato Stream Deck hardware for system suspend (branding fade -> 0%)...");
         self.suspended.store(true, Ordering::SeqCst);
-        self.teardown_transport(true);
-        tracing::info!("Stream Deck screens dimmed and USB HID transport released for suspend");
+        self.branding_locked.store(true, Ordering::SeqCst);
+        self.teardown_transport_with_transition(true, true, 75);
+        tracing::info!("Stream Deck suspend branding transition complete; USB HID transport released");
+    }
+
+    /// Prepares hardware for shutdown/reboot (Option A: `fade_to_zero_after_hold = true`) or
+    /// logout/restart (`fade_to_zero_after_hold = false`, leaving Ballista branding lit for GDM).
+    pub fn prepare_for_shutdown(&self, fade_to_zero_after_hold: bool) {
+        tracing::info!(
+            "Running Stream Deck exit branding transition (fade_to_zero={fade_to_zero_after_hold})..."
+        );
+        self.suspended.store(true, Ordering::SeqCst);
+        self.branding_locked.store(true, Ordering::SeqCst);
+        self.teardown_transport_with_transition(true, fade_to_zero_after_hold, 75);
+        tracing::info!("Stream Deck exit branding transition complete; USB HID transport released");
     }
 
     /// Full USB HID transport reset (used on system wake, Tray Rescan, and I/O error recovery):
     /// tears down stale handles/animations and initializes a fresh `HidApi` (libusb) context.
     pub fn reset_transport(&self) {
         self.suspended.store(true, Ordering::SeqCst);
-        self.teardown_transport(false);
+        self.teardown_transport_with_transition(false, false, 0);
         let fresh_api = match HidApi::new() {
             Ok(a) => Some(a),
             Err(e) => {
@@ -554,36 +752,331 @@ impl HardwareManager {
     /// Stops all background listeners/animations and releases USB device handles cleanly.
     pub fn shutdown(&self) {
         self.suspended.store(true, Ordering::SeqCst);
-        self.teardown_transport(false);
+        self.teardown_transport_with_transition(false, false, 0);
     }
 
-    /// Phase-1 Fast Boot: renders and pushes initial saved brightness & active pages to ALL
-    /// connected decks simultaneously on parallel threads (<250ms total even with multiple decks).
-    pub fn sync_all_devices_async(&self, targets: Vec<(PathBuf, String, DeviceKind, Profile, u8)>) {
+    /// Transitions all connected visual decks in parallel from their current display (e.g.
+    /// boot branding or lock screen branding) into the live Action UI with a smooth fade-out ->
+    /// frame swap -> fade-in crossfade.
+    pub fn fade_in_all_devices_async(
+        &self,
+        targets: Vec<(PathBuf, String, DeviceKind, Profile, u8)>,
+        assumed_start_brightness: Option<u8>,
+    ) {
+        self.branding_locked.store(false, Ordering::SeqCst);
+        let my_gen = self.transition_gen.fetch_add(1, Ordering::SeqCst) + 1;
+
         for (dev_path, device_key, kind, profile, brightness) in targets {
             let hw = self.clone();
             thread::spawn(move || {
-                if hw.is_suspended() {
+                if hw.is_suspended() || hw.is_branding_locked() {
+                    return;
+                }
+                if !kind.is_visual() {
                     return;
                 }
                 let t0 = std::time::Instant::now();
-                if let Err(e) = hw.set_brightness(&dev_path, brightness) {
-                    tracing::warn!(
-                        "Failed to set brightness {}% on {} ({}): {e}",
-                        brightness,
-                        kind.name(),
-                        dev_path.display()
-                    );
+                let dev_arc = match hw.get_or_open_device(&dev_path) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        tracing::warn!("Cannot open {} for fade-in sync: {e}", dev_path.display());
+                        return;
+                    }
+                };
+
+                let start_b = hw
+                    .current_brightness
+                    .lock()
+                    .unwrap()
+                    .get(&dev_path)
+                    .copied()
+                    .or(assumed_start_brightness)
+                    .unwrap_or(0);
+
+                // 1. Fade out existing branding (if lit) to 0% so frame swap is completely tear-free
+                if start_b > 0 {
+                    if !Self::fade_brightness_interruptible(
+                        &dev_arc,
+                        &dev_path,
+                        kind,
+                        start_b,
+                        0,
+                        220,
+                        13,
+                        &hw.current_brightness,
+                        Some((&hw.transition_gen, my_gen)),
+                    ) {
+                        return;
+                    }
+                } else {
+                    if let Ok(dev) = dev_arc.lock() {
+                        let _ = Self::send_brightness_direct(&dev, kind, 0);
+                    }
+                    hw.current_brightness
+                        .lock()
+                        .unwrap()
+                        .insert(dev_path.clone(), 0);
                 }
+
+                if hw.transition_gen.load(Ordering::SeqCst) != my_gen
+                    || hw.is_suspended()
+                    || hw.is_branding_locked()
+                {
+                    return;
+                }
+
+                // 2. Render and upload the complete Action UI while dark at 0%
                 hw.sync_hardware_page(&dev_path, &device_key, kind, &profile);
+
+                if hw.transition_gen.load(Ordering::SeqCst) != my_gen
+                    || hw.is_suspended()
+                    || hw.is_branding_locked()
+                {
+                    return;
+                }
+
+                // 3. Smoothly fade Action UI up to the deck's saved brightness
+                Self::fade_brightness_interruptible(
+                    &dev_arc,
+                    &dev_path,
+                    kind,
+                    0,
+                    brightness,
+                    320,
+                    18,
+                    &hw.current_brightness,
+                    Some((&hw.transition_gen, my_gen)),
+                );
+
                 tracing::info!(
-                    "Fast-boot hardware render complete for {} ({}) in {:?}",
+                    "Fade-in hardware sync complete for {} ({}) in {:?}",
                     kind.name(),
                     dev_path.display(),
                     t0.elapsed()
                 );
             });
         }
+    }
+
+    /// Transitions all connected visual decks in parallel to the Ballista branding screen
+    /// (used when locking the screen or waking from suspend onto the lock screen).
+    pub fn fade_to_branding_all_async(
+        &self,
+        targets: Vec<(PathBuf, DeviceKind, u8)>,
+        fade_from_zero: bool,
+    ) {
+        self.branding_locked.store(true, Ordering::SeqCst);
+        let my_gen = self.transition_gen.fetch_add(1, Ordering::SeqCst) + 1;
+        self.stop_all_animations();
+
+        for (dev_path, kind, target_brightness) in targets {
+            let hw = self.clone();
+            thread::spawn(move || {
+                if hw.is_suspended() || !kind.is_visual() {
+                    return;
+                }
+                let dev_arc = match hw.get_or_open_device(&dev_path) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        tracing::warn!("Cannot open {} for lock branding: {e}", dev_path.display());
+                        return;
+                    }
+                };
+
+                let start_b = if fade_from_zero {
+                    0
+                } else {
+                    hw.current_brightness
+                        .lock()
+                        .unwrap()
+                        .get(&dev_path)
+                        .copied()
+                        .unwrap_or(target_brightness)
+                };
+
+                // 1. Fade Action UI down to 0%
+                if start_b > 0 {
+                    if !Self::fade_brightness_interruptible(
+                        &dev_arc,
+                        &dev_path,
+                        kind,
+                        start_b,
+                        0,
+                        240,
+                        14,
+                        &hw.current_brightness,
+                        Some((&hw.transition_gen, my_gen)),
+                    ) {
+                        return;
+                    }
+                } else {
+                    if let Ok(dev) = dev_arc.lock() {
+                        let _ = Self::send_brightness_direct(&dev, kind, 0);
+                    }
+                    hw.current_brightness
+                        .lock()
+                        .unwrap()
+                        .insert(dev_path.clone(), 0);
+                }
+
+                if hw.transition_gen.load(Ordering::SeqCst) != my_gen || hw.is_suspended() {
+                    return;
+                }
+
+                // 2. Paint Ballista 2x2 logo + touch strip while dark
+                let write_ok = if let Ok(dev) = dev_arc.lock() {
+                    match Self::write_branding_direct(&dev, kind) {
+                        Ok(()) => true,
+                        Err(e) => {
+                            tracing::warn!(
+                                "Failed to render Ballista lock branding on {}: {e}",
+                                dev_path.display()
+                            );
+                            false
+                        }
+                    }
+                } else {
+                    false
+                };
+                if write_ok {
+                    hw.branding_painted
+                        .lock()
+                        .unwrap()
+                        .insert(dev_path.clone(), true);
+                }
+
+                if hw.transition_gen.load(Ordering::SeqCst) != my_gen || hw.is_suspended() {
+                    return;
+                }
+
+                // 3. Fade Ballista branding smoothly up to target_brightness
+                if target_brightness > 0 {
+                    Self::fade_brightness_interruptible(
+                        &dev_arc,
+                        &dev_path,
+                        kind,
+                        0,
+                        target_brightness,
+                        300,
+                        16,
+                        &hw.current_brightness,
+                        Some((&hw.transition_gen, my_gen)),
+                    );
+                }
+            });
+        }
+    }
+
+    /// Standalone headless boot-splash runner (requires no GTK/Wayland/D-Bus).
+    /// Retries USB scan briefly during early kernel boot, paints the Ballista 2x2 logo +
+    /// touch strip onto every connected Stream Deck in parallel, smoothly fades up to
+    /// `target_brightness`, and optionally holds and fades back to 0% (for testing Option A).
+    pub fn run_boot_splash(
+        target_brightness: u8,
+        animate_fade_in: bool,
+        hold_then_fade_off: bool,
+    ) -> usize {
+        let hw = Self::new();
+        let mut devices = hw.scan_devices();
+        for attempt in 1..=3 {
+            if !devices.is_empty() {
+                break;
+            }
+            tracing::info!(
+                "No Elgato Stream Decks enumerated yet (boot retry {attempt}/3)..."
+            );
+            thread::sleep(Duration::from_millis(450));
+            devices = hw.scan_devices();
+        }
+        if devices.is_empty() {
+            tracing::info!("Boot splash: no Elgato Stream Deck devices found");
+            return 0;
+        }
+
+        let total_detected = devices.len();
+        let painted = AtomicUsize::new(0);
+        thread::scope(|s| {
+            for dev_info in &devices {
+                if !dev_info.kind.is_visual() {
+                    continue;
+                }
+                let hw_ref = &hw;
+                let painted_ref = &painted;
+                s.spawn(move || {
+                    let dev_arc = match hw_ref.get_or_open_device(&dev_info.dev_path) {
+                        Ok(d) => d,
+                        Err(e) => {
+                            tracing::warn!(
+                                "Boot splash could not open {} ({}): {e}",
+                                dev_info.name,
+                                dev_info.dev_path.display()
+                            );
+                            return;
+                        }
+                    };
+                    if let Ok(dev) = dev_arc.lock() {
+                        let _ = Self::send_brightness_direct(&dev, dev_info.kind, 0);
+                        if let Err(e) = Self::write_branding_direct(&dev, dev_info.kind) {
+                            tracing::warn!(
+                                "Boot splash write failed on {} ({}): {e}",
+                                dev_info.name,
+                                dev_info.dev_path.display()
+                            );
+                            return;
+                        }
+                    }
+                    if target_brightness > 0 {
+                        if animate_fade_in {
+                            Self::fade_brightness_interruptible(
+                                &dev_arc,
+                                &dev_info.dev_path,
+                                dev_info.kind,
+                                0,
+                                target_brightness,
+                                320,
+                                18,
+                                &hw_ref.current_brightness,
+                                None,
+                            );
+                        } else if let Ok(dev) = dev_arc.lock() {
+                            let _ = Self::send_brightness_direct(
+                                &dev,
+                                dev_info.kind,
+                                target_brightness,
+                            );
+                        }
+                    }
+                    if hold_then_fade_off && target_brightness > 0 {
+                        thread::sleep(Duration::from_millis(600));
+                        Self::fade_brightness_interruptible(
+                            &dev_arc,
+                            &dev_info.dev_path,
+                            dev_info.kind,
+                            target_brightness,
+                            0,
+                            320,
+                            18,
+                            &hw_ref.current_brightness,
+                            None,
+                        );
+                    }
+                    painted_ref.fetch_add(1, Ordering::SeqCst);
+                });
+            }
+        });
+
+        hw.shutdown();
+        let painted_count = painted.load(Ordering::SeqCst);
+        tracing::info!(
+            "Ballista boot splash completed for {painted_count}/{total_detected} device(s)"
+        );
+        painted_count
+    }
+
+    /// Phase-1 Fast Boot: renders and pushes initial saved brightness & active pages to ALL
+    /// connected decks simultaneously on parallel threads (<250ms total even with multiple decks).
+    pub fn sync_all_devices_async(&self, targets: Vec<(PathBuf, String, DeviceKind, Profile, u8)>) {
+        self.fade_in_all_devices_async(targets, Some(75));
     }
 
     fn send_brightness_direct(dev: &HidDevice, kind: DeviceKind, brightness: u8) -> Result<(), String> {
@@ -607,6 +1100,9 @@ impl HardwareManager {
 
     /// Send hardware brightness feature report (0-100%) using the exact Gen1 or Gen2 protocol
     pub fn set_brightness(&self, dev_path: &Path, brightness: u8) -> Result<(), String> {
+        if self.is_branding_locked() {
+            return Ok(());
+        }
         let kind = self.lookup_kind(dev_path);
         if !kind.is_visual() {
             return Ok(());
@@ -614,7 +1110,14 @@ impl HardwareManager {
 
         let dev_arc = self.get_or_open_device(dev_path)?;
         let dev = dev_arc.lock().unwrap();
-        Self::send_brightness_direct(&dev, kind, brightness)
+        let res = Self::send_brightness_direct(&dev, kind, brightness);
+        if res.is_ok() {
+            self.current_brightness
+                .lock()
+                .unwrap()
+                .insert(dev_path.to_path_buf(), brightness.min(100));
+        }
+        res
     }
 
     /// Reset deck display / show default logo
@@ -1400,9 +1903,13 @@ impl HardwareManager {
 
     /// Syncs an entire profile page to physical hardware LCD keys, touchscreen strip, and Neo info bar
     pub fn sync_hardware_page(&self, dev_path: &Path, device_key: &str, kind: DeviceKind, profile: &Profile) {
-        if !kind.is_visual() || self.is_suspended() {
+        if !kind.is_visual() || self.is_suspended() || self.is_branding_locked() {
             return;
         }
+        self.branding_painted
+            .lock()
+            .unwrap()
+            .insert(dev_path.to_path_buf(), false);
 
         let dev_arc = match self.get_or_open_device(dev_path) {
             Ok(d) => d,
@@ -1684,7 +2191,7 @@ impl HardwareManager {
     /// Lightweight single-slot hardware push for live 1Hz native action ticks (Clock, System Metrics, Media)
     /// so ticking a single key never re-renders or re-uploads all 32 keys over USB.
     pub fn sync_single_slot(&self, dev_path: &Path, device_key: &str, kind: DeviceKind, profile: &Profile, slot: &str) {
-        if !kind.is_visual() || self.is_suspended() {
+        if !kind.is_visual() || self.is_suspended() || self.is_branding_locked() {
             return;
         }
         let Ok(dev_arc) = self.get_or_open_device(dev_path) else {

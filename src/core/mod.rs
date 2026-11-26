@@ -2,6 +2,7 @@
 
 pub mod animation;
 pub mod autostart;
+pub mod branding;
 pub mod hardware;
 pub mod plugin_bridge;
 pub mod plugin_manager;

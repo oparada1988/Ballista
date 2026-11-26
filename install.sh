@@ -5,7 +5,8 @@ set -euo pipefail
 # Ballista — Cross-Distro Linux Installer & Uninstaller
 # Supports user installs (~/.local) and system-wide installs (/usr/local),
 # dedicated StreamController compatibility Python venv, desktop integration,
-# and complete 17-PID Elgato Stream Deck udev rules.
+# early OS boot/login branding service (ballista-boot.service), and complete
+# 17-PID Elgato Stream Deck udev rules.
 # ==============================================================================
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -14,6 +15,7 @@ APP_ID="io.github.oparada1988.Ballista"
 SYSTEM_INSTALL=false
 SKIP_DEPS=false
 SKIP_UDEV=false
+SKIP_BOOT_SPLASH=false
 SKIP_BUILD=false
 NO_AUTOSTART=false
 UNINSTALL=false
@@ -38,9 +40,10 @@ Usage: ./install.sh [OPTIONS]
 
 Options:
   --system        Install system-wide into /usr/local (requires sudo/root)
-  --skip-deps     Skip checking/installing distro build & runtime packages
-  --skip-udev     Skip installing Elgato Stream Deck udev rules
-  --skip-build    Skip running 'cargo build --release' (use existing binary)
+  --skip-deps        Skip checking/installing distro build & runtime packages
+  --skip-udev        Skip installing Elgato Stream Deck udev rules
+  --skip-boot-splash Skip installing system-level OS boot/login branding service
+  --skip-build       Skip running 'cargo build --release' (use existing binary)
   --no-autostart  Do not enable automatic login background startup service
   --uninstall     Uninstall Ballista (preserves installed plugins & settings)
   --purge         With --uninstall, also remove ~/.local/share/ballista/{plugins,settings}
@@ -48,17 +51,19 @@ Options:
 
 Default (no flags): installs for the current user into ~/.local/bin and
 ~/.local/share/ballista, sets up the standalone StreamController Python bridge
-venv, installs the .desktop launcher & icon, and configures udev rules for all
-17 Elgato Stream Deck models.
+venv, installs the .desktop launcher & icon, installs udev rules for all 17
+Elgato Stream Deck models, enables the early OS boot/login branding service
+(ballista-boot.service), and enables/restarts the user background service.
 EOF
 }
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --system)     SYSTEM_INSTALL=true; shift ;;
-        --skip-deps)  SKIP_DEPS=true; shift ;;
-        --skip-udev)    SKIP_UDEV=true; shift ;;
-        --skip-build)   SKIP_BUILD=true; shift ;;
+        --skip-deps)        SKIP_DEPS=true; shift ;;
+        --skip-udev)        SKIP_UDEV=true; shift ;;
+        --skip-boot-splash) SKIP_BOOT_SPLASH=true; shift ;;
+        --skip-build)       SKIP_BUILD=true; shift ;;
         --no-autostart) NO_AUTOSTART=true; shift ;;
         --uninstall)    UNINSTALL=true; shift ;;
         --purge)      PURGE=true; shift ;;
@@ -118,8 +123,26 @@ if [[ "$UNINSTALL" == true ]]; then
         info "Preserved your plugins and settings in ${XDG_DATA_HOME:-$HOME/.local/share}/ballista/{plugins,settings}."
     fi
 
+    if [[ -f /etc/systemd/system/ballista-boot.service || -f /usr/local/libexec/ballista-boot ]] && [[ "$SKIP_BOOT_SPLASH" == false ]]; then
+        if [[ $EUID -eq 0 ]]; then
+            info "Removing /etc/systemd/system/ballista-boot.service..."
+            systemctl disable ballista-boot.service >/dev/null 2>&1 || true
+            rm -f /etc/systemd/system/ballista-boot.service /usr/local/libexec/ballista-boot || true
+            systemctl daemon-reload >/dev/null 2>&1 || true
+        elif command -v sudo >/dev/null 2>&1; then
+            info "Removing /etc/systemd/system/ballista-boot.service..."
+            sudo systemctl disable ballista-boot.service >/dev/null 2>&1 || true
+            sudo rm -f /etc/systemd/system/ballista-boot.service /usr/local/libexec/ballista-boot || true
+            sudo systemctl daemon-reload >/dev/null 2>&1 || true
+        fi
+    fi
+
     if [[ -f /etc/udev/rules.d/70-ballista-streamdeck.rules ]] && [[ "$SKIP_UDEV" == false ]]; then
-        if [[ $EUID -eq 0 ]] || command -v sudo >/dev/null 2>&1; then
+        if [[ $EUID -eq 0 ]]; then
+            info "Removing /etc/udev/rules.d/70-ballista-streamdeck.rules..."
+            rm -f /etc/udev/rules.d/70-ballista-streamdeck.rules || true
+            udevadm control --reload-rules || true
+        elif command -v sudo >/dev/null 2>&1; then
             info "Removing /etc/udev/rules.d/70-ballista-streamdeck.rules..."
             sudo rm -f /etc/udev/rules.d/70-ballista-streamdeck.rules || true
             sudo udevadm control --reload-rules || true
@@ -331,17 +354,77 @@ if [[ "$SKIP_UDEV" == false ]]; then
 fi
 
 # ------------------------------------------------------------------------------
+# 5b. Install Early OS Boot & Login Screen Branding Service (ballista-boot.service)
+# ------------------------------------------------------------------------------
+BOOT_SPLASH_DESC="skipped (--skip-boot-splash)"
+BOOT_BIN_INSTALLED=""
+if [[ "$SKIP_BOOT_SPLASH" == false ]]; then
+    if ! command -v systemctl >/dev/null 2>&1; then
+        BOOT_SPLASH_DESC="unavailable (systemd not found)"
+        warn "systemctl not found — skipping system boot branding service."
+    else
+        BOOT_UNIT_SRC="$SCRIPT_DIR/resources/ballista-boot.service"
+        BOOT_UNIT_DEST="/etc/systemd/system/ballista-boot.service"
+        if [[ -f "$BOOT_UNIT_SRC" ]]; then
+            info "Installing OS boot & login screen branding service ($BOOT_UNIT_DEST)..."
+            if [[ "$SYSTEM_INSTALL" == true ]]; then
+                BOOT_BIN="$BIN_DIR/ballista"
+            else
+                BOOT_BIN="/usr/local/libexec/ballista-boot"
+            fi
+            UNIT_TMP="$(mktemp)"
+            sed "s|@BALLISTA_BIN@|$BOOT_BIN|g" "$BOOT_UNIT_SRC" > "$UNIT_TMP"
+            ROOT_EXEC=()
+            if [[ $EUID -eq 0 ]]; then
+                ROOT_EXEC=()
+            elif command -v sudo >/dev/null 2>&1; then
+                ROOT_EXEC=(sudo)
+            else
+                BOOT_SPLASH_DESC="unavailable (sudo not found)"
+                warn "sudo not found — skipping system boot branding service ($BOOT_UNIT_DEST)."
+            fi
+
+            if [[ $EUID -eq 0 ]] || command -v sudo >/dev/null 2>&1; then
+                if [[ "$SYSTEM_INSTALL" == false ]]; then
+                    "${ROOT_EXEC[@]}" install -Dm755 "$SCRIPT_DIR/target/release/ballista" "$BOOT_BIN"
+                else
+                    "${ROOT_EXEC[@]}" rm -f /usr/local/libexec/ballista-boot
+                fi
+                "${ROOT_EXEC[@]}" install -Dm644 "$UNIT_TMP" "$BOOT_UNIT_DEST"
+                "${ROOT_EXEC[@]}" systemctl daemon-reload
+                if "${ROOT_EXEC[@]}" systemctl enable ballista-boot.service >/dev/null 2>&1 \
+                    && systemctl is-enabled --quiet ballista-boot.service 2>/dev/null; then
+                    BOOT_BIN_INSTALLED="$BOOT_BIN"
+                    BOOT_SPLASH_DESC="enabled (systemd: ballista-boot.service)"
+                    success "Enabled early OS boot & login screen Ballista branding service ($BOOT_BIN)."
+                else
+                    BOOT_SPLASH_DESC="installed, but failed to enable (check: systemctl status ballista-boot.service)"
+                    warn "Installed $BOOT_UNIT_DEST, but enabling ballista-boot.service failed."
+                fi
+            fi
+            rm -f "$UNIT_TMP"
+        else
+            BOOT_SPLASH_DESC="unavailable (missing resources/ballista-boot.service)"
+            warn "Missing $BOOT_UNIT_SRC — skipping system boot branding service."
+        fi
+    fi
+fi
+
+# ------------------------------------------------------------------------------
 # 6. Enable Fast Login Startup Service (enabled by default on new installs)
 # ------------------------------------------------------------------------------
 AUTOSTART_DESC="disabled (--no-autostart)"
 if [[ "$NO_AUTOSTART" == false ]]; then
-    SYSTEMD_USER_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
-    XDG_AUTOSTART_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/autostart"
-    if command -v systemctl >/dev/null 2>&1 && systemctl --user is-active --quiet graphical-session.target 2>/dev/null; then
-        info "Enabling fast systemd user login service ($SYSTEMD_USER_DIR/ballista.service)..."
-        mkdir -p "$SYSTEMD_USER_DIR"
-        rm -f "$XDG_AUTOSTART_DIR/${APP_ID}.desktop"
-        cat > "$SYSTEMD_USER_DIR/ballista.service" <<EOF
+    if [[ $EUID -eq 0 && "$SYSTEM_INSTALL" == true ]]; then
+        AUTOSTART_DESC="skipped for root (--system install; run without sudo or enable per-user)"
+    else
+        SYSTEMD_USER_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+        XDG_AUTOSTART_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/autostart"
+        if command -v systemctl >/dev/null 2>&1 && systemctl --user is-active --quiet graphical-session.target 2>/dev/null; then
+            info "Enabling fast systemd user login service ($SYSTEMD_USER_DIR/ballista.service)..."
+            mkdir -p "$SYSTEMD_USER_DIR"
+            rm -f "$XDG_AUTOSTART_DIR/${APP_ID}.desktop"
+            cat > "$SYSTEMD_USER_DIR/ballista.service" <<EOF
 [Unit]
 Description=Ballista - Elgato Stream Deck Background Service
 PartOf=graphical-session.target
@@ -356,14 +439,21 @@ RestartSec=2
 [Install]
 WantedBy=graphical-session.target
 EOF
-        systemctl --user daemon-reload
-        systemctl --user enable ballista.service >/dev/null 2>&1 || true
-        AUTOSTART_DESC="enabled (systemd --user: ballista.service)"
-        success "Enabled systemd user login service (starts instantaneously with desktop session)."
-    else
-        info "Enabling XDG autostart entry ($XDG_AUTOSTART_DIR/${APP_ID}.desktop)..."
-        mkdir -p "$XDG_AUTOSTART_DIR"
-        cat > "$XDG_AUTOSTART_DIR/${APP_ID}.desktop" <<EOF
+            systemctl --user daemon-reload
+            systemctl --user enable ballista.service >/dev/null 2>&1 || true
+            if systemctl --user is-active --quiet ballista.service 2>/dev/null; then
+                info "Restarting running ballista.service to load the updated binary..."
+                systemctl --user restart ballista.service
+                AUTOSTART_DESC="enabled & restarted (systemd --user: ballista.service)"
+                success "Restarted systemd user login service with the newly installed binary."
+            else
+                AUTOSTART_DESC="enabled (systemd --user: ballista.service)"
+                success "Enabled systemd user login service (starts instantaneously with desktop session)."
+            fi
+        else
+            info "Enabling XDG autostart entry ($XDG_AUTOSTART_DIR/${APP_ID}.desktop)..."
+            mkdir -p "$XDG_AUTOSTART_DIR"
+            cat > "$XDG_AUTOSTART_DIR/${APP_ID}.desktop" <<EOF
 [Desktop Entry]
 Type=Application
 Name=Ballista
@@ -374,9 +464,14 @@ Terminal=false
 X-GNOME-Autostart-enabled=true
 X-GNOME-Autostart-Delay=0
 EOF
-        AUTOSTART_DESC="enabled (XDG autostart)"
-        success "Enabled XDG autostart login service."
+            AUTOSTART_DESC="enabled (XDG autostart)"
+            success "Enabled XDG autostart login service."
+        fi
     fi
+elif [[ $EUID -ne 0 ]] && command -v systemctl >/dev/null 2>&1 && systemctl --user is-active --quiet ballista.service 2>/dev/null; then
+    info "Restarting running ballista.service to load the updated binary..."
+    systemctl --user restart ballista.service
+    success "Restarted ballista.service with the newly installed binary."
 fi
 
 # ------------------------------------------------------------------------------
@@ -389,6 +484,10 @@ echo "  Bridge:      $DATA_DIR/bridge/runner.py"
 echo "  Python venv: $VENV_DIR/bin/python3"
 echo "  Launcher:    $APPS_DIR/${APP_ID}.desktop"
 echo "  Autostart:   $AUTOSTART_DESC"
+echo "  Boot splash: $BOOT_SPLASH_DESC"
+if [[ -n "$BOOT_BIN_INSTALLED" ]]; then
+    echo "  Boot binary: $BOOT_BIN_INSTALLED"
+fi
 if [[ "$SYSTEM_INSTALL" == false ]] && [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then
     echo ""
     warn "$BIN_DIR is not currently in your PATH. Add this to ~/.bashrc or ~/.zshrc:"
