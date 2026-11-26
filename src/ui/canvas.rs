@@ -492,6 +492,7 @@ fn decode_slot_move(payload: &str) -> Option<crate::ui::inspector::InspectorTarg
 /// Renders a crisp 48x48 rounded Midnight drag chip for moving/swapping an existing canvas slot.
 /// For Ballista-native actions without a custom image path, draws a live miniature Cairo tile directly.
 fn create_slot_drag_chip_texture(
+    device_key: &str,
     slot_name: &str,
     meta: &SlotDragMeta,
     native_host: Option<&crate::native_sdk::NativePluginHost>,
@@ -504,7 +505,7 @@ fn create_slot_drag_chip_texture(
 
     if meta.is_native && !has_custom_path {
         if let Some(host) = native_host {
-            if host.has_slot(slot_name) {
+            if host.has_slot(device_key, slot_name) {
                 const CHIP: i32 = 48;
                 const R: f64 = 10.0;
                 let surface = cairo::ImageSurface::create(cairo::Format::ARgb32, CHIP, CHIP).ok()?;
@@ -527,7 +528,7 @@ fn create_slot_drag_chip_texture(
                 cr.set_source_rgba(0.098, 0.098, 0.125, 0.96);
                 let _ = cr.paint();
                 cr.translate(1.5, 1.5);
-                let _ = host.render_slot_visual(slot_name, &cr, s - 3.0, s - 3.0);
+                let _ = host.render_slot_visual(device_key, slot_name, &cr, s - 3.0, s - 3.0);
                 let _ = cr.restore();
 
                 // Crisp purple accent border
@@ -604,6 +605,7 @@ pub struct Canvas {
     pub folder_back_btn: Button,
     pub on_folder_back: Rc<RefCell<Option<std::boxed::Box<dyn Fn()>>>>,
     pub native_host: Rc<RefCell<Option<crate::native_sdk::NativePluginHost>>>,
+    pub active_device_key: Rc<RefCell<String>>,
     pub hardware_area: Box,
     pub key_buttons: Rc<RefCell<Vec<Button>>>,
     pub key_sizers: Rc<RefCell<Vec<Box>>>,
@@ -753,6 +755,7 @@ impl Canvas {
             folder_back_btn,
             on_folder_back,
             native_host: Rc::new(RefCell::new(None)),
+            active_device_key: Rc::new(RefCell::new(String::new())),
             hardware_area,
             key_buttons: Rc::new(RefCell::new(Vec::new())),
             key_sizers: Rc::new(RefCell::new(Vec::new())),
@@ -819,6 +822,10 @@ impl Canvas {
 
     pub fn set_native_host(&self, host: crate::native_sdk::NativePluginHost) {
         *self.native_host.borrow_mut() = Some(host);
+    }
+
+    pub fn set_active_device_key(&self, key: &str) {
+        *self.active_device_key.borrow_mut() = key.to_string();
     }
 
     /// Ultra-fast single-slot UI redraw for 1Hz native action ticks (Clock, System Metrics, Media).
@@ -1119,6 +1126,7 @@ impl Canvas {
 
                     let meta_begin = self.key_drag_meta.clone();
                     let nh_begin = self.native_host.clone();
+                    let dev_key_begin = self.active_device_key.clone();
                     let drag_state_begin = self.dragging_source.clone();
                     let drag_caps_begin = self.active_drag_caps.clone();
                     let btn_begin = btn.clone();
@@ -1134,9 +1142,10 @@ impl Canvas {
                         drag_caps_begin.set(Some(meta.caps));
                         btn_begin.add_css_class("drag-source");
                         let nh_opt = nh_begin.borrow().clone();
+                        let dkey = dev_key_begin.borrow().clone();
                         let slot_name = format!("key_{k_begin}");
                         if let Some(tex) =
-                            create_slot_drag_chip_texture(&slot_name, &meta, nh_opt.as_ref())
+                            create_slot_drag_chip_texture(&dkey, &slot_name, &meta, nh_opt.as_ref())
                         {
                             let paintable: gtk::gdk::Paintable = tex.upcast();
                             src.set_icon(Some(&paintable), 24, 24);
@@ -1288,8 +1297,12 @@ impl Canvas {
                 native_da.set_can_target(false);
                 {
                     let nh_draw = self.native_host.clone();
+                    let dkey_draw = self.active_device_key.clone();
                     let slot_name = format!("key_{idx}");
                     native_da.set_draw_func(move |_area, cr, width, height| {
+                        if width <= 0 || height <= 0 {
+                            return;
+                        }
                         let w = width as f64;
                         let h = height as f64;
                         let r = 11.0_f64.min(w / 2.0).min(h / 2.0);
@@ -1301,7 +1314,8 @@ impl Canvas {
                         cr.close_path();
                         cr.clip();
                         if let Some(ref host) = *nh_draw.borrow() {
-                            let _ = host.render_slot_visual(&slot_name, cr, w, h);
+                            let dkey = dkey_draw.borrow();
+                            let _ = host.render_slot_visual(&dkey, &slot_name, cr, w, h);
                         }
                     });
                 }
@@ -1442,10 +1456,15 @@ impl Canvas {
                 slot_native_da.set_can_target(false);
                 {
                     let nh_touch = self.native_host.clone();
+                    let dkey_touch = self.active_device_key.clone();
                     let slot_name = format!("dial_{slot_idx}");
                     slot_native_da.set_draw_func(move |_area, cr, width, height| {
+                        if width <= 0 || height <= 0 {
+                            return;
+                        }
                         if let Some(ref host) = *nh_touch.borrow() {
-                            let _ = host.render_slot_visual(&slot_name, cr, width as f64, height as f64);
+                            let dkey = dkey_touch.borrow();
+                            let _ = host.render_slot_visual(&dkey, &slot_name, cr, width as f64, height as f64);
                         }
                     });
                 }
@@ -1481,6 +1500,7 @@ impl Canvas {
 
                     let meta_begin = self.dial_drag_meta.clone();
                     let nh_begin = self.native_host.clone();
+                    let dev_key_begin = self.active_device_key.clone();
                     let drag_state_begin = self.dragging_source.clone();
                     let drag_caps_begin = self.active_drag_caps.clone();
                     let seg_begin = slot_box.clone();
@@ -1496,9 +1516,10 @@ impl Canvas {
                         drag_caps_begin.set(Some(meta.caps));
                         seg_begin.add_css_class("drag-source");
                         let nh_opt = nh_begin.borrow().clone();
+                        let dkey = dev_key_begin.borrow().clone();
                         let slot_name = format!("dial_{d_begin}");
                         if let Some(tex) =
-                            create_slot_drag_chip_texture(&slot_name, &meta, nh_opt.as_ref())
+                            create_slot_drag_chip_texture(&dkey, &slot_name, &meta, nh_opt.as_ref())
                         {
                             let paintable: gtk::gdk::Paintable = tex.upcast();
                             src.set_icon(Some(&paintable), 24, 24);
@@ -2628,9 +2649,10 @@ impl Canvas {
                         .as_deref()
                         .filter(|p| !p.is_empty() && std::path::Path::new(p).exists())
                         .is_some();
+                    let active_dkey = self.active_device_key.borrow().clone();
                     let is_native_action = native_host_opt
                         .as_ref()
-                        .map(|h| h.is_native_plugin(&action.plugin_id) && h.has_slot(&format!("key_{idx}")))
+                        .map(|h| h.is_native_plugin(&action.plugin_id) && h.has_slot(&active_dkey, &format!("key_{idx}")))
                         .unwrap_or(false);
                     let show_native_canvas = is_native_action && !has_custom_path;
 
@@ -2907,9 +2929,10 @@ impl Canvas {
                             .as_deref()
                             .filter(|p| !p.is_empty() && std::path::Path::new(p).exists())
                             .is_some();
+                        let active_dkey = self.active_device_key.borrow().clone();
                         let show_native_touch = native_host_opt
                             .as_ref()
-                            .map(|h| h.is_native_plugin(&action.plugin_id) && h.has_slot(&format!("dial_{idx}")))
+                            .map(|h| h.is_native_plugin(&action.plugin_id) && h.has_slot(&active_dkey, &format!("dial_{idx}")))
                             .unwrap_or(false)
                             && !has_custom_path;
 

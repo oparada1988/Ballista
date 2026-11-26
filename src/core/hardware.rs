@@ -225,6 +225,7 @@ pub enum HardwareEvent {
     DialRelease { dial_index: usize },
     TouchTap { slot: usize, x: u16, y: u16 },
     TouchSwipe { is_right: bool },
+    DeviceLost { dev_path: PathBuf },
 }
 
 #[derive(Clone)]
@@ -235,6 +236,20 @@ pub struct HardwareManager {
     listener_stops: Arc<Mutex<HashMap<PathBuf, Arc<AtomicBool>>>>,
     active_animations: Arc<Mutex<HashMap<String, (String, Arc<AtomicBool>)>>>,
     native_host: Arc<Mutex<Option<crate::native_sdk::NativePluginHost>>>,
+    suspended: Arc<AtomicBool>,
+}
+
+/// Sleeps up to `duration` in short slices, waking immediately if `stop_flag` becomes true.
+fn sleep_interruptible(stop_flag: &AtomicBool, duration: Duration) {
+    let deadline = std::time::Instant::now() + duration;
+    while !stop_flag.load(Ordering::SeqCst) {
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            break;
+        }
+        let step = (deadline - now).min(Duration::from_millis(10));
+        thread::sleep(step);
+    }
 }
 
 fn parse_hex_color(hex: &str) -> Option<(f64, f64, f64)> {
@@ -316,7 +331,12 @@ impl HardwareManager {
             listener_stops: Arc::new(Mutex::new(HashMap::new())),
             active_animations: Arc::new(Mutex::new(HashMap::new())),
             native_host: Arc::new(Mutex::new(None)),
+            suspended: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    pub fn is_suspended(&self) -> bool {
+        self.suspended.load(Ordering::SeqCst)
     }
 
     pub fn set_native_host(&self, host: crate::native_sdk::NativePluginHost) {
@@ -396,6 +416,9 @@ impl HardwareManager {
 
     /// Returns a persistent shared `HidDevice` handle for `dev_path`, opening via libusb if needed.
     fn get_or_open_device(&self, dev_path: &Path) -> Result<Arc<Mutex<HidDevice>>, String> {
+        if self.is_suspended() {
+            return Err("Hardware transport is suspended".to_string());
+        }
         {
             let handles = self.open_handles.lock().unwrap();
             if let Some(existing) = handles.get(dev_path) {
@@ -439,24 +462,15 @@ impl HardwareManager {
             .unwrap_or(DeviceKind::StreamDeckMK2)
     }
 
-    /// Stops all background listeners/animations and releases USB device handles cleanly.
-    pub fn shutdown(&self) {
-        {
-            let mut stops = self.listener_stops.lock().unwrap();
-            for (_, flag) in stops.drain() {
-                flag.store(true, Ordering::SeqCst);
-            }
+    /// Stops all active animation/marquee threads without dropping device handles.
+    pub fn stop_all_animations(&self) {
+        let mut anims = self.active_animations.lock().unwrap();
+        for (_, (_, flag)) in anims.drain() {
+            flag.store(true, Ordering::SeqCst);
         }
-        {
-            let mut anims = self.active_animations.lock().unwrap();
-            for (_, (_, flag)) in anims.drain() {
-                flag.store(true, Ordering::SeqCst);
-            }
-        }
-        self.open_handles.lock().unwrap().clear();
     }
 
-    /// Stops all active device listeners without closing handles (used before rescanning hardware).
+    /// Stops all active device listeners without closing handles.
     pub fn stop_all_listeners(&self) {
         let mut stops = self.listener_stops.lock().unwrap();
         for (_, flag) in stops.drain() {
@@ -464,15 +478,104 @@ impl HardwareManager {
         }
     }
 
+    /// Safely stops all listeners/animations, drains open `HidDevice` handles while waiting
+    /// for worker threads to release cloned `Arc` references (so `hid_close` completes before
+    /// `hid_exit`), optionally dims screens to 0% before closing, and tears down `HidApi`.
+    fn teardown_transport(&self, dim_screens: bool) {
+        self.stop_all_listeners();
+        self.stop_all_animations();
+
+        let drained: Vec<(PathBuf, Arc<Mutex<HidDevice>>)> = {
+            let mut handles = self.open_handles.lock().unwrap();
+            handles.drain().collect()
+        };
+
+        // Wait briefly for listener/animation threads to exit their interruptible sleeps and drop
+        // their cloned Arc<Mutex<HidDevice>> handles before we close devices and tear down libusb.
+        let wait_deadline = std::time::Instant::now() + Duration::from_millis(250);
+        while drained.iter().any(|(_, arc)| Arc::strong_count(arc) > 1)
+            && std::time::Instant::now() < wait_deadline
+        {
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        if dim_screens {
+            let kinds = self.device_kinds.lock().unwrap().clone();
+            for (path, dev_arc) in &drained {
+                let kind = kinds
+                    .get(path)
+                    .copied()
+                    .unwrap_or(DeviceKind::StreamDeckMK2);
+                if kind.is_visual() {
+                    if let Ok(dev) = dev_arc.lock() {
+                        if let Err(e) = Self::send_brightness_direct(&dev, kind, 0) {
+                            tracing::warn!(
+                                "Failed to dim {} ({}) before suspend: {e}",
+                                kind.name(),
+                                path.display()
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // Explicitly close all HidDevice handles BEFORE dropping HidApi (hid_exit / libusb_exit).
+        drop(drained);
+        self.device_kinds.lock().unwrap().clear();
+        *self.hid_api.lock().unwrap() = None;
+    }
+
+    /// Prepares hardware for system suspend: pauses new I/O, dims connected visual decks to 0%,
+    /// stops listeners & animations, closes USB handles, and tears down the pre-suspend libusb context.
+    pub fn prepare_for_suspend(&self) {
+        tracing::info!("Preparing Elgato Stream Deck hardware for system suspend...");
+        self.suspended.store(true, Ordering::SeqCst);
+        self.teardown_transport(true);
+        tracing::info!("Stream Deck screens dimmed and USB HID transport released for suspend");
+    }
+
+    /// Full USB HID transport reset (used on system wake, Tray Rescan, and I/O error recovery):
+    /// tears down stale handles/animations and initializes a fresh `HidApi` (libusb) context.
+    pub fn reset_transport(&self) {
+        self.suspended.store(true, Ordering::SeqCst);
+        self.teardown_transport(false);
+        let fresh_api = match HidApi::new() {
+            Ok(a) => Some(a),
+            Err(e) => {
+                tracing::error!("Failed to re-initialize libusb HIDAPI transport: {e}");
+                None
+            }
+        };
+        *self.hid_api.lock().unwrap() = fresh_api;
+        self.suspended.store(false, Ordering::SeqCst);
+    }
+
+    /// Stops all background listeners/animations and releases USB device handles cleanly.
+    pub fn shutdown(&self) {
+        self.suspended.store(true, Ordering::SeqCst);
+        self.teardown_transport(false);
+    }
+
     /// Phase-1 Fast Boot: renders and pushes initial saved brightness & active pages to ALL
     /// connected decks simultaneously on parallel threads (<250ms total even with multiple decks).
-    pub fn sync_all_devices_async(&self, targets: Vec<(PathBuf, DeviceKind, Profile, u8)>) {
-        for (dev_path, kind, profile, brightness) in targets {
+    pub fn sync_all_devices_async(&self, targets: Vec<(PathBuf, String, DeviceKind, Profile, u8)>) {
+        for (dev_path, device_key, kind, profile, brightness) in targets {
             let hw = self.clone();
             thread::spawn(move || {
+                if hw.is_suspended() {
+                    return;
+                }
                 let t0 = std::time::Instant::now();
-                let _ = hw.set_brightness(&dev_path, brightness);
-                hw.sync_hardware_page(&dev_path, kind, &profile);
+                if let Err(e) = hw.set_brightness(&dev_path, brightness) {
+                    tracing::warn!(
+                        "Failed to set brightness {}% on {} ({}): {e}",
+                        brightness,
+                        kind.name(),
+                        dev_path.display()
+                    );
+                }
+                hw.sync_hardware_page(&dev_path, &device_key, kind, &profile);
                 tracing::info!(
                     "Fast-boot hardware render complete for {} ({}) in {:?}",
                     kind.name(),
@@ -483,17 +586,8 @@ impl HardwareManager {
         }
     }
 
-    /// Send hardware brightness feature report (0-100%) using the exact Gen1 or Gen2 protocol
-    pub fn set_brightness(&self, dev_path: &Path, brightness: u8) -> Result<(), String> {
-        let kind = self.lookup_kind(dev_path);
-        if !kind.is_visual() {
-            return Ok(());
-        }
-
-        let dev_arc = self.get_or_open_device(dev_path)?;
-        let dev = dev_arc.lock().unwrap();
+    fn send_brightness_direct(dev: &HidDevice, kind: DeviceKind, brightness: u8) -> Result<(), String> {
         let pct = brightness.min(100);
-
         match kind {
             DeviceKind::StreamDeckOriginal | DeviceKind::StreamDeckMini => {
                 let mut payload = [0u8; 17];
@@ -508,8 +602,19 @@ impl HardwareManager {
                     .map_err(|e| format!("Gen2 set_brightness failed: {e}"))?;
             }
         }
-
         Ok(())
+    }
+
+    /// Send hardware brightness feature report (0-100%) using the exact Gen1 or Gen2 protocol
+    pub fn set_brightness(&self, dev_path: &Path, brightness: u8) -> Result<(), String> {
+        let kind = self.lookup_kind(dev_path);
+        if !kind.is_visual() {
+            return Ok(());
+        }
+
+        let dev_arc = self.get_or_open_device(dev_path)?;
+        let dev = dev_arc.lock().unwrap();
+        Self::send_brightness_direct(&dev, kind, brightness)
     }
 
     /// Reset deck display / show default logo
@@ -775,6 +880,7 @@ impl HardwareManager {
     /// Pre-renders the static key background + icon (or native Cairo vector visual) layer
     /// so marquee frames never reload icon assets from disk on each scroll tick.
     fn render_key_base_layer(
+        device_key: &str,
         kind: DeviceKind,
         key_idx: usize,
         appearance: Option<&KeyAppearance>,
@@ -795,6 +901,13 @@ impl HardwareManager {
             cr.set_source_rgb(0.0, 0.0, 0.0);
             let _ = cr.paint();
         } else {
+            let custom_bg = appearance
+                .and_then(|a| a.bg_color.as_deref())
+                .and_then(parse_hex_color);
+            let (r, g, b) = custom_bg.unwrap_or((0.0, 0.0, 0.0));
+            cr.set_source_rgb(r, g, b);
+            let _ = cr.paint();
+
             let custom_icon_override = appearance
                 .and_then(|a| a.icon_path.as_deref())
                 .filter(|p| !p.is_empty() && Path::new(p).exists())
@@ -802,7 +915,7 @@ impl HardwareManager {
 
             let painted_native = if !custom_icon_override {
                 if let Some(host) = native_host {
-                    host.render_slot_visual(&format!("key_{key_idx}"), &cr, w as f64, h as f64)
+                    host.render_slot_visual(device_key, &format!("key_{key_idx}"), &cr, w as f64, h as f64)
                 } else {
                     false
                 }
@@ -811,14 +924,6 @@ impl HardwareManager {
             };
 
             if !painted_native {
-                let custom_bg = appearance
-                    .and_then(|a| a.bg_color.as_deref())
-                    .and_then(parse_hex_color);
-                let (r, g, b) = custom_bg.unwrap_or((0.0, 0.0, 0.0));
-
-                cr.set_source_rgb(r, g, b);
-                let _ = cr.paint();
-
                 if custom_bg.is_some() {
                     cr.set_source_rgb(
                         (r + 0.15).min(1.0),
@@ -924,6 +1029,7 @@ impl HardwareManager {
     /// Renders a key image buffer formatted natively (dimensions, rotation, flip, BMP or JPEG) for the hardware
     pub fn render_key_image(
         &self,
+        device_key: &str,
         kind: DeviceKind,
         key_idx: usize,
         appearance: Option<&KeyAppearance>,
@@ -931,9 +1037,15 @@ impl HardwareManager {
         is_active: bool,
     ) -> Vec<u8> {
         let host = self.get_native_host();
-        let Some((w, h, stride, base_data)) =
-            Self::render_key_base_layer(kind, key_idx, appearance, icon_name, is_active, host.as_ref())
-        else {
+        let Some((w, h, stride, base_data)) = Self::render_key_base_layer(
+            device_key,
+            kind,
+            key_idx,
+            appearance,
+            icon_name,
+            is_active,
+            host.as_ref(),
+        ) else {
             return Vec::new();
         };
         let (encoded, _) = Self::composite_key_frame(
@@ -950,7 +1062,7 @@ impl HardwareManager {
     }
 
     /// Renders the touchscreen strip JPEG for Stream Deck + (800x100) or Stream Deck + XL (1200x100 -> rotated 90° CCW)
-    pub fn render_touchscreen_jpeg(&self, kind: DeviceKind, profile: &Profile) -> Vec<u8> {
+    pub fn render_touchscreen_jpeg(&self, device_key: &str, kind: DeviceKind, profile: &Profile) -> Vec<u8> {
         let (width, height) = kind.touchscreen_size().unwrap_or((800, 100));
         let dial_count = kind.dial_count().max(1);
         let slot_w = (width as f64) / (dial_count as f64);
@@ -1043,6 +1155,14 @@ impl HardwareManager {
                             .filter(|p| !p.is_empty() && Path::new(p).exists())
                             .is_some();
 
+                        if let Some(ref bg_hex) = app.bg_color {
+                            if let Some((bg_r, bg_g, bg_b)) = parse_hex_color(bg_hex) {
+                                cr.set_source_rgb(bg_r, bg_g, bg_b);
+                                cr.rectangle(slot_x, 0.0, slot_w, height as f64);
+                                let _ = cr.fill();
+                            }
+                        }
+
                         if !has_custom_path {
                             if let Some(ref host) = native_host {
                                 let _ = cr.save();
@@ -1050,6 +1170,7 @@ impl HardwareManager {
                                 cr.clip();
                                 cr.translate(slot_x, 0.0);
                                 let painted = host.render_slot_visual(
+                                    device_key,
                                     &format!("dial_{i}"),
                                     &cr,
                                     slot_w,
@@ -1059,14 +1180,6 @@ impl HardwareManager {
                                 if painted {
                                     continue;
                                 }
-                            }
-                        }
-
-                        if let Some(ref bg_hex) = app.bg_color {
-                            if let Some((bg_r, bg_g, bg_b)) = parse_hex_color(bg_hex) {
-                                cr.set_source_rgb(bg_r, bg_g, bg_b);
-                                cr.rectangle(slot_x, 0.0, slot_w, height as f64);
-                                let _ = cr.fill();
                             }
                         }
 
@@ -1286,8 +1399,8 @@ impl HardwareManager {
     }
 
     /// Syncs an entire profile page to physical hardware LCD keys, touchscreen strip, and Neo info bar
-    pub fn sync_hardware_page(&self, dev_path: &Path, kind: DeviceKind, profile: &Profile) {
-        if !kind.is_visual() {
+    pub fn sync_hardware_page(&self, dev_path: &Path, device_key: &str, kind: DeviceKind, profile: &Profile) {
+        if !kind.is_visual() || self.is_suspended() {
             return;
         }
 
@@ -1348,7 +1461,7 @@ impl HardwareManager {
                                         );
                                     }
                                     frame_idx = (frame_idx + 1) % anim.frames.len();
-                                    thread::sleep(Duration::from_millis(delay_ms as u64));
+                                    sleep_interruptible(&stop_flag, Duration::from_millis(delay_ms as u64));
                                 }
                             }
                         });
@@ -1360,6 +1473,7 @@ impl HardwareManager {
 
                 let native_host = self.get_native_host();
                 let Some((kw, kh, kstride, base_data)) = Self::render_key_base_layer(
+                    device_key,
                     kind,
                     key,
                     appearance,
@@ -1428,7 +1542,7 @@ impl HardwareManager {
                         thread::spawn(move || {
                             let started = std::time::Instant::now();
                             while !stop_flag.load(Ordering::SeqCst) {
-                                thread::sleep(Duration::from_millis(85));
+                                sleep_interruptible(&stop_flag, Duration::from_millis(85));
                                 if stop_flag.load(Ordering::SeqCst) {
                                     break;
                                 }
@@ -1516,7 +1630,7 @@ impl HardwareManager {
                                     );
                                 }
                                 frame_idx = (frame_idx + 1) % anim.frames.len();
-                                thread::sleep(Duration::from_millis(delay_ms as u64));
+                                sleep_interruptible(&stop_flag, Duration::from_millis(delay_ms as u64));
                             }
                         }
                     });
@@ -1531,7 +1645,7 @@ impl HardwareManager {
             }
             drop(anim_lock);
 
-            let touch_jpeg = self.render_touchscreen_jpeg(kind, profile);
+            let touch_jpeg = self.render_touchscreen_jpeg(device_key, kind, profile);
             let res = {
                 let dev = dev_arc.lock().unwrap();
                 Self::write_touchscreen_image_direct(
@@ -1569,8 +1683,8 @@ impl HardwareManager {
 
     /// Lightweight single-slot hardware push for live 1Hz native action ticks (Clock, System Metrics, Media)
     /// so ticking a single key never re-renders or re-uploads all 32 keys over USB.
-    pub fn sync_single_slot(&self, dev_path: &Path, kind: DeviceKind, profile: &Profile, slot: &str) {
-        if !kind.is_visual() {
+    pub fn sync_single_slot(&self, dev_path: &Path, device_key: &str, kind: DeviceKind, profile: &Profile, slot: &str) {
+        if !kind.is_visual() || self.is_suspended() {
             return;
         }
         let Ok(dev_arc) = self.get_or_open_device(dev_path) else {
@@ -1595,6 +1709,7 @@ impl HardwareManager {
                 let native_host = self.get_native_host();
 
                 let Some((kw, kh, kstride, base_data)) = Self::render_key_base_layer(
+                    device_key,
                     kind,
                     key,
                     appearance,
@@ -1656,7 +1771,7 @@ impl HardwareManager {
                         thread::spawn(move || {
                             let started = std::time::Instant::now();
                             while !stop_flag.load(Ordering::SeqCst) {
-                                thread::sleep(Duration::from_millis(85));
+                                sleep_interruptible(&stop_flag, Duration::from_millis(85));
                                 if stop_flag.load(Ordering::SeqCst) {
                                     break;
                                 }
@@ -1684,13 +1799,20 @@ impl HardwareManager {
                 drop(anim_lock);
 
                 let dev = dev_arc.lock().unwrap();
-                let _ = Self::write_key_image_direct(&dev, kind, key, &encoded_0);
+                if let Err(e) = Self::write_key_image_direct(&dev, kind, key, &encoded_0) {
+                    tracing::warn!(
+                        "Failed to update key {} on {}: {}",
+                        key,
+                        dev_path.display(),
+                        e
+                    );
+                }
             }
         } else if slot.starts_with("dial_") {
             if let Some((tw, th)) = kind.touchscreen_size() {
-                let touch_jpeg = self.render_touchscreen_jpeg(kind, profile);
+                let touch_jpeg = self.render_touchscreen_jpeg(device_key, kind, profile);
                 let dev = dev_arc.lock().unwrap();
-                let _ = Self::write_touchscreen_image_direct(
+                if let Err(e) = Self::write_touchscreen_image_direct(
                     &dev,
                     kind,
                     0,
@@ -1698,7 +1820,13 @@ impl HardwareManager {
                     tw as u16,
                     th as u16,
                     &touch_jpeg,
-                );
+                ) {
+                    tracing::warn!(
+                        "Failed to update touchscreen on {}: {}",
+                        dev_path.display(),
+                        e
+                    );
+                }
             }
         }
     }
@@ -1727,6 +1855,7 @@ impl HardwareManager {
         };
 
         let stop_flag = Arc::new(AtomicBool::new(false));
+        let suspended_flag = self.suspended.clone();
         self.listener_stops
             .lock()
             .unwrap()
@@ -1741,6 +1870,7 @@ impl HardwareManager {
             let mut prev_touch_keys = vec![false; touch_key_count];
             let mut prev_dial_press = vec![false; dial_count];
             let mut buf = [0u8; 128];
+            let mut consecutive_errors: u32 = 0;
 
             tracing::info!(
                 "Started USB HID listener for {} ({}) [keys={}, dials={}]",
@@ -1750,7 +1880,7 @@ impl HardwareManager {
                 dial_count
             );
 
-            while !stop_flag.load(Ordering::SeqCst) {
+            while !stop_flag.load(Ordering::SeqCst) && !suspended_flag.load(Ordering::SeqCst) {
                 let read_res = {
                     let dev = dev_arc.lock().unwrap();
                     dev.read(&mut buf)
@@ -1758,10 +1888,13 @@ impl HardwareManager {
 
                 match read_res {
                     Ok(0) => {
+                        consecutive_errors = 0;
                         // Sleep OUTSIDE the device mutex so writes & brightness updates acquire immediately
-                        thread::sleep(Duration::from_millis(5));
+                        sleep_interruptible(&stop_flag, Duration::from_millis(5));
                     }
-                    Ok(n) if n >= 2 && buf[0] == 0x01 => match kind {
+                    Ok(n) if n >= 2 && buf[0] == 0x01 => {
+                        consecutive_errors = 0;
+                        match kind {
                         DeviceKind::StreamDeckOriginal => {
                             for i in 0..key_count {
                                 let hw_idx = convert_original_key_index(i);
@@ -1890,14 +2023,35 @@ impl HardwareManager {
                                 }
                             }
                         }
-                    },
-                    Ok(_) => {}
+                    }
+                    }
+                    Ok(_) => {
+                        consecutive_errors = 0;
+                    }
                     Err(e) => {
-                        tracing::debug!(
-                            "HID read error on {} (retrying): {e}",
-                            dev_path.display()
-                        );
-                        thread::sleep(Duration::from_millis(50));
+                        if stop_flag.load(Ordering::SeqCst) || suspended_flag.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        consecutive_errors += 1;
+                        if consecutive_errors == 1 || consecutive_errors % 5 == 0 {
+                            tracing::warn!(
+                                "HID read error #{} on {}: {e}",
+                                consecutive_errors,
+                                dev_path.display()
+                            );
+                        }
+                        if consecutive_errors >= 10 {
+                            tracing::warn!(
+                                "USB HID transport lost on {} after {} consecutive errors — requesting automatic recovery",
+                                dev_path.display(),
+                                consecutive_errors
+                            );
+                            callback(HardwareEvent::DeviceLost {
+                                dev_path: dev_path.clone(),
+                            });
+                            break;
+                        }
+                        sleep_interruptible(&stop_flag, Duration::from_millis(50));
                     }
                 }
             }

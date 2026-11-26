@@ -100,13 +100,6 @@ impl BallistaAction for FolderAction {
         let (ar, ag, ab) = parse_hex(&self.folder_color).unwrap_or((0.569, 0.275, 1.0));
         let min_d = w.min(h).max(24.0);
 
-        let bg_grad = cairo::LinearGradient::new(0.0, 0.0, 0.0, h);
-        bg_grad.add_color_stop_rgb(0.0, 0.115, 0.118, 0.160);
-        bg_grad.add_color_stop_rgb(1.0, 0.072, 0.072, 0.100);
-        let _ = cr.set_source(&bg_grad);
-        cr.rectangle(0.0, 0.0, w, h);
-        let _ = cr.fill();
-
         // Crisp vector folder icon
         let fw = min_d * 0.56;
         let fh = min_d * 0.42;
@@ -175,12 +168,6 @@ impl BallistaAction for FolderBackAction {
 
     fn render_visual(&self, cr: &cairo::Context, w: f64, h: f64) -> bool {
         let min_d = w.min(h).max(24.0);
-        let bg_grad = cairo::LinearGradient::new(0.0, 0.0, 0.0, h);
-        bg_grad.add_color_stop_rgb(0.0, 0.145, 0.115, 0.215);
-        bg_grad.add_color_stop_rgb(1.0, 0.085, 0.072, 0.125);
-        let _ = cr.set_source(&bg_grad);
-        cr.rectangle(0.0, 0.0, w, h);
-        let _ = cr.fill();
 
         let sz = (min_d * 0.34).clamp(14.0, 38.0);
         draw_cairo_text(

@@ -243,12 +243,6 @@ impl BallistaAction for RunCommandAction {
 
     fn render_visual(&self, cr: &cairo::Context, w: f64, h: f64) -> bool {
         let min_d = w.min(h).max(24.0);
-        let bg_grad = cairo::LinearGradient::new(0.0, 0.0, 0.0, h);
-        bg_grad.add_color_stop_rgb(0.0, 0.105, 0.115, 0.145);
-        bg_grad.add_color_stop_rgb(1.0, 0.068, 0.072, 0.095);
-        let _ = cr.set_source(&bg_grad);
-        cr.rectangle(0.0, 0.0, w, h);
-        let _ = cr.fill();
 
         // Crisp terminal prompt glyph `>_`
         let glyph_sz = (min_d * 0.34).clamp(14.0, 38.0);

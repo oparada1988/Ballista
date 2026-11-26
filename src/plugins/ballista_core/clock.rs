@@ -225,13 +225,6 @@ impl ClockAction {
         let accent = parse_hex(&self.accent_color).unwrap_or((0.569, 0.275, 1.0));
         let (ar, ag, ab) = accent;
 
-        let bg_grad = cairo::LinearGradient::new(0.0, 0.0, 0.0, h);
-        bg_grad.add_color_stop_rgb(0.0, 0.118, 0.118, 0.165);
-        bg_grad.add_color_stop_rgb(1.0, 0.070, 0.070, 0.100);
-        let _ = cr.set_source(&bg_grad);
-        cr.rectangle(0.0, 0.0, w, h);
-        let _ = cr.fill();
-
         let (disp_hour, ampm) = if self.use_24h {
             (hour24, "")
         } else {
@@ -348,7 +341,7 @@ impl ClockAction {
                 let rw = (w - rx - 8.0).max(30.0);
 
                 // Timezone pill top-right
-                let pill_w = (tz_str.len() as f64 * 6.5 + 12.0).clamp(40.0, rw);
+                let pill_w = (tz_str.len() as f64 * 6.5 + 12.0).clamp(rw.min(40.0), rw);
                 let pill_h = (h * 0.17).clamp(13.0, 18.0);
                 draw_pill(cr, rx, h * 0.10, pill_w, pill_h, pill_h / 2.0);
                 cr.set_source_rgba(ar, ag, ab, 0.24);
@@ -626,18 +619,6 @@ impl BallistaAction for ClockAction {
         let min_d = w.min(h).max(24.0);
 
         if self.style_idx == 1 {
-            let (bg_top, bg_bot) = match self.analog_theme {
-                1 => ((0.92, 0.93, 0.96), (0.84, 0.86, 0.90)),
-                2 => ((0.08, 0.08, 0.10), (0.06, 0.06, 0.08)),
-                _ => ((0.12, 0.12, 0.16), (0.07, 0.07, 0.10)),
-            };
-            let bg_grad = cairo::LinearGradient::new(0.0, 0.0, 0.0, h);
-            bg_grad.add_color_stop_rgb(0.0, bg_top.0, bg_top.1, bg_top.2);
-            bg_grad.add_color_stop_rgb(1.0, bg_bot.0, bg_bot.1, bg_bot.2);
-            let _ = cr.set_source(&bg_grad);
-            cr.rectangle(0.0, 0.0, w, h);
-            let _ = cr.fill();
-
             self.draw_analog_face(
                 cr,
                 w / 2.0,
@@ -650,13 +631,6 @@ impl BallistaAction for ClockAction {
             );
         } else {
             // DIGITAL KEY CLOCK
-            let bg_grad = cairo::LinearGradient::new(0.0, 0.0, 0.0, h);
-            bg_grad.add_color_stop_rgb(0.0, 0.115, 0.118, 0.160);
-            bg_grad.add_color_stop_rgb(1.0, 0.072, 0.072, 0.098);
-            let _ = cr.set_source(&bg_grad);
-            cr.rectangle(0.0, 0.0, w, h);
-            let _ = cr.fill();
-
             cr.set_source_rgba(ar, ag, ab, 0.85);
             cr.rectangle(w * 0.25, 3.0, w * 0.50, 2.5);
             let _ = cr.fill();

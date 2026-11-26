@@ -362,19 +362,6 @@ impl BallistaAction for TimerDialAction {
     fn render_visual(&self, cr: &cairo::Context, w: f64, h: f64) -> bool {
         let (ar, ag, ab) = self.active_palette();
 
-        // Midnight dark backdrop with subtle finish glow
-        let bg_grad = cairo::LinearGradient::new(0.0, 0.0, 0.0, h);
-        if self.state == TimerState::Finished && self.blink_on {
-            bg_grad.add_color_stop_rgb(0.0, ar * 0.32, ag * 0.32, ab * 0.32);
-            bg_grad.add_color_stop_rgb(1.0, 0.075, 0.080, 0.110);
-        } else {
-            bg_grad.add_color_stop_rgb(0.0, 0.118, 0.120, 0.168);
-            bg_grad.add_color_stop_rgb(1.0, 0.068, 0.070, 0.098);
-        }
-        let _ = cr.set_source(&bg_grad);
-        cr.rectangle(0.0, 0.0, w, h);
-        let _ = cr.fill();
-
         let frac = if self.target_secs > 0 {
             (self.remaining_secs as f64 / self.target_secs as f64).clamp(0.0, 1.0)
         } else {
@@ -452,7 +439,7 @@ impl BallistaAction for TimerDialAction {
             TimerState::Running => "RUNNING",
             TimerState::Idle => "TIMER",
         };
-        let pill_w = (badge.len() as f64 * 6.8 + 12.0).clamp(44.0, rw);
+        let pill_w = (badge.len() as f64 * 6.8 + 12.0).clamp(rw.min(44.0), rw);
         let pill_h = (h * 0.17).clamp(13.0, 18.0);
         draw_pill(cr, rx, h * 0.10, pill_w, pill_h, pill_h / 2.0);
         cr.set_source_rgba(ar, ag, ab, 0.28);

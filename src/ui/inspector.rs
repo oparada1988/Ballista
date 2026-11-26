@@ -83,6 +83,7 @@ pub struct PropertyInspector {
     pub on_open_plugin_settings: Rc<RefCell<Option<std::boxed::Box<dyn Fn(String, String)>>>>,
     pub plugin_manager: Rc<RefCell<Option<PluginManager>>>,
     pub native_host: Rc<RefCell<Option<crate::native_sdk::NativePluginHost>>>,
+    pub active_device_key: Rc<RefCell<String>>,
     pub on_parameter_changed: Rc<RefCell<Option<std::boxed::Box<dyn Fn(String, String)>>>>,
     pub on_config_row_changed: Rc<RefCell<Option<std::boxed::Box<dyn Fn(String, usize, Option<usize>, Option<bool>, Option<String>, Option<String>, Option<f64>)>>>>,
     pub on_config_button_clicked: Rc<RefCell<Option<std::boxed::Box<dyn Fn(String, usize)>>>>,
@@ -207,6 +208,7 @@ impl PropertyInspector {
 
         let native_host: Rc<RefCell<Option<crate::native_sdk::NativePluginHost>>> =
             Rc::new(RefCell::new(None));
+        let active_device_key: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
         let current_target_rc: Rc<RefCell<InspectorTarget>> =
             Rc::new(RefCell::new(InspectorTarget::Key(0)));
 
@@ -219,15 +221,20 @@ impl PropertyInspector {
         preview_native_da.set_can_target(false);
         {
             let nh_prev = native_host.clone();
+            let dkey_prev = active_device_key.clone();
             let tgt_prev = current_target_rc.clone();
             preview_native_da.set_draw_func(move |_area, cr, width, height| {
+                if width <= 0 || height <= 0 {
+                    return;
+                }
                 let slot = match *tgt_prev.borrow() {
                     InspectorTarget::Key(k) => format!("key_{k}"),
                     InspectorTarget::Dial(d) => format!("dial_{d}"),
                     InspectorTarget::Touchscreen => "touchscreen".to_string(),
                 };
                 if let Some(ref host) = *nh_prev.borrow() {
-                    let _ = host.render_slot_visual(&slot, cr, width as f64, height as f64);
+                    let dkey = dkey_prev.borrow();
+                    let _ = host.render_slot_visual(&dkey, &slot, cr, width as f64, height as f64);
                 }
             });
         }
@@ -629,6 +636,7 @@ impl PropertyInspector {
             on_open_plugin_settings,
             plugin_manager: Rc::new(RefCell::new(None)),
             native_host,
+            active_device_key,
             on_parameter_changed,
             on_config_row_changed,
             on_config_button_clicked,
@@ -814,13 +822,15 @@ impl PropertyInspector {
                     .map(|h| h.is_native_plugin(&act.plugin_id))
                     .unwrap_or(false);
 
+                let active_dkey = self.active_device_key.borrow().clone();
                 let live_rows = if is_native {
                     self.native_host
                         .borrow()
                         .as_ref()
-                        .and_then(|h| h.config_rows(&slot))
+                        .and_then(|h| h.config_rows(&active_dkey, &slot))
                 } else if let Some(ref pm) = *self.plugin_manager.borrow() {
-                    pm.get_live_config_rows(&slot)
+                    pm.get_live_config_rows(&format!("{active_dkey}::{slot}"))
+                        .or_else(|| pm.get_live_config_rows(&slot))
                 } else {
                     None
                 };
@@ -1125,12 +1135,13 @@ impl PropertyInspector {
             let has_custom_path = icon_path
                 .filter(|p| !p.is_empty() && std::path::Path::new(p).exists())
                 .is_some();
+            let active_dkey = self.active_device_key.borrow().clone();
             let show_native_prev = !has_custom_path
                 && self
                     .native_host
                     .borrow()
                     .as_ref()
-                    .map(|h| h.is_native_plugin(&act.plugin_id) && h.has_slot(&target_slot_str))
+                    .map(|h| h.is_native_plugin(&act.plugin_id) && h.has_slot(&active_dkey, &target_slot_str))
                     .unwrap_or(false);
 
             self.preview_native_da.set_visible(show_native_prev);
@@ -1349,12 +1360,13 @@ impl PropertyInspector {
         let has_custom_path = icon_path
             .filter(|p| !p.is_empty() && std::path::Path::new(p).exists())
             .is_some();
+        let active_dkey = self.active_device_key.borrow().clone();
         let show_native_prev = !has_custom_path
             && self
                 .native_host
                 .borrow()
                 .as_ref()
-                .map(|h| h.is_native_plugin(&act.plugin_id) && h.has_slot(&target_slot_str))
+                .map(|h| h.is_native_plugin(&act.plugin_id) && h.has_slot(&active_dkey, &target_slot_str))
                 .unwrap_or(false);
 
         self.preview_native_da.set_visible(show_native_prev);
@@ -1802,6 +1814,10 @@ impl PropertyInspector {
 
     pub fn set_native_host(&self, host: crate::native_sdk::NativePluginHost) {
         *self.native_host.borrow_mut() = Some(host);
+    }
+
+    pub fn set_active_device_key(&self, key: &str) {
+        *self.active_device_key.borrow_mut() = key.to_string();
     }
 
     pub fn redraw_native_preview(&self, slot: &str) {

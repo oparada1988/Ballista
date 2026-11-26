@@ -93,13 +93,6 @@ impl HotkeyAction {
         let (ar, ag, ab) = parse_hex(&self.accent_color).unwrap_or((0.569, 0.275, 1.0));
         let flash = self.active_jog_flash();
 
-        let bg_grad = cairo::LinearGradient::new(0.0, 0.0, 0.0, h);
-        bg_grad.add_color_stop_rgb(0.0, 0.118, 0.118, 0.165);
-        bg_grad.add_color_stop_rgb(1.0, 0.070, 0.070, 0.100);
-        let _ = cr.set_source(&bg_grad);
-        cr.rectangle(0.0, 0.0, w, h);
-        let _ = cr.fill();
-
         draw_cairo_text(
             cr,
             "HOTKEY JOG",
@@ -373,12 +366,6 @@ impl BallistaAction for HotkeyAction {
         }
 
         let min_d = w.min(h).max(24.0);
-        let bg_grad = cairo::LinearGradient::new(0.0, 0.0, 0.0, h);
-        bg_grad.add_color_stop_rgb(0.0, 0.115, 0.115, 0.160);
-        bg_grad.add_color_stop_rgb(1.0, 0.072, 0.072, 0.100);
-        let _ = cr.set_source(&bg_grad);
-        cr.rectangle(0.0, 0.0, w, h);
-        let _ = cr.fill();
 
         // Draw crisp rounded keycap outline
         let kw = w * 0.72;

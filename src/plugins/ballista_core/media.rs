@@ -79,7 +79,7 @@ impl MprisPlayerInfo {
             pos += (elapsed_us * rate) as i64;
         }
         if self.length_us > 0 {
-            pos.clamp(0, self.length_us)
+            pos.clamp(0, self.length_us.max(0))
         } else {
             pos.max(0)
         }
@@ -481,14 +481,6 @@ impl MediaAction {
             .map(|p| (p.estimated_position_us(), p.length_us))
             .unwrap_or((0, 0));
 
-        // Base Midnight backdrop
-        let bg_grad = cairo::LinearGradient::new(0.0, 0.0, 0.0, h);
-        bg_grad.add_color_stop_rgb(0.0, 0.125, 0.125, 0.175);
-        bg_grad.add_color_stop_rgb(1.0, 0.070, 0.070, 0.098);
-        let _ = cr.set_source(&bg_grad);
-        cr.rectangle(0.0, 0.0, w, h);
-        let _ = cr.fill();
-
         let (content_x, content_w) = if self.dial_layout == 0 {
             // FULL ART BACKDROP: album art fills the entire designated 200x100 segment
             if let Some(ref art) = self.cached_art {
@@ -500,14 +492,6 @@ impl MediaAction {
                 scrim.add_color_stop_rgba(0.75, 0.04, 0.04, 0.07, 0.72);
                 scrim.add_color_stop_rgba(1.0, 0.03, 0.03, 0.06, 0.90);
                 let _ = cr.set_source(&scrim);
-                cr.rectangle(0.0, 0.0, w, h);
-                let _ = cr.fill();
-            } else {
-                // Subtle diagonal ambient accent glow when idle / no art
-                let glow = cairo::RadialGradient::new(w * 0.5, h * 0.45, 4.0, w * 0.5, h * 0.45, w * 0.55);
-                glow.add_color_stop_rgba(0.0, ar, ag, ab, 0.24);
-                glow.add_color_stop_rgba(1.0, ar, ag, ab, 0.0);
-                let _ = cr.set_source(&glow);
                 cr.rectangle(0.0, 0.0, w, h);
                 let _ = cr.fill();
             }
@@ -770,7 +754,7 @@ impl BallistaAction for MediaAction {
                 if let Some(ref mut p) = self.cached_player {
                     let cur = p.estimated_position_us();
                     p.position_us = if p.length_us > 0 {
-                        (cur + offset_us).clamp(0, p.length_us)
+                        (cur + offset_us).clamp(0, p.length_us.max(0))
                     } else {
                         (cur + offset_us).max(0)
                     };
@@ -976,15 +960,7 @@ impl BallistaAction for MediaAction {
             .map(|p| p.status == "Playing")
             .unwrap_or(false);
 
-        // 1. Base Midnight backdrop
-        let bg_grad = cairo::LinearGradient::new(0.0, 0.0, 0.0, h);
-        bg_grad.add_color_stop_rgb(0.0, 0.125, 0.125, 0.175);
-        bg_grad.add_color_stop_rgb(1.0, 0.075, 0.075, 0.105);
-        let _ = cr.set_source(&bg_grad);
-        cr.rectangle(0.0, 0.0, w, h);
-        let _ = cr.fill();
-
-        // 2. Square Key Rendering
+        // Square Key Rendering (album art backdrop only when enabled and available)
         let want_art = matches!(self.mode_idx, 0 | 6) && self.show_art_backdrop;
         if want_art {
             if let Some(ref art) = self.cached_art {

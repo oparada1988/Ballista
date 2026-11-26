@@ -1122,11 +1122,12 @@ class BridgeRunner:
         if action_class is None:
             return {"status": "error", "message": f"Could not find action class for {action_id}"}
 
-        # Determine InputIdentifier
-        if slot.startswith("key_"):
-            input_ident = Input.Key(slot.replace("key_", ""))
-        elif slot.startswith("dial_"):
-            input_ident = Input.Dial(slot.replace("dial_", ""))
+        # Determine InputIdentifier (supports device-scoped slots like "<device_key>::key_0")
+        base_slot = slot.rsplit("::", 1)[-1]
+        if base_slot.startswith("key_"):
+            input_ident = Input.Key(base_slot.replace("key_", ""))
+        elif base_slot.startswith("dial_"):
+            input_ident = Input.Dial(base_slot.replace("dial_", ""))
         else:
             input_ident = Input.Touchscreen("0")
 
@@ -1230,6 +1231,13 @@ class BridgeRunner:
     def handle_clear_all_actions(self):
         for slot in list(self.actions.keys()):
             self.handle_destroy_action(slot)
+        return {"status": "ok"}
+
+    def handle_clear_device_actions(self, device_key: str):
+        prefix = f"{device_key}::"
+        for slot in list(self.actions.keys()):
+            if slot.startswith(prefix):
+                self.handle_destroy_action(slot)
         return {"status": "ok"}
 
     def handle_update_action_settings(self, slot: str, settings: dict):
@@ -1430,6 +1438,8 @@ class BridgeRunner:
                 res = self.handle_destroy_action(req.get("slot", ""))
             elif cmd == "clear_all_actions":
                 res = self.handle_clear_all_actions()
+            elif cmd == "clear_device_actions":
+                res = self.handle_clear_device_actions(req.get("slot", ""))
             elif cmd == "update_action_settings":
                 res = self.handle_update_action_settings(req.get("slot", ""), req.get("settings", {}))
             elif cmd == "get_action_config_rows":

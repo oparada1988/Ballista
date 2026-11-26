@@ -99,12 +99,6 @@ impl BallistaAction for MultiActionRunner {
 
     fn render_visual(&self, cr: &cairo::Context, w: f64, h: f64) -> bool {
         let min_d = w.min(h).max(24.0);
-        let bg_grad = cairo::LinearGradient::new(0.0, 0.0, 0.0, h);
-        bg_grad.add_color_stop_rgb(0.0, 0.115, 0.118, 0.165);
-        bg_grad.add_color_stop_rgb(1.0, 0.072, 0.074, 0.102);
-        let _ = cr.set_source(&bg_grad);
-        cr.rectangle(0.0, 0.0, w, h);
-        let _ = cr.fill();
 
         // Stacked action bars glyph representing a multi-step sequence
         let bw = min_d * 0.50;

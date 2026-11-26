@@ -317,6 +317,14 @@ impl PluginBridge {
         });
     }
 
+    pub fn clear_device_actions(&self, device_key: &str) {
+        self.send_command(BridgeCommand {
+            cmd: "clear_device_actions".into(),
+            slot: Some(device_key.into()),
+            ..Default::default()
+        });
+    }
+
     pub fn update_action_settings(&self, slot: &str, settings: HashMap<String, serde_json::Value>) {
         self.send_command(BridgeCommand {
             cmd: "update_action_settings".into(),

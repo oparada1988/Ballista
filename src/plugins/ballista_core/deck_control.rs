@@ -80,13 +80,6 @@ impl DeckControlAction {
     fn render_dial_card(&self, cr: &cairo::Context, w: f64, h: f64) {
         let (ar, ag, ab) = parse_hex(&self.accent_color).unwrap_or((0.569, 0.275, 1.0));
 
-        let bg_grad = cairo::LinearGradient::new(0.0, 0.0, 0.0, h);
-        bg_grad.add_color_stop_rgb(0.0, 0.118, 0.120, 0.168);
-        bg_grad.add_color_stop_rgb(1.0, 0.068, 0.070, 0.098);
-        let _ = cr.set_source(&bg_grad);
-        cr.rectangle(0.0, 0.0, w, h);
-        let _ = cr.fill();
-
         let pad_x = 12.0;
 
         match self.dial_mode_idx {
@@ -556,12 +549,6 @@ impl BallistaAction for DeckControlAction {
         }
 
         let min_d = w.min(h).max(24.0);
-        let bg_grad = cairo::LinearGradient::new(0.0, 0.0, 0.0, h);
-        bg_grad.add_color_stop_rgb(0.0, 0.115, 0.118, 0.162);
-        bg_grad.add_color_stop_rgb(1.0, 0.072, 0.074, 0.100);
-        let _ = cr.set_source(&bg_grad);
-        cr.rectangle(0.0, 0.0, w, h);
-        let _ = cr.fill();
 
         let (glyph, label) = match self.mode_idx {
             0 => ("▶", "Next Page".to_string()),

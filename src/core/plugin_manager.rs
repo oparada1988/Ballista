@@ -167,6 +167,13 @@ impl PluginManager {
         }
     }
 
+    pub fn clear_device_live_config_rows(&self, device_key: &str) {
+        let prefix = format!("{device_key}::");
+        if let Ok(mut lock) = self.live_config_rows.lock() {
+            lock.retain(|k, _| !k.starts_with(&prefix));
+        }
+    }
+
     pub fn set_live_plugin_settings_rows(&self, plugin_id: &str, rows: Vec<super::plugin_bridge::BridgeConfigRow>) {
         if let Ok(mut lock) = self.live_plugin_settings_rows.lock() {
             lock.insert(plugin_id.to_string(), rows);

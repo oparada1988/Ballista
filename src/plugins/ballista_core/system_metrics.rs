@@ -157,14 +157,6 @@ impl SystemMetricsAction {
             _ => "DISK",
         };
 
-        // Midnight dark backdrop
-        let bg_grad = cairo::LinearGradient::new(0.0, 0.0, 0.0, h);
-        bg_grad.add_color_stop_rgb(0.0, 0.115, 0.118, 0.162);
-        bg_grad.add_color_stop_rgb(1.0, 0.068, 0.070, 0.098);
-        let _ = cr.set_source(&bg_grad);
-        cr.rectangle(0.0, 0.0, w, h);
-        let _ = cr.fill();
-
         let pad_x = 10.0;
         let dot_y = h - 7.5;
 
@@ -569,14 +561,6 @@ impl BallistaAction for SystemMetricsAction {
 
         let (ar, ag, ab) = self.active_rgb();
         let min_d = w.min(h).max(24.0);
-
-        // Midnight dark backdrop with subtle top sheen
-        let bg_grad = cairo::LinearGradient::new(0.0, 0.0, 0.0, h);
-        bg_grad.add_color_stop_rgb(0.0, 0.115, 0.118, 0.160);
-        bg_grad.add_color_stop_rgb(1.0, 0.075, 0.075, 0.102);
-        let _ = cr.set_source(&bg_grad);
-        cr.rectangle(0.0, 0.0, w, h);
-        let _ = cr.fill();
 
         let metric_short = match self.metric_idx {
             0 => "CPU",
