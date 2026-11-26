@@ -10,18 +10,38 @@ pub fn resolve_icon_path(icon_name_or_path: &str, size: i32) -> Option<String> {
     if icon_name_or_path.is_empty() {
         return None;
     }
-    // 1. Direct path check
+    // 1. Direct path check (handles AppImage, Snap, and user absolute icon paths)
     let p = std::path::Path::new(icon_name_or_path);
     if p.is_absolute() && p.exists() {
         return Some(icon_name_or_path.to_string());
     }
 
-    let clean_name = p.file_name().and_then(|n| n.to_str()).unwrap_or(icon_name_or_path);
+    let raw_name = p.file_name().and_then(|n| n.to_str()).unwrap_or(icon_name_or_path);
+    let clean_name = raw_name
+        .strip_suffix(".svg")
+        .or_else(|| raw_name.strip_suffix(".png"))
+        .or_else(|| raw_name.strip_suffix(".xpm"))
+        .unwrap_or(raw_name);
 
-    // 2. GtkIconTheme lookup (main-thread only — off-thread Phase-1 boot falls through to filesystem search)
+    // 2. GtkIconTheme lookup (main-thread only — augment search paths with Flatpak & Snap icon roots!)
     if gtk::is_initialized_main_thread() {
         if let Some(display) = gtk::gdk::Display::default() {
             let theme = gtk::IconTheme::for_display(&display);
+            let home = std::env::var("HOME").unwrap_or_default();
+            let extra_roots = [
+                format!("{home}/.local/share/flatpak/exports/share/icons"),
+                "/var/lib/flatpak/exports/share/icons".to_string(),
+                "/var/lib/snapd/desktop/icons".to_string(),
+                format!("{home}/.local/share/icons"),
+            ];
+            let existing_paths = theme.search_path();
+            for root in &extra_roots {
+                let rp = std::path::Path::new(root);
+                if rp.exists() && !existing_paths.iter().any(|ep| ep == rp) {
+                    theme.add_search_path(rp);
+                }
+            }
+
             if theme.has_icon(clean_name) {
                 let paintable = theme.lookup_icon(clean_name, &[], size, 1, gtk::TextDirection::None, gtk::IconLookupFlags::empty());
                 if let Some(file) = paintable.file() {
@@ -46,19 +66,56 @@ pub fn resolve_icon_path(icon_name_or_path: &str, size: i32) -> Option<String> {
         }
     }
 
-    // 3. Fallback filesystem searches in common system and cache directories
+    // 3. Comprehensive filesystem search across Flatpak (user & system), User/AppImage, Snap, Local, and System icon roots
     let home = std::env::var("HOME").unwrap_or_default();
-    let candidates = [
-        format!("{}/.cache/streamcontroller_apps/icons/{clean_name}.png", home),
-        format!("{}/.cache/streamcontroller_apps/icons/{clean_name}.svg", home),
-        format!("/usr/share/pixmaps/{clean_name}.png"),
-        format!("/usr/share/pixmaps/{clean_name}.svg"),
-        format!("/usr/share/icons/hicolor/scalable/apps/{clean_name}.svg"),
-        format!("/usr/share/icons/hicolor/256x256/apps/{clean_name}.png"),
-        format!("/usr/share/icons/hicolor/128x128/apps/{clean_name}.png"),
-        format!("/usr/share/icons/hicolor/48x48/apps/{clean_name}.png"),
+    let icon_roots = [
+        format!("{home}/.local/share/flatpak/exports/share/icons"),
+        "/var/lib/flatpak/exports/share/icons".to_string(),
+        format!("{home}/.local/share/icons"),
+        "/var/lib/snapd/desktop/icons".to_string(),
+        "/usr/local/share/icons".to_string(),
+        "/usr/share/icons".to_string(),
     ];
-    for cand in &candidates {
+    let subdirs = [
+        "hicolor/scalable/apps",
+        "hicolor/512x512/apps",
+        "hicolor/256x256/apps",
+        "hicolor/128x128/apps",
+        "hicolor/96x96/apps",
+        "hicolor/64x64/apps",
+        "hicolor/48x48/apps",
+    ];
+    let exts = ["svg", "png"];
+
+    for root in &icon_roots {
+        if !std::path::Path::new(root).exists() {
+            continue;
+        }
+        // Check direct files inside ~/.local/share/icons (common for Gear Lever / AppImage icons)
+        for ext in &exts {
+            let direct = format!("{root}/{clean_name}.{ext}");
+            if std::path::Path::new(&direct).exists() {
+                return Some(direct);
+            }
+        }
+        for sub in &subdirs {
+            for ext in &exts {
+                let cand = format!("{root}/{sub}/{clean_name}.{ext}");
+                if std::path::Path::new(&cand).exists() {
+                    return Some(cand);
+                }
+            }
+        }
+    }
+
+    let pixmap_candidates = [
+        format!("{home}/.cache/streamcontroller_apps/icons/{clean_name}.png"),
+        format!("{home}/.cache/streamcontroller_apps/icons/{clean_name}.svg"),
+        format!("/usr/share/pixmaps/{clean_name}.svg"),
+        format!("/usr/share/pixmaps/{clean_name}.png"),
+        format!("/usr/share/pixmaps/{raw_name}"),
+    ];
+    for cand in &pixmap_candidates {
         if std::path::Path::new(cand).exists() {
             return Some(cand.clone());
         }

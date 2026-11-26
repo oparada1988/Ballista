@@ -91,12 +91,6 @@ impl NativePluginHost {
             .unwrap_or(TargetCaps::KEYS_AND_DIALS)
     }
 
-    pub fn set_deck_context(&self, available_profiles: Vec<String>, total_pages: usize) {
-        let mut guard = self.inner.lock().unwrap();
-        guard.deck.available_profiles = available_profiles;
-        guard.deck.total_pages = total_pages.max(1);
-    }
-
     pub fn set_deck_state(
         &self,
         available_profiles: Vec<String>,

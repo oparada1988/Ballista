@@ -320,4 +320,18 @@ mod tests {
         assert!(restored.folders.contains_key("folder_2"));
         assert!(restored.folder_stack.is_empty());
     }
+
+    #[test]
+    fn app_scanner_includes_flatpak_snap_and_user_desktop_dirs() {
+        let dirs = crate::core::PluginManager::desktop_application_dirs();
+        let strs: Vec<String> = dirs
+            .iter()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect();
+        assert!(strs.iter().any(|s| s == "/var/lib/flatpak/exports/share/applications"));
+        assert!(strs.iter().any(|s| s == "/var/lib/snapd/desktop/applications"));
+        assert!(strs.iter().any(|s| s.ends_with(".local/share/flatpak/exports/share/applications")));
+        assert!(strs.iter().any(|s| s.ends_with(".local/share/applications")));
+        assert!(strs.iter().any(|s| s == "/usr/share/applications"));
+    }
 }

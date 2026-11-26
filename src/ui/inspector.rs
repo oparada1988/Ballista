@@ -2343,7 +2343,12 @@ pub fn show_app_picker_dialog<F: Fn(InstalledApp) + 'static>(
         let inner = Box::new(Orientation::Horizontal, 12);
         inner.set_halign(gtk::Align::Fill);
 
-        let icon_img = if !app.icon.is_empty() && std::path::Path::new(&app.icon).exists() {
+        let resolved_picker_icon = super::canvas::resolve_icon_path(&app.icon, 48);
+        let icon_img = if let Some(ref ip) = resolved_picker_icon {
+            let img = gtk::Image::from_file(ip);
+            img.set_pixel_size(32);
+            img
+        } else if !app.icon.is_empty() && std::path::Path::new(&app.icon).exists() {
             let img = gtk::Image::from_file(&app.icon);
             img.set_pixel_size(32);
             img
@@ -2375,6 +2380,19 @@ pub fn show_app_picker_dialog<F: Fn(InstalledApp) + 'static>(
         text_col.append(&id_lbl);
         inner.append(&icon_img);
         inner.append(&text_col);
+
+        if !app.source.is_empty() {
+            let src_badge = Label::new(Some(&app.source.to_uppercase()));
+            src_badge.add_css_class("cap-badge");
+            match app.source.as_str() {
+                "Flatpak" => src_badge.add_css_class("cap-badge-dial"),
+                "Snap" | "AppImage" => src_badge.add_css_class("cap-badge-both"),
+                _ => src_badge.add_css_class("cap-badge-key"),
+            }
+            src_badge.set_valign(gtk::Align::Center);
+            inner.append(&src_badge);
+        }
+
         row_btn.set_child(Some(&inner));
 
         let app_clone = app.clone();
@@ -2386,7 +2404,12 @@ pub fn show_app_picker_dialog<F: Fn(InstalledApp) + 'static>(
         });
 
         list_box.append(&row_btn);
-        let search_key = format!("{} {}", app.name.to_lowercase(), app.desktop_id.to_lowercase());
+        let search_key = format!(
+            "{} {} {}",
+            app.name.to_lowercase(),
+            app.desktop_id.to_lowercase(),
+            app.source.to_lowercase()
+        );
         row_entries.push((row_btn, search_key));
     }
 

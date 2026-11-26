@@ -785,7 +785,17 @@ impl MainWindow {
                             }
                         }
                         HostCommand::OpenAppPicker => {
-                            let apps = insp_nat.installed_apps.borrow().clone();
+                            // Live-rescan System, Flatpak, Snap, and AppImage .desktop entries so newly installed apps show immediately
+                            let fresh_apps = PluginManager::collect_installed_apps();
+                            if !fresh_apps.is_empty() {
+                                insp_nat.populate_installed_apps(&fresh_apps);
+                                pm_nat.borrow_mut().installed_apps = fresh_apps.clone();
+                            }
+                            let apps = if fresh_apps.is_empty() {
+                                insp_nat.installed_apps.borrow().clone()
+                            } else {
+                                fresh_apps
+                            };
                             let prof_p = prof_nat.clone();
                             let nh_p = nh_nat.clone();
                             let can_p = canvas_nat.clone();
@@ -802,6 +812,8 @@ impl MainWindow {
                                     super::canvas::resolve_icon_path(&picked.icon, 128);
                                 let mut updates: HashMap<String, serde_json::Value> = HashMap::new();
                                 updates.insert("desktop_id".into(), serde_json::json!(picked.desktop_id));
+                                updates.insert("desktop_path".into(), serde_json::json!(picked.desktop_path));
+                                updates.insert("exec".into(), serde_json::json!(picked.exec));
                                 updates.insert("app_name".into(), serde_json::json!(picked.name));
                                 updates.insert("icon_name".into(), serde_json::json!(picked.icon));
                                 if let Some(ref ip) = resolved_icon {
@@ -812,6 +824,8 @@ impl MainWindow {
                                     if let Some(page) = prof.current_page_mut() {
                                         let action = get_target_mut(page, tgt_p);
                                         action.parameters.insert("desktop_id".into(), picked.desktop_id.clone());
+                                        action.parameters.insert("desktop_path".into(), picked.desktop_path.clone());
+                                        action.parameters.insert("exec".into(), picked.exec.clone());
                                         action.parameters.insert("app_name".into(), picked.name.clone());
                                         action.parameters.insert("icon_name".into(), picked.icon.clone());
                                         if let Some(ref ip) = resolved_icon {

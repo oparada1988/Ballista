@@ -84,6 +84,10 @@ pub struct InstalledApp {
     pub name: String,
     pub exec: String,
     pub icon: String,
+    #[serde(default)]
+    pub desktop_path: String,
+    #[serde(default)]
+    pub source: String,
 }
 
 #[derive(Clone)]
@@ -214,56 +218,179 @@ impl PluginManager {
         }
     }
 
-    pub fn scan_installed_apps(&mut self) {
-        let mut apps = Vec::new();
-        let app_dirs = [
-            PathBuf::from("/usr/share/applications"),
-            glib::user_data_dir().join("applications"),
-        ];
+    /// Returns all Freedesktop `.desktop` application directories in precedence order:
+    /// User overrides (including AppImages), User Flatpaks, System Flatpaks, Snaps,
+    /// custom `XDG_DATA_DIRS` entries, `/usr/local`, and `/usr`.
+    pub fn desktop_application_dirs() -> Vec<PathBuf> {
+        let mut dirs: Vec<PathBuf> = Vec::new();
+        let mut push_unique = |p: PathBuf| {
+            if !dirs.contains(&p) {
+                dirs.push(p);
+            }
+        };
 
-        for dir in app_dirs {
+        let home = std::env::var("HOME").ok().map(PathBuf::from);
+        // 1. User applications (AppImages via Gear Lever / AppImageLauncher, custom .desktop files, user overrides)
+        push_unique(glib::user_data_dir().join("applications"));
+        if let Some(ref h) = home {
+            push_unique(h.join(".local/share/applications"));
+            // 2. User Flatpak exports
+            push_unique(h.join(".local/share/flatpak/exports/share/applications"));
+        }
+        // 3. System Flatpak exports
+        push_unique(PathBuf::from("/var/lib/flatpak/exports/share/applications"));
+        // 4. Snap desktop applications
+        push_unique(PathBuf::from("/var/lib/snapd/desktop/applications"));
+        // 5. Any additional XDG_DATA_DIRS (NixOS, Guix, Distrobox, custom prefixes)
+        if let Ok(xdg_dirs) = std::env::var("XDG_DATA_DIRS") {
+            for entry in xdg_dirs.split(':').filter(|s| !s.trim().is_empty()) {
+                push_unique(PathBuf::from(entry).join("applications"));
+            }
+        }
+        // 6. Standard local and system directories
+        push_unique(PathBuf::from("/usr/local/share/applications"));
+        push_unique(PathBuf::from("/usr/share/applications"));
+        dirs
+    }
+
+    pub fn scan_installed_apps(&mut self) {
+        let mut apps: Vec<InstalledApp> = Vec::new();
+        let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let user_apps_dir = glib::user_data_dir().join("applications");
+
+        fn collect_desktop_files(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+            if depth > 3 {
+                return;
+            }
             if let Ok(entries) = fs::read_dir(dir) {
                 for entry in entries.flatten() {
                     let path = entry.path();
-                    if path.extension().and_then(|e| e.to_str()) == Some("desktop") {
-                        if let Ok(content) = fs::read_to_string(&path) {
-                            let mut name = None;
-                            let mut exec = None;
-                            let mut icon = None;
-                            let mut no_display = false;
-
-                            for line in content.lines() {
-                                let line = line.trim();
-                                if line.starts_with("Name=") && name.is_none() {
-                                    name = Some(line.strip_prefix("Name=").unwrap().to_string());
-                                } else if line.starts_with("Exec=") && exec.is_none() {
-                                    exec = Some(line.strip_prefix("Exec=").unwrap().to_string());
-                                } else if line.starts_with("Icon=") && icon.is_none() {
-                                    icon = Some(line.strip_prefix("Icon=").unwrap().to_string());
-                                } else if line == "NoDisplay=true" {
-                                    no_display = true;
-                                }
-                            }
-
-                            if !no_display {
-                                if let (Some(n), Some(e)) = (name, exec) {
-                                    let desktop_id = path.file_name().unwrap().to_string_lossy().to_string();
-                                    apps.push(InstalledApp {
-                                        desktop_id,
-                                        name: n,
-                                        exec: e,
-                                        icon: icon.unwrap_or_else(|| "application-x-executable".into()),
-                                    });
-                                }
-                            }
-                        }
+                    if path.is_dir() {
+                        collect_desktop_files(&path, depth + 1, out);
+                    } else if path.extension().and_then(|e| e.to_str()) == Some("desktop") {
+                        out.push(path);
                     }
                 }
             }
         }
 
-        apps.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
-        apps.dedup_by(|a, b| a.name == b.name);
+        for dir in Self::desktop_application_dirs() {
+            if !dir.exists() {
+                continue;
+            }
+            let mut files = Vec::new();
+            collect_desktop_files(&dir, 0, &mut files);
+            for path in files {
+                let Some(desktop_id) = path.file_name().and_then(|n| n.to_str()).map(|s| s.to_string()) else {
+                    continue;
+                };
+                if seen_ids.contains(&desktop_id) {
+                    continue;
+                }
+                let Ok(content) = fs::read_to_string(&path) else {
+                    continue;
+                };
+
+                // Strictly parse keys inside `[Desktop Entry]` only (never bleed into `[Desktop Action ...]`)
+                let mut in_main_entry = false;
+                let mut name: Option<String> = None;
+                let mut exec: Option<String> = None;
+                let mut icon: Option<String> = None;
+                let mut entry_type: Option<String> = None;
+                let mut no_display = false;
+                let mut hidden = false;
+
+                for raw_line in content.lines() {
+                    let line = raw_line.trim();
+                    if line.is_empty() || line.starts_with('#') {
+                        continue;
+                    }
+                    if line.starts_with('[') && line.ends_with(']') {
+                        if line == "[Desktop Entry]" {
+                            in_main_entry = true;
+                        } else if in_main_entry {
+                            break;
+                        }
+                        continue;
+                    }
+                    if !in_main_entry {
+                        continue;
+                    }
+                    if let Some(val) = line.strip_prefix("Name=") {
+                        if name.is_none() && !val.trim().is_empty() {
+                            name = Some(val.trim().to_string());
+                        }
+                    } else if let Some(val) = line.strip_prefix("Exec=") {
+                        if exec.is_none() && !val.trim().is_empty() {
+                            exec = Some(val.trim().to_string());
+                        }
+                    } else if let Some(val) = line.strip_prefix("Icon=") {
+                        if icon.is_none() && !val.trim().is_empty() {
+                            icon = Some(val.trim().to_string());
+                        }
+                    } else if let Some(val) = line.strip_prefix("Type=") {
+                        entry_type = Some(val.trim().to_string());
+                    } else if line.eq_ignore_ascii_case("NoDisplay=true") {
+                        no_display = true;
+                    } else if line.eq_ignore_ascii_case("Hidden=true") {
+                        hidden = true;
+                    }
+                }
+
+                if no_display || hidden {
+                    continue;
+                }
+                if let Some(ref t) = entry_type {
+                    if t != "Application" {
+                        continue;
+                    }
+                }
+
+                if let (Some(n), Some(e)) = (name, exec) {
+                    let path_str = path.to_string_lossy().to_string();
+                    let lower_path = path_str.to_lowercase();
+                    let lower_exec = e.to_lowercase();
+                    let source = if lower_path.contains("/flatpak/")
+                        || lower_exec.contains("flatpak run")
+                        || lower_exec.contains("/flatpak ")
+                    {
+                        "Flatpak"
+                    } else if lower_path.contains("/snapd/")
+                        || lower_path.contains("/snap/")
+                        || lower_exec.contains("/snap/")
+                        || lower_exec.starts_with("snap run ")
+                    {
+                        "Snap"
+                    } else if lower_exec.contains(".appimage")
+                        || lower_exec.contains("appimagelauncher")
+                        || lower_path.contains("appimage")
+                    {
+                        "AppImage"
+                    } else if path.starts_with(&user_apps_dir) {
+                        "User"
+                    } else {
+                        "System"
+                    };
+
+                    seen_ids.insert(desktop_id.clone());
+                    apps.push(InstalledApp {
+                        desktop_id,
+                        name: n,
+                        exec: e,
+                        icon: icon.unwrap_or_else(|| "application-x-executable".into()),
+                        desktop_path: path_str,
+                        source: source.to_string(),
+                    });
+                }
+            }
+        }
+
+        apps.sort_by(|a, b| {
+            a.name
+                .to_lowercase()
+                .cmp(&b.name.to_lowercase())
+                .then_with(|| a.source.cmp(&b.source))
+        });
         self.installed_apps = apps;
     }
 
@@ -711,17 +838,7 @@ impl PluginManager {
     }
 
     pub fn launch_app_desktop(&self, desktop_id: &str) -> Result<(), String> {
-        let _ = std::process::Command::new("gtk-launch")
-            .arg(desktop_id)
-            .spawn()
-            .or_else(|_| {
-                std::process::Command::new("gio")
-                    .arg("launch")
-                    .arg(format!("/usr/share/applications/{desktop_id}"))
-                    .spawn()
-            })
-            .map_err(|e| format!("Failed to spawn launcher: {e}"))?;
-
+        crate::plugins::ballista_core::launcher::launch_desktop_app(desktop_id, "");
         Ok(())
     }
 

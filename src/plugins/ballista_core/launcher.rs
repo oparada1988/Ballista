@@ -11,6 +11,8 @@ const LAUNCHER_MODES: &[&str] = &["Application", "Website URL", "File / Folder"]
 pub struct LauncherAction {
     mode_idx: usize,
     desktop_id: String,
+    desktop_path: String,
+    exec_cmd: String,
     app_name: String,
     args: String,
     url: String,
@@ -23,6 +25,8 @@ impl LauncherAction {
         Self {
             mode_idx: 0,
             desktop_id: String::new(),
+            desktop_path: String::new(),
+            exec_cmd: String::new(),
             app_name: String::new(),
             args: String::new(),
             url: String::new(),
@@ -34,6 +38,8 @@ impl LauncherAction {
     fn sync_from_settings(&mut self, ctx: &ActionContext) {
         self.mode_idx = ctx.get_usize("mode", 0).min(LAUNCHER_MODES.len() - 1);
         self.desktop_id = ctx.get_str("desktop_id", "");
+        self.desktop_path = ctx.get_str("desktop_path", "");
+        self.exec_cmd = ctx.get_str("exec", "");
         self.app_name = ctx.get_str("app_name", "");
         self.args = ctx.get_str("args", "");
         self.url = ctx.get_str("url", "");
@@ -43,29 +49,191 @@ impl LauncherAction {
     }
 }
 
-pub fn launch_desktop_app(desktop_id: &str, extra_args: &str) {
-    let id = desktop_id.trim();
-    if id.is_empty() {
-        return;
+fn enriched_xdg_data_dirs() -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let mut push_unique = |s: String| {
+        if !s.is_empty() && !parts.contains(&s) {
+            parts.push(s);
+        }
+    };
+    if let Ok(cur) = std::env::var("XDG_DATA_DIRS") {
+        for p in cur.split(':') {
+            push_unique(p.trim().to_string());
+        }
     }
-    let id_owned = id.to_string();
-    let args_owned = extra_args.trim().to_string();
-    std::thread::spawn(move || {
-        // 1. Try gtk-launch (handles native, Flatpak, and user .desktop entries cleanly)
-        let mut cmd = Command::new("gtk-launch");
-        cmd.arg(&id_owned);
-        if !args_owned.is_empty() {
-            for part in args_owned.split_whitespace() {
-                cmd.arg(part);
+    if let Ok(home) = std::env::var("HOME") {
+        push_unique(format!("{home}/.local/share/flatpak/exports/share"));
+        push_unique(format!("{home}/.local/share"));
+    }
+    push_unique("/var/lib/flatpak/exports/share".to_string());
+    push_unique("/var/lib/snapd/desktop".to_string());
+    push_unique("/usr/local/share".to_string());
+    push_unique("/usr/share".to_string());
+    parts.join(":")
+}
+
+fn find_desktop_file(desktop_id: &str, desktop_path: &str) -> Option<std::path::PathBuf> {
+    if !desktop_path.is_empty() {
+        let p = std::path::PathBuf::from(desktop_path);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    let clean_id = desktop_id.trim();
+    if clean_id.is_empty() {
+        return None;
+    }
+    let file_name = if clean_id.ends_with(".desktop") {
+        clean_id.to_string()
+    } else {
+        format!("{clean_id}.desktop")
+    };
+    for dir in crate::core::PluginManager::desktop_application_dirs() {
+        let direct = dir.join(&file_name);
+        if direct.exists() {
+            return Some(direct);
+        }
+        // Check 1 level of subdirs (e.g. AppImages / Wine / custom categories)
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for e in entries.flatten() {
+                let sub = e.path();
+                if sub.is_dir() {
+                    let nested = sub.join(&file_name);
+                    if nested.exists() {
+                        return Some(nested);
+                    }
+                }
             }
         }
-        if cmd.spawn().is_ok() {
-            return;
+    }
+    None
+}
+
+fn read_desktop_exec(path: &std::path::Path) -> Option<String> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let mut in_main = false;
+    for raw in content.lines() {
+        let line = raw.trim();
+        if line.starts_with('[') && line.ends_with(']') {
+            if line == "[Desktop Entry]" {
+                in_main = true;
+            } else if in_main {
+                break;
+            }
+            continue;
         }
-        // 2. Fallback to gio launch
-        let _ = Command::new("gio")
-            .args(["launch", &format!("/usr/share/applications/{id_owned}")])
-            .spawn();
+        if in_main {
+            if let Some(val) = line.strip_prefix("Exec=") {
+                let trimmed = val.trim();
+                if !trimmed.is_empty() {
+                    return Some(trimmed.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn strip_freedesktop_field_codes(exec: &str) -> String {
+    let mut out = String::with_capacity(exec.len());
+    let mut chars = exec.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '%' {
+            if let Some(&next) = chars.peek() {
+                match next {
+                    '%' => {
+                        chars.next();
+                        out.push('%');
+                    }
+                    'f' | 'F' | 'u' | 'U' | 'd' | 'D' | 'n' | 'N' | 'i' | 'c' | 'k' | 'v' | 'm' => {
+                        chars.next();
+                    }
+                    _ => out.push(c),
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out.trim().to_string()
+}
+
+pub fn launch_desktop_app(desktop_id: &str, extra_args: &str) {
+    launch_desktop_app_full(desktop_id, "", "", extra_args);
+}
+
+pub fn launch_desktop_app_full(
+    desktop_id: &str,
+    desktop_path: &str,
+    exec_cmd: &str,
+    extra_args: &str,
+) {
+    let id_owned = desktop_id.trim().to_string();
+    let path_owned = desktop_path.trim().to_string();
+    let exec_owned = exec_cmd.trim().to_string();
+    let args_owned = extra_args.trim().to_string();
+    if id_owned.is_empty() && path_owned.is_empty() && exec_owned.is_empty() {
+        return;
+    }
+
+    std::thread::spawn(move || {
+        let resolved_path = find_desktop_file(&id_owned, &path_owned);
+        let xdg_dirs = enriched_xdg_data_dirs();
+
+        // 1. When no custom CLI args are added and we have the exact .desktop file,
+        //    `gio launch <file.desktop>` handles System, Flatpak, Snap, and AppImage cleanly!
+        if args_owned.is_empty() {
+            if let Some(ref dp) = resolved_path {
+                if let Ok(status) = Command::new("gio")
+                    .arg("launch")
+                    .arg(dp)
+                    .env("XDG_DATA_DIRS", &xdg_dirs)
+                    .status()
+                {
+                    if status.success() {
+                        return;
+                    }
+                }
+            }
+        }
+
+        // 2. Try gtk-launch with enriched XDG_DATA_DIRS (includes Flatpak & Snap dirs even under systemd --user)
+        if !id_owned.is_empty() {
+            let mut cmd = Command::new("gtk-launch");
+            cmd.env("XDG_DATA_DIRS", &xdg_dirs);
+            cmd.arg(&id_owned);
+            if !args_owned.is_empty() {
+                for part in args_owned.split_whitespace() {
+                    cmd.arg(part);
+                }
+            }
+            if let Ok(status) = cmd.status() {
+                if status.success() {
+                    return;
+                }
+            }
+        }
+
+        // 3. Direct Exec= fallback (works reliably for AppImages, custom commands, and extra arguments)
+        let raw_exec = if !exec_owned.is_empty() {
+            Some(exec_owned)
+        } else {
+            resolved_path.as_deref().and_then(read_desktop_exec)
+        };
+        if let Some(raw) = raw_exec {
+            let mut cleaned = strip_freedesktop_field_codes(&raw);
+            if !args_owned.is_empty() {
+                cleaned.push(' ');
+                cleaned.push_str(&args_owned);
+            }
+            if !cleaned.is_empty() {
+                let _ = Command::new("sh")
+                    .arg("-c")
+                    .arg(&cleaned)
+                    .env("XDG_DATA_DIRS", &xdg_dirs)
+                    .spawn();
+            }
+        }
     });
 }
 
@@ -102,7 +270,7 @@ impl BallistaAction for LauncherAction {
 
     fn on_key_down(&mut self, _ctx: &mut ActionContext) {
         match self.mode_idx {
-            0 => launch_desktop_app(&self.desktop_id, &self.args),
+            0 => launch_desktop_app_full(&self.desktop_id, &self.desktop_path, &self.exec_cmd, &self.args),
             1 => open_url_or_path(&self.url),
             _ => open_url_or_path(&self.file_path),
         }
