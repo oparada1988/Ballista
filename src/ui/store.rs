@@ -53,6 +53,33 @@ pub struct PluginInfo {
     pub local_path: Option<String>,
 }
 
+struct MarketplaceCatalog {
+    plugins: Vec<PluginInfo>,
+    spotlight_ids: Vec<String>,
+}
+
+fn resolve_spotlight_plugins<'a>(
+    plugins: &'a [PluginInfo],
+    spotlight_ids: &[String],
+) -> Vec<&'a PluginInfo> {
+    let mut resolved: Vec<&'a PluginInfo> = Vec::new();
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+
+    for sid in spotlight_ids {
+        if let Some(plugin) = plugins.iter().find(|p| p.id == *sid) {
+            if seen.insert(plugin.id.as_str()) {
+                resolved.push(plugin);
+            }
+        }
+    }
+
+    if !resolved.is_empty() {
+        resolved
+    } else {
+        plugins.iter().take(6).collect()
+    }
+}
+
 fn is_newer_version(candidate: &str, installed: &str) -> bool {
     let parse = |s: &str| -> Vec<u32> {
         s.trim()
@@ -119,7 +146,7 @@ fn market_plugin_cache_dir(plugin_id: &str) -> PathBuf {
     dir
 }
 
-fn load_marketplace_catalog() -> Vec<PluginInfo> {
+fn load_marketplace_catalog() -> MarketplaceCatalog {
     let cache_dir = glib::user_cache_dir().join("ballista");
     let _ = std::fs::create_dir_all(&cache_dir);
     let cache_file = cache_dir.join("market_catalog.json");
@@ -148,6 +175,16 @@ fn load_marketplace_catalog() -> Vec<PluginInfo> {
     if let Ok(data) = std::fs::read_to_string(&cache_file) {
         if let Ok(val) = serde_json::from_str::<serde_json::Value>(&data) {
             if let Some(arr) = val.get("plugins").and_then(|v| v.as_array()) {
+                let spotlight_ids: Vec<String> = val
+                    .get("spotlight")
+                    .and_then(|v| v.as_array())
+                    .map(|sarr| {
+                        sarr.iter()
+                            .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                            .filter(|s| !s.trim().is_empty())
+                            .collect()
+                    })
+                    .unwrap_or_default();
                 let mut list = Vec::new();
                 for p in arr {
                     let id = p.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
@@ -358,19 +395,23 @@ fn load_marketplace_catalog() -> Vec<PluginInfo> {
                         local_path,
                     });
                 }
-                return list;
+                return MarketplaceCatalog {
+                    plugins: list,
+                    spotlight_ids,
+                };
             }
         }
     }
 
     // Bundled offline fallback (100% portable using XDG cache dirs and remote GitHub URLs)
-    vec![
+    MarketplaceCatalog {
+        plugins: vec![
         PluginInfo {
             id: "com_oparada_AppLauncher".into(),
             name: "App Launcher".into(),
             category: "Utility".into(),
             author: "oparada1988".into(),
-            license: "MIT".into(),
+            license: "GPL-3.0-or-later".into(),
             version: "0.1.0".into(),
             runtime: PluginRuntime::StreamController,
             icon: "action_launch.png".into(),
@@ -402,7 +443,7 @@ fn load_marketplace_catalog() -> Vec<PluginInfo> {
             name: "DiscordSC".into(),
             category: "Streaming".into(),
             author: "oparada1988".into(),
-            license: "MIT".into(),
+            license: "GPL-3.0-or-later".into(),
             version: "1.2.4".into(),
             runtime: PluginRuntime::StreamController,
             icon: "user-available-symbolic".into(),
@@ -435,7 +476,7 @@ fn load_marketplace_catalog() -> Vec<PluginInfo> {
             name: "Govee Controller".into(),
             category: "Utility".into(),
             author: "oparada1988".into(),
-            license: "MIT".into(),
+            license: "GPL-3.0-or-later".into(),
             version: "1.0.1".into(),
             runtime: PluginRuntime::StreamController,
             icon: "lightbulb-symbolic".into(),
@@ -463,7 +504,9 @@ fn load_marketplace_catalog() -> Vec<PluginInfo> {
             rating_count: 0,
             local_path: None,
         },
-    ]
+        ],
+        spotlight_ids: Vec::new(),
+    }
 }
 
 pub fn create_store_window(
@@ -606,7 +649,9 @@ pub fn create_store_window(
     scroll_content.append(&spotlight_header);
 
     // Live Marketplace Catalog queried directly from Ballista-Market
-    let plugins_catalog = load_marketplace_catalog();
+    let marketplace_catalog = load_marketplace_catalog();
+    let plugins_catalog = marketplace_catalog.plugins;
+    let spotlight_ids = marketplace_catalog.spotlight_ids;
 
     // =========================================================================
     // Page 2: Plugin Detail Subview (Two-Column Hero + 16:9 Gallery + Actions)
@@ -2076,24 +2121,37 @@ pub fn create_store_window(
     carousel.set_hexpand(true);
     carousel.set_size_request(-1, 105);
 
+    let spotlight_plugins = resolve_spotlight_plugins(&plugins_catalog, &spotlight_ids);
     let mut chunk = Vec::new();
-    for (i, item) in plugins_catalog.iter().enumerate() {
+    for (i, item) in spotlight_plugins.iter().enumerate() {
         let card = create_spotlight_card(item, open_plugin_detail.clone());
         chunk.push(card);
 
-        if chunk.len() == 3 || i == plugins_catalog.len() - 1 {
+        if chunk.len() == 3 || i == spotlight_plugins.len() - 1 {
             let slide_box = Box::new(Orientation::Horizontal, 12);
             slide_box.set_hexpand(true);
             slide_box.set_homogeneous(true);
             slide_box.set_size_request(-1, 105);
+            let card_count = chunk.len();
             for c in chunk.drain(..) {
                 slide_box.append(&c);
+            }
+            // Keep 3 homogeneous columns on partial final slides so banners keep their 2.78:1 aspect ratio
+            for _ in card_count..3 {
+                let spacer = Box::new(Orientation::Vertical, 0);
+                spacer.set_hexpand(true);
+                spacer.set_can_target(false);
+                slide_box.append(&spacer);
             }
             carousel.append(&slide_box);
         }
     }
 
     scroll_content.append(&carousel);
+
+    let has_multiple_slides = carousel.n_pages() > 1;
+    prev_btn.set_visible(has_multiple_slides);
+    next_btn.set_visible(has_multiple_slides);
 
     // Carousel Navigation chevrons
     let car_clone1 = carousel.clone();
@@ -2133,6 +2191,7 @@ pub fn create_store_window(
     dots.set_halign(gtk::Align::Center);
     dots.set_margin_top(4);
     dots.set_margin_bottom(6);
+    dots.set_visible(has_multiple_slides);
     scroll_content.append(&dots);
 
     // =========================================================================
@@ -3055,4 +3114,63 @@ fn create_catalog_card(
     row.add_controller(click_gesture);
 
     card
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dummy_plugin(id: &str) -> PluginInfo {
+        PluginInfo {
+            id: id.to_string(),
+            name: id.to_string(),
+            category: "Utility".to_string(),
+            author: "tester".to_string(),
+            license: "MIT".to_string(),
+            version: "1.0.0".to_string(),
+            runtime: PluginRuntime::Ballista,
+            icon: "system-run-symbolic".to_string(),
+            thumbnail: None,
+            is_file_icon: false,
+            fallback_grad: "thumb-grad-utility".to_string(),
+            short_description: String::new(),
+            description: String::new(),
+            tags: Vec::new(),
+            github_url: None,
+            download_url: None,
+            screenshots: Vec::new(),
+            surfaces: Vec::new(),
+            compatible_devices: Vec::new(),
+            actions: Vec::new(),
+            rating: None,
+            rating_count: 0,
+            local_path: None,
+        }
+    }
+
+    #[test]
+    fn resolve_spotlight_preserves_order_and_deduplicates() {
+        let plugins = vec![dummy_plugin("a"), dummy_plugin("b"), dummy_plugin("c")];
+        let ids = vec![
+            "c".to_string(),
+            "missing".to_string(),
+            "a".to_string(),
+            "c".to_string(),
+        ];
+        let resolved: Vec<&str> = resolve_spotlight_plugins(&plugins, &ids)
+            .into_iter()
+            .map(|p| p.id.as_str())
+            .collect();
+        assert_eq!(resolved, vec!["c", "a"]);
+    }
+
+    #[test]
+    fn resolve_spotlight_falls_back_when_empty() {
+        let plugins: Vec<PluginInfo> = (0..8).map(|i| dummy_plugin(&format!("p{i}"))).collect();
+        let resolved: Vec<&str> = resolve_spotlight_plugins(&plugins, &[])
+            .into_iter()
+            .map(|p| p.id.as_str())
+            .collect();
+        assert_eq!(resolved, vec!["p0", "p1", "p2", "p3", "p4", "p5"]);
+    }
 }
