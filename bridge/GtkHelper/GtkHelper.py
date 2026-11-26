@@ -65,10 +65,22 @@ class BetterExpander(Adw.ExpanderRow):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._rows = []
+        self._on_rows_changed_callbacks = []
 
     def add_row(self, widget):
         super().add_row(widget)
-        self._rows.append(widget)
+        if widget not in self._rows:
+            self._rows.append(widget)
+        self._notify_rows_changed()
+
+    def remove(self, widget):
+        try:
+            super().remove(widget)
+        except Exception:
+            pass
+        if widget in self._rows:
+            self._rows.remove(widget)
+        self._notify_rows_changed()
 
     def get_rows(self):
         return list(self._rows)
@@ -76,10 +88,18 @@ class BetterExpander(Adw.ExpanderRow):
     def clear(self):
         for r in list(self._rows):
             try:
-                self.remove(r)
+                super().remove(r)
             except Exception:
                 pass
         self._rows.clear()
+        self._notify_rows_changed()
+
+    def _notify_rows_changed(self):
+        for cb in list(self._on_rows_changed_callbacks):
+            try:
+                cb()
+            except Exception:
+                pass
 
 
 class BetterPreferencesGroup(Adw.PreferencesGroup):

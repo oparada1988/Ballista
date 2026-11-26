@@ -5,6 +5,15 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use crate::models::KeyAppearance;
 
+#[derive(Debug, Clone)]
+pub struct InstalledPluginSummary {
+    pub id: String,
+    pub name: String,
+    pub version: String,
+    pub author: String,
+    pub thumbnail_path: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ActionSettingType {
     Combo {
@@ -108,9 +117,24 @@ impl PluginManager {
             plugin_has_settings: Arc::new(Mutex::new(HashMap::new())),
         };
 
-        manager.scan_installed_apps();
+        // Defer desktop app scanning off startup critical path for instant login boot
         manager.rescan_plugins();
         manager
+    }
+
+    /// Scans freedesktop `.desktop` entries off the UI/startup thread
+    pub fn collect_installed_apps() -> Vec<InstalledApp> {
+        let mut tmp = Self {
+            plugins_dir: PathBuf::new(),
+            plugins: HashMap::new(),
+            installed_apps: Vec::new(),
+            bridge: super::plugin_bridge::PluginBridge::new(),
+            live_config_rows: Arc::new(Mutex::new(HashMap::new())),
+            live_plugin_settings_rows: Arc::new(Mutex::new(HashMap::new())),
+            plugin_has_settings: Arc::new(Mutex::new(HashMap::new())),
+        };
+        tmp.scan_installed_apps();
+        tmp.installed_apps
     }
 
     pub fn set_live_config_rows(&self, slot: &str, rows: Vec<super::plugin_bridge::BridgeConfigRow>) {
@@ -385,6 +409,152 @@ impl PluginManager {
 
         self.rescan_plugins();
         Ok(id.to_string())
+    }
+
+    /// Extract and install a plugin from a local `.zip` archive without holding PluginManager locks
+    /// (supports root `manifest.json` as well as GitHub repo wrapper directories like `Plugin-main/manifest.json`)
+    pub fn extract_plugin_zip(plugins_dir: &Path, zip_path: &Path) -> Result<InstalledPluginSummary, String> {
+        if !zip_path.is_file() {
+            return Err(format!("Selected file does not exist: {}", zip_path.display()));
+        }
+
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let temp_extract = std::env::temp_dir().join(format!("ballista_local_zip_{stamp}"));
+        let _ = fs::remove_dir_all(&temp_extract);
+        fs::create_dir_all(&temp_extract)
+            .map_err(|e| format!("Failed to create temporary extraction folder: {e}"))?;
+
+        let unzip_status = std::process::Command::new("unzip")
+            .arg("-q")
+            .arg("-o")
+            .arg(zip_path)
+            .arg("-d")
+            .arg(&temp_extract)
+            .status()
+            .map_err(|e| {
+                let _ = fs::remove_dir_all(&temp_extract);
+                format!("Failed to invoke unzip: {e}")
+            })?;
+
+        if !unzip_status.success() {
+            let _ = fs::remove_dir_all(&temp_extract);
+            return Err(format!("Failed to extract ZIP archive '{}'", zip_path.display()));
+        }
+
+        let mut source_folder: Option<PathBuf> = None;
+        if temp_extract.join("manifest.json").exists() {
+            source_folder = Some(temp_extract.clone());
+        } else if let Ok(entries) = fs::read_dir(&temp_extract) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if !p.is_dir() || entry.file_name() == "__MACOSX" {
+                    continue;
+                }
+                if p.join("manifest.json").exists() {
+                    source_folder = Some(p);
+                    break;
+                }
+                if let Ok(sub_entries) = fs::read_dir(&p) {
+                    for sub in sub_entries.flatten() {
+                        let sp = sub.path();
+                        if sp.is_dir() && sp.join("manifest.json").exists() {
+                            source_folder = Some(sp);
+                            break;
+                        }
+                    }
+                }
+                if source_folder.is_some() {
+                    break;
+                }
+            }
+        }
+
+        let Some(source_folder) = source_folder else {
+            let _ = fs::remove_dir_all(&temp_extract);
+            return Err("Selected ZIP archive does not contain a valid manifest.json".into());
+        };
+
+        let manifest_data = fs::read_to_string(source_folder.join("manifest.json")).map_err(|e| {
+            let _ = fs::remove_dir_all(&temp_extract);
+            format!("Failed to read manifest.json: {e}")
+        })?;
+        let json: serde_json::Value = serde_json::from_str(&manifest_data).map_err(|e| {
+            let _ = fs::remove_dir_all(&temp_extract);
+            format!("Invalid manifest.json: {e}")
+        })?;
+        let fallback_id = source_folder
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("custom_plugin");
+        let id = json
+            .get("id")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or(fallback_id)
+            .trim()
+            .to_string();
+        let name = json
+            .get("name")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or(&id)
+            .trim()
+            .to_string();
+        let version = json
+            .get("version")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or("1.0.0")
+            .trim()
+            .to_string();
+        let author = json
+            .get("author")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
+        let thumb_rel = json
+            .get("thumbnail")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| s.trim().to_string());
+
+        let dest = plugins_dir.join(&id);
+        let _ = fs::remove_dir_all(&dest);
+        fs::create_dir_all(&dest).map_err(|e| {
+            let _ = fs::remove_dir_all(&temp_extract);
+            format!("Failed to prepare plugin directory: {e}")
+        })?;
+
+        let copy_res = Self::copy_dir_all(&source_folder, &dest);
+        let _ = fs::remove_dir_all(&temp_extract);
+        copy_res.map_err(|e| format!("Failed to copy extracted plugin '{id}': {e}"))?;
+
+        Self::run_plugin_install_hook(&dest);
+        let thumbnail_path = thumb_rel
+            .map(|rel| dest.join(rel))
+            .filter(|p| p.is_file())
+            .map(|p| p.to_string_lossy().to_string());
+
+        tracing::info!("Installed plugin '{}' ({}) from ZIP into {}", name, id, dest.display());
+        Ok(InstalledPluginSummary {
+            id,
+            name,
+            version,
+            author,
+            thumbnail_path,
+        })
+    }
+
+    /// Sideload / Install a plugin from a local `.zip` archive
+    #[allow(dead_code)]
+    pub fn install_from_zip(&mut self, zip_path: &Path) -> Result<String, String> {
+        let summary = Self::extract_plugin_zip(&self.plugins_dir, zip_path)?;
+        self.rescan_plugins();
+        Ok(summary.id)
     }
 
     /// Download & Extract a plugin directly from a remote zip archive URL without touching UI or plugin state

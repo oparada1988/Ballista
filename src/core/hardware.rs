@@ -15,6 +15,186 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
+/// Computes horizontal marquee scroll offset (px) and cycle distance (px) for overflowing single-line text.
+/// Holds briefly at the beginning (1.0s) so the start is always legible, then smoothly scrolls left
+/// and loops seamlessly with a clean gap.
+pub fn marquee_offset(elapsed_sec: f64, text_w: f64, clip_w: f64) -> (f64, f64) {
+    const PAUSE_START_SEC: f64 = 1.0;
+    const LOOP_GAP_PX: f64 = 28.0;
+    let speed_px_s = 32.0 * (clip_w / 88.0).clamp(0.75, 1.35);
+    let cycle_dist = text_w + LOOP_GAP_PX;
+    let scroll_dur = cycle_dist / speed_px_s;
+    let total_cycle = PAUSE_START_SEC + scroll_dur;
+    let t = elapsed_sec.max(0.0) % total_cycle;
+    let offset = if t < PAUSE_START_SEC {
+        0.0
+    } else {
+        (t - PAUSE_START_SEC) * speed_px_s
+    };
+    (offset, cycle_dist)
+}
+
+/// Renders a strictly single-line button label (Top, Center, or Bottom) onto a Cairo context with
+/// proportional pixel sizing (`min_dim / 86.0`), crisp dark outline, and smooth horizontal
+/// marquee scrolling whenever the text spans wider than the button's inner width.
+/// Returns `true` if the text overflowed and requires marquee scrolling.
+pub fn draw_single_line_key_label(
+    cr: &Context,
+    w: f64,
+    h: f64,
+    text: &str,
+    align: TextVerticalAlign,
+    font_family: &str,
+    font_size: u32,
+    text_color_hex: &str,
+    elapsed_sec: f64,
+) -> bool {
+    let clean: String = text
+        .replace('\r', "")
+        .split('\n')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    if clean.is_empty() {
+        return false;
+    }
+
+    let min_dim = w.min(h).max(24.0);
+    let px_size = ((font_size.max(6) as f64) * (min_dim / 86.0)).max(8.0);
+
+    let layout = pc::create_layout(cr);
+    let mut font_desc = pango::FontDescription::new();
+    font_desc.set_family(if font_family.is_empty() {
+        "Cantarell"
+    } else {
+        font_family
+    });
+    font_desc.set_absolute_size(px_size * pango::SCALE as f64);
+    font_desc.set_weight(pango::Weight::Bold);
+    layout.set_font_description(Some(&font_desc));
+    layout.set_single_paragraph_mode(true);
+    layout.set_text(&clean);
+
+    let (_, logical) = layout.pixel_extents();
+    let text_w = logical.width() as f64;
+    let text_h = logical.height() as f64;
+
+    let pad_x = 4.0_f64;
+    let pad_y = 4.0_f64;
+    let clip_w = (w - pad_x * 2.0).max(8.0);
+    let text_y = match align {
+        TextVerticalAlign::Top => pad_y,
+        TextVerticalAlign::Center => ((h - text_h) / 2.0).max(2.0),
+        TextVerticalAlign::Bottom => (h - text_h - pad_y).max(2.0),
+    };
+
+    let (tr, tg, tb) = parse_hex_color(text_color_hex).unwrap_or((1.0, 1.0, 1.0));
+    let draw_at = |x: f64| {
+        cr.set_source_rgba(0.0, 0.0, 0.0, 0.90);
+        for (dx, dy) in [
+            (-1.0, 0.0),
+            (1.0, 0.0),
+            (0.0, -1.0),
+            (0.0, 1.0),
+            (1.0, 1.0),
+        ] {
+            cr.move_to(x + dx, text_y + dy);
+            pc::show_layout(cr, &layout);
+        }
+        cr.set_source_rgb(tr, tg, tb);
+        cr.move_to(x, text_y);
+        pc::show_layout(cr, &layout);
+    };
+
+    let _ = cr.save();
+    cr.rectangle(pad_x, (text_y - 2.0).max(0.0), clip_w, text_h + 4.0);
+    cr.clip();
+
+    let overflows = text_w > clip_w + 0.5;
+    if !overflows {
+        let draw_x = pad_x + (clip_w - text_w) / 2.0;
+        draw_at(draw_x);
+    } else {
+        let (offset, cycle_dist) = marquee_offset(elapsed_sec, text_w, clip_w);
+        let x1 = pad_x - offset;
+        draw_at(x1);
+        let x2 = x1 + cycle_dist;
+        if x2 < pad_x + clip_w {
+            draw_at(x2);
+        }
+    }
+
+    let _ = cr.restore();
+    overflows
+}
+
+/// Draws all active single-line label zones (top, center, bottom or single title) for a KeyAppearance.
+/// Returns `true` if any zone overflows horizontally and requires marquee scrolling.
+fn draw_key_appearance_labels(
+    cr: &Context,
+    w: f64,
+    h: f64,
+    app: &KeyAppearance,
+    elapsed_sec: f64,
+) -> bool {
+    let mut overflows = false;
+    if app.has_plugin_labels() {
+        if let Some(ref t) = app.top_label {
+            overflows |= draw_single_line_key_label(
+                cr,
+                w,
+                h,
+                t,
+                TextVerticalAlign::Top,
+                &app.font_family,
+                app.font_size,
+                &app.text_color,
+                elapsed_sec,
+            );
+        }
+        if let Some(ref c) = app.center_label {
+            overflows |= draw_single_line_key_label(
+                cr,
+                w,
+                h,
+                c,
+                TextVerticalAlign::Center,
+                &app.font_family,
+                app.font_size,
+                &app.text_color,
+                elapsed_sec,
+            );
+        }
+        if let Some(ref b) = app.bottom_label {
+            overflows |= draw_single_line_key_label(
+                cr,
+                w,
+                h,
+                b,
+                TextVerticalAlign::Bottom,
+                &app.font_family,
+                app.font_size,
+                &app.text_color,
+                elapsed_sec,
+            );
+        }
+    } else if app.show_title && !app.title.is_empty() {
+        overflows |= draw_single_line_key_label(
+            cr,
+            w,
+            h,
+            &app.title,
+            app.vertical_align,
+            &app.font_family,
+            app.font_size,
+            &app.text_color,
+            elapsed_sec,
+        );
+    }
+    overflows
+}
+
 #[derive(Debug, Clone)]
 pub struct ConnectedDevice {
     pub kind: DeviceKind,
@@ -23,6 +203,17 @@ pub struct ConnectedDevice {
     pub vid: u16,
     pub pid: u16,
     pub serial: Option<String>,
+}
+
+impl ConnectedDevice {
+    /// Stable identifier used for persisting per-device active profiles and brightness across reboots.
+    pub fn stable_key(&self) -> String {
+        self.serial
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| format!("{:?}_{:04x}", self.kind, self.pid))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -36,12 +227,14 @@ pub enum HardwareEvent {
     TouchSwipe { is_right: bool },
 }
 
+#[derive(Clone)]
 pub struct HardwareManager {
     hid_api: Arc<Mutex<Option<HidApi>>>,
     open_handles: Arc<Mutex<HashMap<PathBuf, Arc<Mutex<HidDevice>>>>>,
     device_kinds: Arc<Mutex<HashMap<PathBuf, DeviceKind>>>,
-    listener_stop: Arc<Mutex<Option<Arc<AtomicBool>>>>,
+    listener_stops: Arc<Mutex<HashMap<PathBuf, Arc<AtomicBool>>>>,
     active_animations: Arc<Mutex<HashMap<String, (String, Arc<AtomicBool>)>>>,
+    native_host: Arc<Mutex<Option<crate::native_sdk::NativePluginHost>>>,
 }
 
 fn parse_hex_color(hex: &str) -> Option<(f64, f64, f64)> {
@@ -120,9 +313,18 @@ impl HardwareManager {
             hid_api: Arc::new(Mutex::new(api)),
             open_handles: Arc::new(Mutex::new(HashMap::new())),
             device_kinds: Arc::new(Mutex::new(HashMap::new())),
-            listener_stop: Arc::new(Mutex::new(None)),
+            listener_stops: Arc::new(Mutex::new(HashMap::new())),
             active_animations: Arc::new(Mutex::new(HashMap::new())),
+            native_host: Arc::new(Mutex::new(None)),
         }
+    }
+
+    pub fn set_native_host(&self, host: crate::native_sdk::NativePluginHost) {
+        *self.native_host.lock().unwrap() = Some(host);
+    }
+
+    fn get_native_host(&self) -> Option<crate::native_sdk::NativePluginHost> {
+        self.native_host.lock().unwrap().clone()
     }
 
     /// Enumerates all connected Elgato Stream Deck devices over USB HID (libusb backend,
@@ -239,8 +441,11 @@ impl HardwareManager {
 
     /// Stops all background listeners/animations and releases USB device handles cleanly.
     pub fn shutdown(&self) {
-        if let Some(stop) = self.listener_stop.lock().unwrap().take() {
-            stop.store(true, Ordering::SeqCst);
+        {
+            let mut stops = self.listener_stops.lock().unwrap();
+            for (_, flag) in stops.drain() {
+                flag.store(true, Ordering::SeqCst);
+            }
         }
         {
             let mut anims = self.active_animations.lock().unwrap();
@@ -249,6 +454,33 @@ impl HardwareManager {
             }
         }
         self.open_handles.lock().unwrap().clear();
+    }
+
+    /// Stops all active device listeners without closing handles (used before rescanning hardware).
+    pub fn stop_all_listeners(&self) {
+        let mut stops = self.listener_stops.lock().unwrap();
+        for (_, flag) in stops.drain() {
+            flag.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// Phase-1 Fast Boot: renders and pushes initial saved brightness & active pages to ALL
+    /// connected decks simultaneously on parallel threads (<250ms total even with multiple decks).
+    pub fn sync_all_devices_async(&self, targets: Vec<(PathBuf, DeviceKind, Profile, u8)>) {
+        for (dev_path, kind, profile, brightness) in targets {
+            let hw = self.clone();
+            thread::spawn(move || {
+                let t0 = std::time::Instant::now();
+                let _ = hw.set_brightness(&dev_path, brightness);
+                hw.sync_hardware_page(&dev_path, kind, &profile);
+                tracing::info!(
+                    "Fast-boot hardware render complete for {} ({}) in {:?}",
+                    kind.name(),
+                    dev_path.display(),
+                    t0.elapsed()
+                );
+            });
+        }
     }
 
     /// Send hardware brightness feature report (0-100%) using the exact Gen1 or Gen2 protocol
@@ -540,18 +772,17 @@ impl HardwareManager {
         Ok(())
     }
 
-    /// Renders a key image buffer formatted natively (dimensions, rotation, flip, BMP or JPEG) for the hardware
-    pub fn render_key_image(
-        &self,
+    /// Pre-renders the static key background + icon (or native Cairo vector visual) layer
+    /// so marquee frames never reload icon assets from disk on each scroll tick.
+    fn render_key_base_layer(
         kind: DeviceKind,
-        _key_idx: usize,
+        key_idx: usize,
         appearance: Option<&KeyAppearance>,
         icon_name: Option<&str>,
         is_active: bool,
-    ) -> Vec<u8> {
-        let Some((w, h)) = kind.key_image_size() else {
-            return Vec::new();
-        };
+        native_host: Option<&crate::native_sdk::NativePluginHost>,
+    ) -> Option<(u32, u32, i32, Vec<u8>)> {
+        let (w, h) = kind.key_image_size()?;
         let min_dim = w.min(h);
 
         let surface = ImageSurface::create(Format::Rgb24, w as i32, h as i32)
@@ -564,131 +795,158 @@ impl HardwareManager {
             cr.set_source_rgb(0.0, 0.0, 0.0);
             let _ = cr.paint();
         } else {
-            let custom_bg = appearance
-                .and_then(|a| a.bg_color.as_deref())
-                .and_then(parse_hex_color);
-            let (r, g, b) = custom_bg.unwrap_or((0.0, 0.0, 0.0));
+            let custom_icon_override = appearance
+                .and_then(|a| a.icon_path.as_deref())
+                .filter(|p| !p.is_empty() && Path::new(p).exists())
+                .is_some();
 
-            cr.set_source_rgb(r, g, b);
-            let _ = cr.paint();
-
-            if custom_bg.is_some() {
-                cr.set_source_rgb(
-                    (r + 0.15).min(1.0),
-                    (g + 0.15).min(1.0),
-                    (b + 0.15).min(1.0),
-                );
-                cr.set_line_width(2.0);
-                cr.rectangle(1.0, 1.0, (w - 2) as f64, (h - 2) as f64);
-                let _ = cr.stroke();
-            }
-
-            let mut icon_path = appearance.and_then(|a| a.icon_path.as_deref());
-            if let Some(p) = icon_path {
-                if (p.ends_with("action_launch.png") || p.ends_with("default_app.png"))
-                    && icon_name.is_some()
-                {
-                    icon_path = None;
+            let painted_native = if !custom_icon_override {
+                if let Some(host) = native_host {
+                    host.render_slot_visual(&format!("key_{key_idx}"), &cr, w as f64, h as f64)
+                } else {
+                    false
                 }
-            }
-            let scale_pct =
-                appearance.map(|a| a.icon_scale).unwrap_or(100).clamp(20, 100) as f64 / 100.0;
-            let icon_max = ((min_dim as f64 * scale_pct) as i32).max(12);
+            } else {
+                false
+            };
 
-            if let Some(pixbuf) = load_icon(icon_path, icon_name, icon_max) {
-                let icon_w = pixbuf.width() as f64;
-                let icon_h = pixbuf.height() as f64;
-                let icon_x = ((w as f64 - icon_w) / 2.0).max(0.0);
-                let icon_y = ((h as f64 - icon_h) / 2.0).max(0.0);
+            if !painted_native {
+                let custom_bg = appearance
+                    .and_then(|a| a.bg_color.as_deref())
+                    .and_then(parse_hex_color);
+                let (r, g, b) = custom_bg.unwrap_or((0.0, 0.0, 0.0));
 
-                cr.set_source_pixbuf(&pixbuf, icon_x, icon_y);
+                cr.set_source_rgb(r, g, b);
                 let _ = cr.paint();
-            }
 
-            if let Some(app) = appearance {
-                let draw_overlay_text = |text: &str, align: TextVerticalAlign| {
-                    if text.is_empty() {
-                        return;
+                if custom_bg.is_some() {
+                    cr.set_source_rgb(
+                        (r + 0.15).min(1.0),
+                        (g + 0.15).min(1.0),
+                        (b + 0.15).min(1.0),
+                    );
+                    cr.set_line_width(2.0);
+                    cr.rectangle(1.0, 1.0, (w - 2) as f64, (h - 2) as f64);
+                    let _ = cr.stroke();
+                }
+
+                let mut icon_path = appearance.and_then(|a| a.icon_path.as_deref());
+                if let Some(p) = icon_path {
+                    if (p.ends_with("action_launch.png") || p.ends_with("default_app.png"))
+                        && icon_name.is_some()
+                    {
+                        icon_path = None;
                     }
-                    let layout = pc::create_layout(&cr);
-                    let scale_factor = min_dim as f64 / 96.0;
-                    let target_size =
-                        ((app.font_size as f64 * scale_factor).max(8.0) * pango::SCALE as f64)
-                            as i32;
+                }
+                let scale_pct =
+                    appearance.map(|a| a.icon_scale).unwrap_or(100).clamp(20, 100) as f64 / 100.0;
+                let icon_max = ((min_dim as f64 * scale_pct) as i32).max(12);
 
-                    let mut font_desc = pango::FontDescription::new();
-                    font_desc.set_family(&app.font_family);
-                    font_desc.set_size(target_size);
-                    font_desc.set_weight(pango::Weight::Bold);
-                    layout.set_font_description(Some(&font_desc));
+                if let Some(pixbuf) = load_icon(icon_path, icon_name, icon_max) {
+                    let icon_w = pixbuf.width() as f64;
+                    let icon_h = pixbuf.height() as f64;
+                    let icon_x = ((w as f64 - icon_w) / 2.0).max(0.0);
+                    let icon_y = ((h as f64 - icon_h) / 2.0).max(0.0);
 
-                    layout.set_text(text);
-                    layout.set_alignment(pango::Alignment::Center);
-                    layout.set_width(((w - 8) as i32) * pango::SCALE);
-                    layout.set_wrap(pango::WrapMode::WordChar);
-
-                    let (_, extents) = layout.pixel_extents();
-                    let text_h = extents.height() as f64;
-
-                    let text_y = match align {
-                        TextVerticalAlign::Top => 4.0,
-                        TextVerticalAlign::Center => ((h as f64 - text_h) / 2.0).max(2.0),
-                        TextVerticalAlign::Bottom => (h as f64 - text_h - 4.0).max(2.0),
-                    };
-
-                    cr.set_source_rgba(0.0, 0.0, 0.0, 0.90);
-                    for (dx, dy) in [
-                        (-1.0, 0.0),
-                        (1.0, 0.0),
-                        (0.0, -1.0),
-                        (0.0, 1.0),
-                        (1.0, 1.0),
-                    ] {
-                        cr.move_to(4.0 + dx, text_y + dy);
-                        pc::show_layout(&cr, &layout);
-                    }
-
-                    let (tr, tg, tb) =
-                        parse_hex_color(&app.text_color).unwrap_or((1.0, 1.0, 1.0));
-                    cr.set_source_rgb(tr, tg, tb);
-                    cr.move_to(4.0, text_y);
-                    pc::show_layout(&cr, &layout);
-                };
-
-                if app.has_plugin_labels() {
-                    if let Some(ref t) = app.top_label {
-                        draw_overlay_text(t, TextVerticalAlign::Top);
-                    }
-                    if let Some(ref c) = app.center_label {
-                        draw_overlay_text(c, TextVerticalAlign::Center);
-                    }
-                    if let Some(ref b) = app.bottom_label {
-                        draw_overlay_text(b, TextVerticalAlign::Bottom);
-                    }
-                } else if app.show_title && !app.title.is_empty() {
-                    draw_overlay_text(&app.title, app.vertical_align);
+                    cr.set_source_pixbuf(&pixbuf, icon_x, icon_y);
+                    let _ = cr.paint();
                 }
             }
         }
 
         drop(cr);
-        let stride = surface.stride() as usize;
-        let surface_data = surface.take_data().expect("Failed to read surface data");
+        let stride = surface.stride();
+        let data = surface.take_data().ok()?.to_vec();
+        Some((w, h, stride, data))
+    }
 
+    /// Renders single-line (and optionally scrolling marquee) labels onto a pre-rendered base buffer
+    /// and encodes the final frame for the target Stream Deck hardware.
+    fn composite_key_frame(
+        kind: DeviceKind,
+        w: u32,
+        h: u32,
+        stride: i32,
+        base_data: &[u8],
+        appearance: Option<&KeyAppearance>,
+        is_active: bool,
+        elapsed_sec: f64,
+    ) -> (Vec<u8>, bool) {
+        let mut frame_buf = base_data.to_vec();
+        let mut overflows = false;
+
+        if is_active {
+            if let Some(app) = appearance {
+                match ImageSurface::create_for_data(
+                    frame_buf,
+                    Format::Rgb24,
+                    w as i32,
+                    h as i32,
+                    stride,
+                ) {
+                    Ok(surface) => {
+                        if let Ok(cr) = Context::new(&surface) {
+                            overflows =
+                                draw_key_appearance_labels(&cr, w as f64, h as f64, app, elapsed_sec);
+                        }
+                        frame_buf = surface
+                            .take_data()
+                            .map(|d| d.to_vec())
+                            .unwrap_or_else(|_| base_data.to_vec());
+                    }
+                    Err(_) => {
+                        frame_buf = base_data.to_vec();
+                    }
+                }
+            }
+        }
+
+        let stride_u = stride as usize;
         let mut img: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::new(w, h);
         for y in 0..h {
             for x in 0..w {
-                let offset = y as usize * stride + x as usize * 4;
-                let b_val = surface_data[offset];
-                let g_val = surface_data[offset + 1];
-                let r_val = surface_data[offset + 2];
+                let offset = y as usize * stride_u + x as usize * 4;
+                let b_val = frame_buf[offset];
+                let g_val = frame_buf[offset + 1];
+                let r_val = frame_buf[offset + 2];
                 img.put_pixel(x, y, Rgb([r_val, g_val, b_val]));
             }
         }
 
         let (rot_ccw, flip_x, flip_y) = kind.key_image_transform();
         let transformed = apply_hardware_transform(img, rot_ccw, flip_x, flip_y);
-        encode_hardware_image(&transformed, kind.key_image_format(), 95)
+        (
+            encode_hardware_image(&transformed, kind.key_image_format(), 95),
+            overflows,
+        )
+    }
+
+    /// Renders a key image buffer formatted natively (dimensions, rotation, flip, BMP or JPEG) for the hardware
+    pub fn render_key_image(
+        &self,
+        kind: DeviceKind,
+        key_idx: usize,
+        appearance: Option<&KeyAppearance>,
+        icon_name: Option<&str>,
+        is_active: bool,
+    ) -> Vec<u8> {
+        let host = self.get_native_host();
+        let Some((w, h, stride, base_data)) =
+            Self::render_key_base_layer(kind, key_idx, appearance, icon_name, is_active, host.as_ref())
+        else {
+            return Vec::new();
+        };
+        let (encoded, _) = Self::composite_key_frame(
+            kind,
+            w,
+            h,
+            stride,
+            &base_data,
+            appearance,
+            is_active,
+            0.0,
+        );
+        encoded
     }
 
     /// Renders the touchscreen strip JPEG for Stream Deck + (800x100) or Stream Deck + XL (1200x100 -> rotated 90° CCW)
@@ -771,12 +1029,38 @@ impl HardwareManager {
                     }
                 }
             } else {
+                let native_host = self.get_native_host();
                 for i in 0..dial_count {
                     if let Some(action) = page.dial_actions.get(&i) {
                         let slot_x = (i as f64) * slot_w;
                         let app = action.active_appearance();
                         let summary_title = app.combined_display_summary();
                         let title = summary_title.as_str();
+
+                        let has_custom_path = app
+                            .icon_path
+                            .as_deref()
+                            .filter(|p| !p.is_empty() && Path::new(p).exists())
+                            .is_some();
+
+                        if !has_custom_path {
+                            if let Some(ref host) = native_host {
+                                let _ = cr.save();
+                                cr.rectangle(slot_x, 0.0, slot_w, height as f64);
+                                cr.clip();
+                                cr.translate(slot_x, 0.0);
+                                let painted = host.render_slot_visual(
+                                    &format!("dial_{i}"),
+                                    &cr,
+                                    slot_w,
+                                    height as f64,
+                                );
+                                let _ = cr.restore();
+                                if painted {
+                                    continue;
+                                }
+                            }
+                        }
 
                         if let Some(ref bg_hex) = app.bg_color {
                             if let Some((bg_r, bg_g, bg_b)) = parse_hex_color(bg_hex) {
@@ -790,19 +1074,69 @@ impl HardwareManager {
                         if let Some(ref path) = app.icon_path {
                             if Path::new(path).exists() {
                                 let scale_pct = (app.icon_scale.clamp(20, 100) as f64) / 100.0;
-                                let base_sz = if title.is_empty() { 70.0 } else { 48.0 };
-                                let icon_sz = ((base_sz * scale_pct) as i32).max(12);
-                                if let Ok(pixbuf) = gdk_pixbuf::Pixbuf::from_file_at_scale(
-                                    path, icon_sz, icon_sz, true,
-                                ) {
+                                let is_svg = path.to_lowercase().ends_with(".svg");
+
+                                let loaded_pb: Option<(gdk_pixbuf::Pixbuf, bool)> = if is_svg {
+                                    // Probe natural aspect via unscaled load, then rasterize cleanly at target size
+                                    let aspect = gdk_pixbuf::Pixbuf::from_file(path)
+                                        .map(|p| p.width().max(1) as f64 / p.height().max(1) as f64)
+                                        .unwrap_or(1.0);
+                                    let is_wide = aspect > 1.35;
+                                    let (tw, th) = if is_wide {
+                                        (
+                                            (slot_w * scale_pct).round().max(16.0) as i32,
+                                            (height as f64 * scale_pct).round().max(16.0) as i32,
+                                        )
+                                    } else {
+                                        let base = if title.is_empty() { height as f64 - 12.0 } else { height as f64 - 36.0 };
+                                        let sq = (base * scale_pct).round().max(16.0) as i32;
+                                        (sq, sq)
+                                    };
+                                    gdk_pixbuf::Pixbuf::from_file_at_scale(path, tw, th, true)
+                                        .ok()
+                                        .map(|pb| (pb, is_wide))
+                                } else if let Ok(raw_pb) = gdk_pixbuf::Pixbuf::from_file(path) {
+                                    let src_w = raw_pb.width().max(1) as f64;
+                                    let src_h = raw_pb.height().max(1) as f64;
+                                    let aspect = src_w / src_h;
+                                    let is_wide = aspect > 1.35;
+
+                                    // Wide dial cards (200x100 on Stream Deck + & Stream Deck + XL) fill
+                                    // their full slot_w x height LCD zone; square icons stay cleanly proportioned.
+                                    let (max_w, max_h) = if is_wide {
+                                        (
+                                            (slot_w * scale_pct).max(16.0),
+                                            (height as f64 * scale_pct).max(16.0),
+                                        )
+                                    } else {
+                                        let base = if title.is_empty() { height as f64 - 12.0 } else { height as f64 - 36.0 };
+                                        let sq = (base * scale_pct).max(16.0);
+                                        (sq, sq)
+                                    };
+
+                                    let fit_scale = (max_w / src_w).min(max_h / src_h);
+                                    let dst_w = (src_w * fit_scale).round().max(1.0) as i32;
+                                    let dst_h = (src_h * fit_scale).round().max(1.0) as i32;
+
+                                    let scaled = if dst_w == raw_pb.width() && dst_h == raw_pb.height() {
+                                        Some(raw_pb)
+                                    } else {
+                                        raw_pb.scale_simple(dst_w, dst_h, gdk_pixbuf::InterpType::Hyper)
+                                    };
+                                    scaled.map(|pb| (pb, is_wide))
+                                } else {
+                                    None
+                                };
+
+                                if let Some((pixbuf, is_wide_card)) = loaded_pb {
                                     has_card_icon = true;
                                     let pw = pixbuf.width() as f64;
                                     let ph = pixbuf.height() as f64;
                                     let px = slot_x + (slot_w - pw) / 2.0;
-                                    let py = if title.is_empty() {
+                                    let py = if is_wide_card || title.is_empty() {
                                         (height as f64 - ph) / 2.0
                                     } else {
-                                        10.0
+                                        8.0
                                     };
                                     cr.set_source_pixbuf(&pixbuf, px, py);
                                     let _ = cr.paint();
@@ -811,27 +1145,36 @@ impl HardwareManager {
                         }
 
                         let draw_dial_label = |text: &str, y_pos: f64| {
-                            if text.is_empty() {
+                            let clean: String = text
+                                .replace('\r', "")
+                                .split('\n')
+                                .map(|s| s.trim())
+                                .filter(|s| !s.is_empty())
+                                .collect::<Vec<_>>()
+                                .join(" ");
+                            if clean.is_empty() {
                                 return;
                             }
                             let layout = pc::create_layout(&cr);
                             let mut font_desc = pango::FontDescription::new();
                             font_desc.set_family(&app.font_family);
-                            font_desc.set_size(app.font_size as i32 * pango::SCALE);
+                            font_desc.set_absolute_size((app.font_size.max(8) as f64) * pango::SCALE as f64);
                             font_desc.set_weight(pango::Weight::Bold);
                             layout.set_font_description(Some(&font_desc));
-                            layout.set_text(text);
+                            layout.set_single_paragraph_mode(true);
+                            layout.set_ellipsize(pango::EllipsizeMode::End);
+                            layout.set_text(&clean);
                             layout.set_alignment(pango::Alignment::Center);
-                            layout.set_width((slot_w as i32) * pango::SCALE);
+                            layout.set_width(((slot_w - 8.0).max(16.0) as i32) * pango::SCALE);
 
                             cr.set_source_rgba(0.0, 0.0, 0.0, 0.85);
-                            cr.move_to(slot_x + 1.0, y_pos + 1.0);
+                            cr.move_to(slot_x + 4.0 + 1.0, y_pos + 1.0);
                             pc::show_layout(&cr, &layout);
 
                             let (fg_r, fg_g, fg_b) =
                                 parse_hex_color(&app.text_color).unwrap_or((1.0, 1.0, 1.0));
                             cr.set_source_rgb(fg_r, fg_g, fg_b);
-                            cr.move_to(slot_x, y_pos);
+                            cr.move_to(slot_x + 4.0, y_pos);
                             pc::show_layout(&cr, &layout);
                         };
 
@@ -1015,15 +1358,107 @@ impl HardwareManager {
                     }
                 }
 
+                let native_host = self.get_native_host();
+                let Some((kw, kh, kstride, base_data)) = Self::render_key_base_layer(
+                    kind,
+                    key,
+                    appearance,
+                    icon_name,
+                    is_active,
+                    native_host.as_ref(),
+                ) else {
+                    if let Some((_, stop_flag)) = anim_lock.remove(&key_anim_id) {
+                        stop_flag.store(true, Ordering::SeqCst);
+                    }
+                    drop(anim_lock);
+                    continue;
+                };
+
+                let (encoded_0, overflows) = Self::composite_key_frame(
+                    kind,
+                    kw,
+                    kh,
+                    kstride,
+                    &base_data,
+                    appearance,
+                    is_active,
+                    0.0,
+                );
+
+                if overflows {
+                    if let Some(app) = appearance {
+                        let marquee_sig = format!(
+                            "marquee:{:?}:{:?}:{:?}:{}:{}:{}:{}:{}:{:?}:{:?}:{}",
+                            app.top_label,
+                            app.center_label,
+                            app.bottom_label,
+                            app.show_title,
+                            app.title,
+                            app.font_family,
+                            app.font_size,
+                            app.text_color,
+                            app.bg_color,
+                            app.icon_path,
+                            app.icon_scale
+                        );
+                        let already_running = anim_lock
+                            .get(&key_anim_id)
+                            .map(|(sig, _)| sig == &marquee_sig)
+                            .unwrap_or(false);
+                        if already_running {
+                            drop(anim_lock);
+                            continue;
+                        }
+                        if let Some((_, stop_flag)) = anim_lock.remove(&key_anim_id) {
+                            stop_flag.store(true, Ordering::SeqCst);
+                        }
+                        let stop_flag = Arc::new(AtomicBool::new(false));
+                        anim_lock.insert(key_anim_id.clone(), (marquee_sig, stop_flag.clone()));
+                        drop(anim_lock);
+
+                        // Immediately push initial static frame (t=0.0) so key renders with zero delay
+                        {
+                            let dev = dev_arc.lock().unwrap();
+                            let _ = Self::write_key_image_direct(&dev, kind, key, &encoded_0);
+                        }
+
+                        // Lightweight marquee ticker (~12 FPS) reusing the pre-rendered icon/bg base buffer
+                        let dev_arc_anim = dev_arc.clone();
+                        let app_owned = app.clone();
+                        thread::spawn(move || {
+                            let started = std::time::Instant::now();
+                            while !stop_flag.load(Ordering::SeqCst) {
+                                thread::sleep(Duration::from_millis(85));
+                                if stop_flag.load(Ordering::SeqCst) {
+                                    break;
+                                }
+                                let elapsed = started.elapsed().as_secs_f64();
+                                let (frame_bytes, _) = Self::composite_key_frame(
+                                    kind,
+                                    kw,
+                                    kh,
+                                    kstride,
+                                    &base_data,
+                                    Some(&app_owned),
+                                    true,
+                                    elapsed,
+                                );
+                                let dev = dev_arc_anim.lock().unwrap();
+                                let _ = Self::write_key_image_direct(&dev, kind, key, &frame_bytes);
+                            }
+                        });
+                        continue;
+                    }
+                }
+
                 if let Some((_, stop_flag)) = anim_lock.remove(&key_anim_id) {
                     stop_flag.store(true, Ordering::SeqCst);
                 }
                 drop(anim_lock);
 
-                let encoded = self.render_key_image(kind, key, appearance, icon_name, is_active);
                 let res = {
                     let dev = dev_arc.lock().unwrap();
-                    Self::write_key_image_direct(&dev, kind, key, &encoded)
+                    Self::write_key_image_direct(&dev, kind, key, &encoded_0)
                 };
                 if let Err(e) = res {
                     tracing::error!(
@@ -1132,13 +1567,151 @@ impl HardwareManager {
         }
     }
 
-    /// Spawn background listener thread polling USB HID input reports for any Stream Deck model
+    /// Lightweight single-slot hardware push for live 1Hz native action ticks (Clock, System Metrics, Media)
+    /// so ticking a single key never re-renders or re-uploads all 32 keys over USB.
+    pub fn sync_single_slot(&self, dev_path: &Path, kind: DeviceKind, profile: &Profile, slot: &str) {
+        if !kind.is_visual() {
+            return;
+        }
+        let Ok(dev_arc) = self.get_or_open_device(dev_path) else {
+            return;
+        };
+
+        if let Some(key_str) = slot.strip_prefix("key_") {
+            if let Ok(key) = key_str.parse::<usize>() {
+                if key >= kind.total_keys() {
+                    return;
+                }
+                let page = match profile.current_page() {
+                    Some(p) => p,
+                    None => return,
+                };
+                let action = page.keys.get(&key);
+                let appearance = action.map(|a| a.active_appearance());
+                let icon_name = action
+                    .and_then(|a| a.parameters.get("icon_name"))
+                    .map(|s| s.as_str());
+                let is_active = action.is_some();
+                let native_host = self.get_native_host();
+
+                let Some((kw, kh, kstride, base_data)) = Self::render_key_base_layer(
+                    kind,
+                    key,
+                    appearance,
+                    icon_name,
+                    is_active,
+                    native_host.as_ref(),
+                ) else {
+                    return;
+                };
+                let (encoded_0, overflows) = Self::composite_key_frame(
+                    kind,
+                    kw,
+                    kh,
+                    kstride,
+                    &base_data,
+                    appearance,
+                    is_active,
+                    0.0,
+                );
+
+                let key_anim_id = format!("key_{}_{}", dev_path.display(), key);
+                let mut anim_lock = self.active_animations.lock().unwrap();
+                if overflows {
+                    if let Some(app) = appearance {
+                        let marquee_sig = format!(
+                            "marquee:{:?}:{:?}:{:?}:{}:{}:{}:{}:{}:{:?}:{:?}:{}",
+                            app.top_label,
+                            app.center_label,
+                            app.bottom_label,
+                            app.show_title,
+                            app.title,
+                            app.font_family,
+                            app.font_size,
+                            app.text_color,
+                            app.bg_color,
+                            app.icon_path,
+                            app.icon_scale
+                        );
+                        let already_running = anim_lock
+                            .get(&key_anim_id)
+                            .map(|(sig, _)| sig == &marquee_sig)
+                            .unwrap_or(false);
+                        if already_running {
+                            return;
+                        }
+                        if let Some((_, stop_flag)) = anim_lock.remove(&key_anim_id) {
+                            stop_flag.store(true, Ordering::SeqCst);
+                        }
+                        let stop_flag = Arc::new(AtomicBool::new(false));
+                        anim_lock.insert(key_anim_id.clone(), (marquee_sig, stop_flag.clone()));
+                        drop(anim_lock);
+
+                        {
+                            let dev = dev_arc.lock().unwrap();
+                            let _ = Self::write_key_image_direct(&dev, kind, key, &encoded_0);
+                        }
+                        let dev_arc_anim = dev_arc.clone();
+                        let app_owned = app.clone();
+                        thread::spawn(move || {
+                            let started = std::time::Instant::now();
+                            while !stop_flag.load(Ordering::SeqCst) {
+                                thread::sleep(Duration::from_millis(85));
+                                if stop_flag.load(Ordering::SeqCst) {
+                                    break;
+                                }
+                                let elapsed = started.elapsed().as_secs_f64();
+                                let (frame_bytes, _) = Self::composite_key_frame(
+                                    kind,
+                                    kw,
+                                    kh,
+                                    kstride,
+                                    &base_data,
+                                    Some(&app_owned),
+                                    true,
+                                    elapsed,
+                                );
+                                let dev = dev_arc_anim.lock().unwrap();
+                                let _ = Self::write_key_image_direct(&dev, kind, key, &frame_bytes);
+                            }
+                        });
+                        return;
+                    }
+                }
+                if let Some((_, stop_flag)) = anim_lock.remove(&key_anim_id) {
+                    stop_flag.store(true, Ordering::SeqCst);
+                }
+                drop(anim_lock);
+
+                let dev = dev_arc.lock().unwrap();
+                let _ = Self::write_key_image_direct(&dev, kind, key, &encoded_0);
+            }
+        } else if slot.starts_with("dial_") {
+            if let Some((tw, th)) = kind.touchscreen_size() {
+                let touch_jpeg = self.render_touchscreen_jpeg(kind, profile);
+                let dev = dev_arc.lock().unwrap();
+                let _ = Self::write_touchscreen_image_direct(
+                    &dev,
+                    kind,
+                    0,
+                    0,
+                    tw as u16,
+                    th as u16,
+                    &touch_jpeg,
+                );
+            }
+        }
+    }
+
+    /// Spawn background listener thread polling USB HID input reports for a connected Stream Deck.
+    /// Supports simultaneous listeners across ALL connected decks (only replaces an existing listener
+    /// for the same `dev_path`).
     pub fn start_listener<F>(&self, dev_path: PathBuf, kind: DeviceKind, callback: F)
     where
         F: Fn(HardwareEvent) + Send + 'static,
     {
-        // Stop any existing listener thread cleanly before starting the new one
-        if let Some(old_stop) = self.listener_stop.lock().unwrap().take() {
+        // Stop any previous listener for THIS specific device only (other decks remain active!)
+        if let Some(old_stop) = self.listener_stops.lock().unwrap().remove(&dev_path) {
             old_stop.store(true, Ordering::SeqCst);
         }
 
@@ -1154,7 +1727,10 @@ impl HardwareManager {
         };
 
         let stop_flag = Arc::new(AtomicBool::new(false));
-        *self.listener_stop.lock().unwrap() = Some(stop_flag.clone());
+        self.listener_stops
+            .lock()
+            .unwrap()
+            .insert(dev_path.clone(), stop_flag.clone());
 
         thread::spawn(move || {
             let key_count = kind.total_keys();

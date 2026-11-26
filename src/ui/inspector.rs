@@ -55,10 +55,15 @@ pub struct PropertyInspector {
     pub action_info_name: Label,
     pub action_info_desc: Label,
     pub dynamic_settings_box: Box,
+    pub multi_action_box: Box,
+    pub multi_active_seq: Rc<Cell<usize>>,
+    pub on_multi_steps_changed: Rc<RefCell<Option<std::boxed::Box<dyn Fn(String, String, Vec<crate::native_sdk::MultiActionStep>)>>>>,
     pub swipe_row: Box,
     pub swipe_dropdown: DropDown,
     pub app_dropdown: DropDown,
     pub preview_tile: Overlay,
+    pub preview_sizer: Box,
+    pub preview_native_da: gtk::DrawingArea,
     pub preview_inner_label: Label,
     pub preview_top_label: Label,
     pub preview_center_label: Label,
@@ -77,6 +82,7 @@ pub struct PropertyInspector {
     pub current_plugin_name: Rc<RefCell<Option<String>>>,
     pub on_open_plugin_settings: Rc<RefCell<Option<std::boxed::Box<dyn Fn(String, String)>>>>,
     pub plugin_manager: Rc<RefCell<Option<PluginManager>>>,
+    pub native_host: Rc<RefCell<Option<crate::native_sdk::NativePluginHost>>>,
     pub on_parameter_changed: Rc<RefCell<Option<std::boxed::Box<dyn Fn(String, String)>>>>,
     pub on_config_row_changed: Rc<RefCell<Option<std::boxed::Box<dyn Fn(String, usize, Option<usize>, Option<bool>, Option<String>, Option<String>, Option<f64>)>>>>,
     pub on_config_button_clicked: Rc<RefCell<Option<std::boxed::Box<dyn Fn(String, usize)>>>>,
@@ -193,20 +199,61 @@ impl PropertyInspector {
         preview_tile.set_vexpand(false);
         preview_tile.set_hexpand(false);
 
+        let preview_sizer = Box::new(Orientation::Vertical, 0);
+        preview_sizer.set_size_request(78, 78);
+        preview_sizer.set_hexpand(false);
+        preview_sizer.set_vexpand(false);
+        preview_sizer.set_can_target(false);
+
+        let native_host: Rc<RefCell<Option<crate::native_sdk::NativePluginHost>>> =
+            Rc::new(RefCell::new(None));
+        let current_target_rc: Rc<RefCell<InspectorTarget>> =
+            Rc::new(RefCell::new(InspectorTarget::Key(0)));
+
+        let preview_native_da = gtk::DrawingArea::new();
+        preview_native_da.set_hexpand(true);
+        preview_native_da.set_vexpand(true);
+        preview_native_da.set_halign(gtk::Align::Fill);
+        preview_native_da.set_valign(gtk::Align::Fill);
+        preview_native_da.set_visible(false);
+        preview_native_da.set_can_target(false);
+        {
+            let nh_prev = native_host.clone();
+            let tgt_prev = current_target_rc.clone();
+            preview_native_da.set_draw_func(move |_area, cr, width, height| {
+                let slot = match *tgt_prev.borrow() {
+                    InspectorTarget::Key(k) => format!("key_{k}"),
+                    InspectorTarget::Dial(d) => format!("dial_{d}"),
+                    InspectorTarget::Touchscreen => "touchscreen".to_string(),
+                };
+                if let Some(ref host) = *nh_prev.borrow() {
+                    let _ = host.render_slot_visual(&slot, cr, width as f64, height as f64);
+                }
+            });
+        }
+
         let preview_icon = Picture::new();
         preview_icon.set_can_shrink(true);
         preview_icon.set_content_fit(gtk::ContentFit::Contain);
-        preview_icon.set_halign(gtk::Align::Center);
-        preview_icon.set_valign(gtk::Align::Center);
-        preview_icon.set_size_request(80, 80);
+        preview_icon.set_halign(gtk::Align::Fill);
+        preview_icon.set_valign(gtk::Align::Fill);
+        preview_icon.set_hexpand(true);
+        preview_icon.set_vexpand(true);
         preview_icon.set_visible(false);
+        preview_icon.set_can_target(false);
 
         let make_prev_label = |valign: gtk::Align| {
             let lbl = Label::new(Some(""));
             lbl.set_valign(valign);
-            lbl.set_halign(gtk::Align::Center);
-            lbl.set_wrap(true);
-            lbl.set_justify(gtk::Justification::Center);
+            lbl.set_halign(gtk::Align::Fill);
+            lbl.set_xalign(0.5);
+            lbl.set_wrap(false);
+            lbl.set_single_line_mode(true);
+            lbl.set_ellipsize(pango::EllipsizeMode::End);
+            lbl.set_margin_start(4);
+            lbl.set_margin_end(4);
+            lbl.set_margin_top(3);
+            lbl.set_margin_bottom(3);
             lbl.add_css_class("deck-key-label");
             lbl.set_visible(false);
             lbl
@@ -216,7 +263,9 @@ impl PropertyInspector {
         let preview_top_label = make_prev_label(gtk::Align::Start);
         let preview_center_label = make_prev_label(gtk::Align::Center);
 
-        preview_tile.set_child(Some(&preview_icon));
+        preview_tile.set_child(Some(&preview_sizer));
+        preview_tile.add_overlay(&preview_native_da);
+        preview_tile.add_overlay(&preview_icon);
         preview_tile.add_overlay(&preview_top_label);
         preview_tile.add_overlay(&preview_center_label);
         preview_tile.add_overlay(&preview_inner_label);
@@ -442,6 +491,22 @@ impl PropertyInspector {
         dynamic_settings_box.set_halign(gtk::Align::Start);
         action_box.append(&dynamic_settings_box);
 
+        // Native Multi-Action Step Sequence Editor Container
+        let multi_action_box = Box::new(Orientation::Vertical, 8);
+        multi_action_box.set_visible(false);
+        multi_action_box.set_halign(gtk::Align::Start);
+        multi_action_box.set_margin_top(6);
+        action_box.append(&multi_action_box);
+
+        let multi_active_seq = Rc::new(Cell::new(0usize));
+        let on_multi_steps_changed: Rc<
+            RefCell<
+                Option<
+                    std::boxed::Box<dyn Fn(String, String, Vec<crate::native_sdk::MultiActionStep>)>,
+                >,
+            >,
+        > = Rc::new(RefCell::new(None));
+
         let on_parameter_changed: Rc<RefCell<Option<std::boxed::Box<dyn Fn(String, String)>>>> = Rc::new(RefCell::new(None));
         let on_config_row_changed: Rc<RefCell<Option<std::boxed::Box<dyn Fn(String, usize, Option<usize>, Option<bool>, Option<String>, Option<String>, Option<f64>)>>>> = Rc::new(RefCell::new(None));
         let on_config_button_clicked: Rc<RefCell<Option<std::boxed::Box<dyn Fn(String, usize)>>>> = Rc::new(RefCell::new(None));
@@ -536,10 +601,15 @@ impl PropertyInspector {
             action_info_name,
             action_info_desc,
             dynamic_settings_box,
+            multi_action_box,
+            multi_active_seq,
+            on_multi_steps_changed,
             swipe_row,
             swipe_dropdown,
             app_dropdown,
             preview_tile,
+            preview_sizer,
+            preview_native_da,
             preview_inner_label,
             preview_top_label,
             preview_center_label,
@@ -550,7 +620,7 @@ impl PropertyInspector {
             radio_state_1,
             selected_state_idx: Rc::new(Cell::new(0)),
             is_updating: Rc::new(Cell::new(false)),
-            current_target: Rc::new(RefCell::new(InspectorTarget::Key(0))),
+            current_target: current_target_rc,
             current_key_idx: Rc::new(RefCell::new(Some(0))),
             installed_apps: Rc::new(RefCell::new(Vec::new())),
             active_preview_anim: Rc::new(RefCell::new(None)),
@@ -558,6 +628,7 @@ impl PropertyInspector {
             current_plugin_name,
             on_open_plugin_settings,
             plugin_manager: Rc::new(RefCell::new(None)),
+            native_host,
             on_parameter_changed,
             on_config_row_changed,
             on_config_button_clicked,
@@ -570,6 +641,9 @@ impl PropertyInspector {
 
     pub fn set_target(&self, target: InspectorTarget) {
         *self.current_target.borrow_mut() = target;
+        self.preview_tile.remove_css_class("inspector-key-tile");
+        self.preview_tile.remove_css_class("inspector-dial-tile");
+        self.preview_tile.remove_css_class("inspector-touch-tile");
         match target {
             InspectorTarget::Key(k) => {
                 *self.current_key_idx.borrow_mut() = Some(k);
@@ -592,7 +666,9 @@ impl PropertyInspector {
                 self.swipe_row.set_visible(false);
                 self.state_dots_box.set_visible(false);
                 self.preview_inner_label.set_visible(true);
+                self.preview_tile.add_css_class("inspector-key-tile");
                 self.preview_tile.set_size_request(80, 80);
+                self.preview_sizer.set_size_request(78, 78);
             }
             InspectorTarget::Dial(d) => {
                 *self.current_key_idx.borrow_mut() = None;
@@ -615,7 +691,9 @@ impl PropertyInspector {
                 self.swipe_row.set_visible(false);
                 self.state_dots_box.set_visible(false);
                 self.preview_inner_label.set_visible(true);
-                self.preview_tile.set_size_request(80, 50);
+                self.preview_tile.add_css_class("inspector-dial-tile");
+                self.preview_tile.set_size_request(160, 80);
+                self.preview_sizer.set_size_request(158, 78);
             }
             InspectorTarget::Touchscreen => {
                 *self.current_key_idx.borrow_mut() = None;
@@ -642,7 +720,8 @@ impl PropertyInspector {
                 self.swipe_row.set_visible(true);
                 self.state_dots_box.set_visible(false);
                 self.preview_inner_label.set_visible(false);
-                self.preview_tile.set_size_request(160, 20);
+                self.preview_tile.add_css_class("inspector-touch-tile");
+                self.preview_tile.set_size_request(160, 24);
             }
         }
     }
@@ -728,7 +807,19 @@ impl PropertyInspector {
                     InspectorTarget::Touchscreen => "touchscreen".into(),
                 };
 
-                let live_rows = if let Some(ref pm) = *self.plugin_manager.borrow() {
+                let is_native = self
+                    .native_host
+                    .borrow()
+                    .as_ref()
+                    .map(|h| h.is_native_plugin(&act.plugin_id))
+                    .unwrap_or(false);
+
+                let live_rows = if is_native {
+                    self.native_host
+                        .borrow()
+                        .as_ref()
+                        .and_then(|h| h.config_rows(&slot))
+                } else if let Some(ref pm) = *self.plugin_manager.borrow() {
                     pm.get_live_config_rows(&slot)
                 } else {
                     None
@@ -736,7 +827,18 @@ impl PropertyInspector {
 
                 if let Some(ref rows) = live_rows {
                     self.action_info_name.set_text(&act.action_name);
-                    let desc = get_action_description(&act.action_id, &act.action_name, &act.plugin_name);
+                    let desc = if is_native {
+                        self.native_host
+                            .borrow()
+                            .as_ref()
+                            .and_then(|h| h.find_descriptor(&act.plugin_id, &act.action_id))
+                            .map(|d| d.description)
+                            .unwrap_or_else(|| {
+                                get_action_description(&act.action_id, &act.action_name, &act.plugin_name)
+                            })
+                    } else {
+                        get_action_description(&act.action_id, &act.action_name, &act.plugin_name)
+                    };
                     self.action_info_desc.set_text(&desc);
                     self.render_live_config_rows(&slot, rows);
                 } else {
@@ -894,6 +996,20 @@ impl PropertyInspector {
                 self.dynamic_settings_box.set_visible(false);
             }
 
+            // Dedicated Interactive Step Editor for Native Multi-Action
+            if act.action_id == "ballista.multi_action" {
+                let target = *self.current_target.borrow();
+                let slot = match target {
+                    InspectorTarget::Key(k) => format!("key_{k}"),
+                    InspectorTarget::Dial(d) => format!("dial_{d}"),
+                    InspectorTarget::Touchscreen => "touchscreen".into(),
+                };
+                self.render_multi_action_editor(&slot, act);
+                self.multi_action_box.set_visible(true);
+            } else {
+                self.multi_action_box.set_visible(false);
+            }
+
             if act.states.len() > 1 {
                 self.state_dots_box.set_visible(true);
                 let st = act.current_state.min(act.states.len() - 1);
@@ -950,15 +1066,30 @@ impl PropertyInspector {
                 src.remove();
             }
 
-            // Update Preview tile with strictly bounded texture scaling
+            // Update Preview tile with strictly bounded texture scaling (2:1 for dials, 1:1 for keys)
             let scale_pct = (app.icon_scale.clamp(20, 100) as f64) / 100.0;
-            let (base_w, base_h) = match target {
-                InspectorTarget::Touchscreen => (160, 20),
-                InspectorTarget::Dial(_) => (90, 48),
-                InspectorTarget::Key(_) => (80, 80),
+            let (base_w, base_h, radius) = match target {
+                InspectorTarget::Touchscreen => (158, 22, 6.0),
+                InspectorTarget::Dial(_) => (158, 78, 8.0),
+                InspectorTarget::Key(_) => (78, 78, 10.0),
             };
             let icon_w = ((base_w as f64 * scale_pct) as i32).max(12);
             let icon_h = ((base_h as f64 * scale_pct) as i32).max(12);
+            let pad_x = if app.icon_scale < 100 {
+                ((base_w as f64 * (1.0 - scale_pct)) / 2.0).round() as i32
+            } else {
+                0
+            };
+            let pad_y = if app.icon_scale < 100 {
+                ((base_h as f64 * (1.0 - scale_pct)) / 2.0).round() as i32
+            } else {
+                0
+            };
+            self.preview_icon.set_margin_start(pad_x);
+            self.preview_icon.set_margin_end(pad_x);
+            self.preview_icon.set_margin_top(pad_y);
+            self.preview_icon.set_margin_bottom(pad_y);
+            self.preview_icon.set_size_request(-1, -1);
 
             let mut icon_path = app.icon_path.as_deref();
             let mut icon_name = act.parameters.get("icon_name").map(|s| s.as_str())
@@ -986,7 +1117,27 @@ impl PropertyInspector {
                 }
             }
 
-            if let Some(icon) = icon_path {
+            let target_slot_str = match target {
+                InspectorTarget::Key(k) => format!("key_{k}"),
+                InspectorTarget::Dial(d) => format!("dial_{d}"),
+                InspectorTarget::Touchscreen => "touchscreen".into(),
+            };
+            let has_custom_path = icon_path
+                .filter(|p| !p.is_empty() && std::path::Path::new(p).exists())
+                .is_some();
+            let show_native_prev = !has_custom_path
+                && self
+                    .native_host
+                    .borrow()
+                    .as_ref()
+                    .map(|h| h.is_native_plugin(&act.plugin_id) && h.has_slot(&target_slot_str))
+                    .unwrap_or(false);
+
+            self.preview_native_da.set_visible(show_native_prev);
+            if show_native_prev {
+                self.preview_native_da.queue_draw();
+                self.preview_icon.set_visible(false);
+            } else if let Some(icon) = icon_path {
                 if std::path::Path::new(icon).exists() {
                     if icon.to_lowercase().ends_with(".gif") {
                         if let Some(texture) = crate::ui::canvas::create_rounded_texture(icon, icon_w, icon_h, 10.0, true) {
@@ -1046,23 +1197,20 @@ impl PropertyInspector {
                                 let _ = sender.send_blocking(raw_frames);
                             }
                         });
-                    } else if let Some(paintable) = crate::ui::canvas::lookup_icon_paintable(Some(icon), icon_name, icon_w, 10.0) {
+                    } else if let Some(paintable) = crate::ui::canvas::lookup_rect_paintable(Some(icon), icon_name, icon_w, icon_h, radius) {
                         self.preview_icon.set_paintable(Some(&paintable));
                     } else {
                         self.preview_icon.set_filename(Some(icon));
                     }
-                    self.preview_icon.set_size_request(icon_w, icon_h);
                     self.preview_icon.set_visible(true);
-                } else if let Some(paintable) = crate::ui::canvas::lookup_icon_paintable(None, icon_name, icon_w, 10.0) {
+                } else if let Some(paintable) = crate::ui::canvas::lookup_rect_paintable(None, icon_name, icon_w, icon_h, radius) {
                     self.preview_icon.set_paintable(Some(&paintable));
-                    self.preview_icon.set_size_request(icon_w, icon_h);
                     self.preview_icon.set_visible(true);
                 } else {
                     self.preview_icon.set_visible(false);
                 }
-            } else if let Some(paintable) = crate::ui::canvas::lookup_icon_paintable(None, icon_name, icon_w, 10.0) {
+            } else if let Some(paintable) = crate::ui::canvas::lookup_rect_paintable(None, icon_name, icon_w, icon_h, radius) {
                 self.preview_icon.set_paintable(Some(&paintable));
-                self.preview_icon.set_size_request(icon_w, icon_h);
                 self.preview_icon.set_visible(true);
             } else {
                 self.preview_icon.set_visible(false);
@@ -1114,18 +1262,27 @@ impl PropertyInspector {
             self.rendered_live_rows.borrow_mut().clear();
             self.rendered_live_widgets.borrow_mut().clear();
             let target = *self.current_target.borrow();
+            self.preview_tile.remove_css_class("inspector-key-tile");
+            self.preview_tile.remove_css_class("inspector-dial-tile");
+            self.preview_tile.remove_css_class("inspector-touch-tile");
             match target {
                 InspectorTarget::Touchscreen => {
                     self.title_label.set_text("Stream Deck + Touch Strip");
-                    self.preview_tile.set_size_request(160, 20);
+                    self.preview_tile.add_css_class("inspector-touch-tile");
+                    self.preview_tile.set_size_request(160, 24);
+                    self.preview_sizer.set_size_request(158, 22);
                 }
                 InspectorTarget::Dial(d) => {
                     self.title_label.set_text(&format!("Stream Deck + Dial {} & Card {}", d + 1, d + 1));
-                    self.preview_tile.set_size_request(100, 52);
+                    self.preview_tile.add_css_class("inspector-dial-tile");
+                    self.preview_tile.set_size_request(160, 80);
+                    self.preview_sizer.set_size_request(158, 78);
                 }
                 InspectorTarget::Key(k) => {
                     self.title_label.set_text(&format!("Empty Key Slot {}", k + 1));
+                    self.preview_tile.add_css_class("inspector-key-tile");
                     self.preview_tile.set_size_request(80, 80);
+                    self.preview_sizer.set_size_request(78, 78);
                 }
             }
             self.delete_button.set_sensitive(false);
@@ -1139,7 +1296,9 @@ impl PropertyInspector {
             self.args_row.set_visible(false);
             self.action_info_box.set_visible(false);
             self.dynamic_settings_box.set_visible(false);
+            self.multi_action_box.set_visible(false);
             self.title_entry.set_text("");
+            self.preview_native_da.set_visible(false);
             self.preview_icon.set_visible(false);
             self.preview_inner_label.set_text("");
             self.preview_inner_label.set_visible(false);
@@ -1172,27 +1331,45 @@ impl PropertyInspector {
         }
 
         let scale_pct = (app.icon_scale.clamp(20, 100) as f64) / 100.0;
-        let (base_w, base_h) = match target {
-            InspectorTarget::Touchscreen => (160, 20),
-            InspectorTarget::Dial(_) => (90, 48),
-            InspectorTarget::Key(_) => (80, 80),
+        let (base_w, base_h, radius) = match target {
+            InspectorTarget::Touchscreen => (160, 24, 6.0),
+            InspectorTarget::Dial(_) => (160, 80, 8.0),
+            InspectorTarget::Key(_) => (80, 80, 10.0),
         };
         let icon_w = ((base_w as f64 * scale_pct) as i32).max(12);
         let icon_h = ((base_h as f64 * scale_pct) as i32).max(12);
         let icon_path = app.icon_path.as_deref();
         let icon_name = act.parameters.get("icon_name").map(|s| s.as_str());
 
-        if let Some(icon) = icon_path.filter(|p| !p.is_empty() && std::path::Path::new(p).exists()) {
-            if let Some(paintable) = crate::ui::canvas::lookup_icon_paintable(Some(icon), icon_name, icon_w, 10.0) {
+        let target_slot_str = match target {
+            InspectorTarget::Key(k) => format!("key_{k}"),
+            InspectorTarget::Dial(d) => format!("dial_{d}"),
+            InspectorTarget::Touchscreen => "touchscreen".into(),
+        };
+        let has_custom_path = icon_path
+            .filter(|p| !p.is_empty() && std::path::Path::new(p).exists())
+            .is_some();
+        let show_native_prev = !has_custom_path
+            && self
+                .native_host
+                .borrow()
+                .as_ref()
+                .map(|h| h.is_native_plugin(&act.plugin_id) && h.has_slot(&target_slot_str))
+                .unwrap_or(false);
+
+        self.preview_native_da.set_visible(show_native_prev);
+        if show_native_prev {
+            self.preview_native_da.queue_draw();
+            self.preview_icon.set_visible(false);
+        } else if let Some(icon) = icon_path.filter(|p| !p.is_empty() && std::path::Path::new(p).exists()) {
+            if let Some(paintable) = crate::ui::canvas::lookup_rect_paintable(Some(icon), icon_name, icon_w, icon_h, radius) {
                 self.preview_icon.set_paintable(Some(&paintable));
             } else {
                 self.preview_icon.set_filename(Some(icon));
             }
-            self.preview_icon.set_size_request(icon_w, icon_h);
             self.preview_icon.set_visible(true);
-        } else if let Some(paintable) = crate::ui::canvas::lookup_icon_paintable(None, icon_name, icon_w, 10.0) {
+        } else if let Some(paintable) = crate::ui::canvas::lookup_rect_paintable(None, icon_name, icon_w, icon_h, radius) {
             self.preview_icon.set_paintable(Some(&paintable));
-            self.preview_icon.set_size_request(icon_w, icon_h);
             self.preview_icon.set_visible(true);
         } else {
             self.preview_icon.set_visible(false);
@@ -1285,6 +1462,7 @@ impl PropertyInspector {
                                 let str_opts: Vec<&str> = row.options.iter().map(|s| s.as_str()).collect();
                                 let model = gtk::StringList::new(&str_opts);
                                 dd.set_model(Some(&model));
+                                dd.set_enable_search(row.options.len() > 8);
                             }
                             if row.selected < row.options.len() && dd.selected() as usize != row.selected {
                                 dd.set_selected(row.selected as u32);
@@ -1347,7 +1525,13 @@ impl PropertyInspector {
                             }
                         }
                     }
-                    _ => {}
+                    _ => {
+                        if let Some(lbl) = widget.downcast_ref::<Label>() {
+                            if lbl.text().as_str() != row.subtitle {
+                                lbl.set_text(&row.subtitle);
+                            }
+                        }
+                    }
                 }
             }
             drop(widgets);
@@ -1389,7 +1573,12 @@ impl PropertyInspector {
                 "ComboRow" => {
                     let str_opts: Vec<&str> = row.options.iter().map(|s| s.as_str()).collect();
                     let model = gtk::StringList::new(&str_opts);
-                    let dd = DropDown::new(Some(model), Option::<gtk::Expression>::None);
+                    let search_expr = gtk::PropertyExpression::new(
+                        gtk::StringObject::static_type(),
+                        gtk::Expression::NONE,
+                        "string",
+                    );
+                    let dd = DropDown::new(Some(model), Some(search_expr));
                     dd.set_size_request(280, -1);
                     dd.set_enable_search(row.options.len() > 8);
                     dd.set_sensitive(row.sensitive);
@@ -1611,6 +1800,479 @@ impl PropertyInspector {
         self.dynamic_settings_box.set_visible(true);
     }
 
+    pub fn set_native_host(&self, host: crate::native_sdk::NativePluginHost) {
+        *self.native_host.borrow_mut() = Some(host);
+    }
+
+    pub fn redraw_native_preview(&self, slot: &str) {
+        let cur_slot = match *self.current_target.borrow() {
+            InspectorTarget::Key(k) => format!("key_{k}"),
+            InspectorTarget::Dial(d) => format!("dial_{d}"),
+            InspectorTarget::Touchscreen => "touchscreen".to_string(),
+        };
+        if cur_slot == slot && self.preview_native_da.is_visible() {
+            self.preview_native_da.queue_draw();
+        }
+    }
+
+    /// Renders the interactive Multi-Action Step Sequence Editor inside `self.multi_action_box`.
+    pub fn render_multi_action_editor(&self, slot: &str, act: &KeyAction) {
+        use crate::native_sdk::MultiActionStep;
+
+        while let Some(child) = self.multi_action_box.first_child() {
+            self.multi_action_box.remove(&child);
+        }
+
+        let merged = act.merged_settings_json();
+        let is_two_state = merged
+            .get("mode")
+            .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+            .unwrap_or(0)
+            == 1;
+
+        let active_seq = if is_two_state {
+            self.multi_active_seq.get().min(1)
+        } else {
+            0
+        };
+        let state_key = if active_seq == 1 {
+            "steps_b".to_string()
+        } else {
+            "steps".to_string()
+        };
+
+        // Optional Sequence 1 / Sequence 2 switcher when in Two-State Toggle mode
+        if is_two_state {
+            let seq_row = Box::new(Orientation::Horizontal, 6);
+            let seq_lbl = Label::new(Some("Sequence:"));
+            seq_lbl.set_size_request(100, -1);
+            seq_lbl.set_xalign(0.0);
+
+            let btn_s1 = Button::with_label("State 1");
+            let btn_s2 = Button::with_label("State 2");
+            if active_seq == 0 {
+                btn_s1.add_css_class("suggested-action");
+                btn_s2.add_css_class("flat");
+            } else {
+                btn_s1.add_css_class("flat");
+                btn_s2.add_css_class("suggested-action");
+            }
+            let seq_cell_1 = self.multi_active_seq.clone();
+            let cb_1 = self.on_multi_steps_changed.clone();
+            let slot_1 = slot.to_string();
+            let steps_a_cur: Vec<MultiActionStep> = merged
+                .get("steps")
+                .and_then(|v| serde_json::from_value(v.clone()).ok())
+                .unwrap_or_default();
+            let steps_b_cur: Vec<MultiActionStep> = merged
+                .get("steps_b")
+                .and_then(|v| serde_json::from_value(v.clone()).ok())
+                .unwrap_or_default();
+            let sa_1 = steps_a_cur.clone();
+            btn_s1.connect_clicked(move |_| {
+                seq_cell_1.set(0);
+                if let Some(ref cb) = *cb_1.borrow() {
+                    cb(slot_1.clone(), "steps".to_string(), sa_1.clone());
+                }
+            });
+            let seq_cell_2 = self.multi_active_seq.clone();
+            let cb_2 = self.on_multi_steps_changed.clone();
+            let slot_2 = slot.to_string();
+            let sb_2 = steps_b_cur.clone();
+            btn_s2.connect_clicked(move |_| {
+                seq_cell_2.set(1);
+                if let Some(ref cb) = *cb_2.borrow() {
+                    cb(slot_2.clone(), "steps_b".to_string(), sb_2.clone());
+                }
+            });
+
+            seq_row.append(&seq_lbl);
+            seq_row.append(&btn_s1);
+            seq_row.append(&btn_s2);
+            self.multi_action_box.append(&seq_row);
+        }
+
+        let steps: Vec<MultiActionStep> = merged
+            .get(&state_key)
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default();
+
+        // Add Step Bar
+        let add_row = Box::new(Orientation::Horizontal, 8);
+        let add_lbl = Label::new(Some("Add Step:"));
+        add_lbl.set_size_request(100, -1);
+        add_lbl.set_xalign(0.0);
+
+        let step_kinds = StringList::new(&[
+            "Delay (ms)",
+            "Run Command",
+            "Hotkey",
+            "Type Text",
+            "Launch App",
+            "Open Website",
+            "Media Control",
+            "Switch Page",
+            "Set Brightness",
+            "Trigger Key",
+        ]);
+        let kind_dd = DropDown::new(Some(step_kinds), Option::<gtk::Expression>::None);
+        kind_dd.set_size_request(190, -1);
+
+        let add_btn = Button::with_label("+ Add");
+        add_btn.add_css_class("suggested-action");
+        {
+            let dd_ref = kind_dd.clone();
+            let steps_add = steps.clone();
+            let cb_ref = self.on_multi_steps_changed.clone();
+            let slot_s = slot.to_string();
+            let key_s = state_key.clone();
+            add_btn.connect_clicked(move |_| {
+                let new_step = match dd_ref.selected() {
+                    0 => MultiActionStep::Delay { ms: 500 },
+                    1 => MultiActionStep::RunCommand { command: String::new() },
+                    2 => MultiActionStep::Hotkey { keys: "Ctrl+Shift+M".into() },
+                    3 => MultiActionStep::TypeText { text: String::new(), press_enter: true },
+                    4 => MultiActionStep::LaunchApp { desktop_id: String::new(), app_name: String::new() },
+                    5 => MultiActionStep::OpenUrl { url: "https://".into() },
+                    6 => MultiActionStep::Media { action: "play_pause".into() },
+                    7 => MultiActionStep::SwitchPage { target: "next".into() },
+                    8 => MultiActionStep::Brightness { percent: 80 },
+                    _ => MultiActionStep::TriggerKey { key_index: 0 },
+                };
+                let mut next = steps_add.clone();
+                next.push(new_step);
+                if let Some(ref cb) = *cb_ref.borrow() {
+                    cb(slot_s.clone(), key_s.clone(), next);
+                }
+            });
+        }
+
+        add_row.append(&add_lbl);
+        add_row.append(&kind_dd);
+        add_row.append(&add_btn);
+        self.multi_action_box.append(&add_row);
+
+        if steps.is_empty() {
+            let hint = Label::new(Some("No steps yet — pick an action above and click + Add."));
+            hint.add_css_class("dim-label");
+            hint.set_xalign(0.0);
+            hint.set_margin_start(110);
+            self.multi_action_box.append(&hint);
+            return;
+        }
+
+        // Render ordered step cards
+        for (idx, step) in steps.iter().enumerate() {
+            let card = Box::new(Orientation::Horizontal, 8);
+            card.add_css_class("multi-step-card");
+
+            let badge = Label::new(Some(&format!("{}", idx + 1)));
+            badge.add_css_class("multi-step-badge");
+            badge.set_valign(gtk::Align::Center);
+            card.append(&badge);
+
+            // Inline editor tailored to the step kind
+            match step {
+                MultiActionStep::Delay { ms } => {
+                    let lbl = Label::new(Some("Delay (ms):"));
+                    lbl.set_valign(gtk::Align::Center);
+                    let spin = SpinButton::with_range(50.0, 60000.0, 50.0);
+                    spin.set_value(*ms as f64);
+                    spin.set_size_request(110, -1);
+                    let steps_c = steps.clone();
+                    let cb = self.on_multi_steps_changed.clone();
+                    let s_str = slot.to_string();
+                    let k_str = state_key.clone();
+                    spin.connect_value_changed(move |sp| {
+                        let mut next = steps_c.clone();
+                        if let Some(MultiActionStep::Delay { ms }) = next.get_mut(idx) {
+                            *ms = sp.value().round().max(10.0) as u64;
+                        }
+                        if let Some(ref f) = *cb.borrow() {
+                            f(s_str.clone(), k_str.clone(), next);
+                        }
+                    });
+                    card.append(&lbl);
+                    card.append(&spin);
+                }
+                MultiActionStep::RunCommand { command } => {
+                    let entry = Entry::new();
+                    entry.set_placeholder_text(Some("Shell command..."));
+                    entry.set_text(command);
+                    entry.set_size_request(210, -1);
+                    let steps_c = steps.clone();
+                    let cb = self.on_multi_steps_changed.clone();
+                    let s_str = slot.to_string();
+                    let k_str = state_key.clone();
+                    entry.connect_changed(move |e| {
+                        let mut next = steps_c.clone();
+                        if let Some(MultiActionStep::RunCommand { command }) = next.get_mut(idx) {
+                            *command = e.text().to_string();
+                        }
+                        if let Some(ref f) = *cb.borrow() {
+                            f(s_str.clone(), k_str.clone(), next);
+                        }
+                    });
+                    card.append(&entry);
+                }
+                MultiActionStep::Hotkey { keys } => {
+                    let entry = Entry::new();
+                    entry.set_placeholder_text(Some("Ctrl+Shift+M"));
+                    entry.set_text(keys);
+                    entry.set_size_request(210, -1);
+                    let steps_c = steps.clone();
+                    let cb = self.on_multi_steps_changed.clone();
+                    let s_str = slot.to_string();
+                    let k_str = state_key.clone();
+                    entry.connect_changed(move |e| {
+                        let mut next = steps_c.clone();
+                        if let Some(MultiActionStep::Hotkey { keys }) = next.get_mut(idx) {
+                            *keys = e.text().to_string();
+                        }
+                        if let Some(ref f) = *cb.borrow() {
+                            f(s_str.clone(), k_str.clone(), next);
+                        }
+                    });
+                    card.append(&entry);
+                }
+                MultiActionStep::TypeText { text, .. } => {
+                    let entry = Entry::new();
+                    entry.set_placeholder_text(Some("Text snippet to type..."));
+                    entry.set_text(text);
+                    entry.set_size_request(210, -1);
+                    let steps_c = steps.clone();
+                    let cb = self.on_multi_steps_changed.clone();
+                    let s_str = slot.to_string();
+                    let k_str = state_key.clone();
+                    entry.connect_changed(move |e| {
+                        let mut next = steps_c.clone();
+                        if let Some(MultiActionStep::TypeText { text, .. }) = next.get_mut(idx) {
+                            *text = e.text().to_string();
+                        }
+                        if let Some(ref f) = *cb.borrow() {
+                            f(s_str.clone(), k_str.clone(), next);
+                        }
+                    });
+                    card.append(&entry);
+                }
+                MultiActionStep::LaunchApp { app_name, desktop_id } => {
+                    let btn_label = if !app_name.is_empty() {
+                        format!("App: {}", app_name)
+                    } else if !desktop_id.is_empty() {
+                        format!("App: {}", desktop_id)
+                    } else {
+                        "Choose Application...".to_string()
+                    };
+                    let pick_btn = Button::with_label(&btn_label);
+                    pick_btn.set_size_request(210, -1);
+                    let apps_ref = self.installed_apps.clone();
+                    let steps_c = steps.clone();
+                    let cb = self.on_multi_steps_changed.clone();
+                    let s_str = slot.to_string();
+                    let k_str = state_key.clone();
+                    let anchor = self.container.clone();
+                    pick_btn.connect_clicked(move |_| {
+                        let apps = apps_ref.borrow().clone();
+                        let steps_inner = steps_c.clone();
+                        let cb_inner = cb.clone();
+                        let s_inner = s_str.clone();
+                        let k_inner = k_str.clone();
+                        show_app_picker_dialog(&anchor, &apps, move |picked| {
+                            let mut next = steps_inner.clone();
+                            if let Some(MultiActionStep::LaunchApp { desktop_id, app_name }) = next.get_mut(idx) {
+                                *desktop_id = picked.desktop_id.clone();
+                                *app_name = picked.name.clone();
+                            }
+                            if let Some(ref f) = *cb_inner.borrow() {
+                                f(s_inner.clone(), k_inner.clone(), next);
+                            }
+                        });
+                    });
+                    card.append(&pick_btn);
+                }
+                MultiActionStep::OpenUrl { url } => {
+                    let entry = Entry::new();
+                    entry.set_placeholder_text(Some("https://..."));
+                    entry.set_text(url);
+                    entry.set_size_request(210, -1);
+                    let steps_c = steps.clone();
+                    let cb = self.on_multi_steps_changed.clone();
+                    let s_str = slot.to_string();
+                    let k_str = state_key.clone();
+                    entry.connect_changed(move |e| {
+                        let mut next = steps_c.clone();
+                        if let Some(MultiActionStep::OpenUrl { url }) = next.get_mut(idx) {
+                            *url = e.text().to_string();
+                        }
+                        if let Some(ref f) = *cb.borrow() {
+                            f(s_str.clone(), k_str.clone(), next);
+                        }
+                    });
+                    card.append(&entry);
+                }
+                MultiActionStep::Media { action } => {
+                    let opts = ["play_pause", "play", "pause", "next", "previous", "stop"];
+                    let labels = ["Play / Pause", "Play", "Pause", "Next Track", "Previous Track", "Stop"];
+                    let dd = DropDown::new(Some(StringList::new(&labels)), Option::<gtk::Expression>::None);
+                    dd.set_size_request(210, -1);
+                    if let Some(pos) = opts.iter().position(|o| *o == action.as_str()) {
+                        dd.set_selected(pos as u32);
+                    }
+                    let steps_c = steps.clone();
+                    let cb = self.on_multi_steps_changed.clone();
+                    let s_str = slot.to_string();
+                    let k_str = state_key.clone();
+                    dd.connect_selected_notify(move |d| {
+                        let sel = d.selected() as usize;
+                        if let Some(&val) = opts.get(sel) {
+                            let mut next = steps_c.clone();
+                            if let Some(MultiActionStep::Media { action }) = next.get_mut(idx) {
+                                *action = val.to_string();
+                            }
+                            if let Some(ref f) = *cb.borrow() {
+                                f(s_str.clone(), k_str.clone(), next);
+                            }
+                        }
+                    });
+                    card.append(&dd);
+                }
+                MultiActionStep::SwitchPage { target } => {
+                    let opts = ["next", "prev", "1", "2", "3", "4", "5"];
+                    let labels = ["Next Page", "Previous Page", "Page 1", "Page 2", "Page 3", "Page 4", "Page 5"];
+                    let dd = DropDown::new(Some(StringList::new(&labels)), Option::<gtk::Expression>::None);
+                    dd.set_size_request(210, -1);
+                    if let Some(pos) = opts.iter().position(|o| *o == target.as_str()) {
+                        dd.set_selected(pos as u32);
+                    }
+                    let steps_c = steps.clone();
+                    let cb = self.on_multi_steps_changed.clone();
+                    let s_str = slot.to_string();
+                    let k_str = state_key.clone();
+                    dd.connect_selected_notify(move |d| {
+                        let sel = d.selected() as usize;
+                        if let Some(&val) = opts.get(sel) {
+                            let mut next = steps_c.clone();
+                            if let Some(MultiActionStep::SwitchPage { target }) = next.get_mut(idx) {
+                                *target = val.to_string();
+                            }
+                            if let Some(ref f) = *cb.borrow() {
+                                f(s_str.clone(), k_str.clone(), next);
+                            }
+                        }
+                    });
+                    card.append(&dd);
+                }
+                MultiActionStep::Brightness { percent } => {
+                    let lbl = Label::new(Some("Brightness %:"));
+                    lbl.set_valign(gtk::Align::Center);
+                    let spin = SpinButton::with_range(0.0, 100.0, 5.0);
+                    spin.set_value(*percent as f64);
+                    spin.set_size_request(100, -1);
+                    let steps_c = steps.clone();
+                    let cb = self.on_multi_steps_changed.clone();
+                    let s_str = slot.to_string();
+                    let k_str = state_key.clone();
+                    spin.connect_value_changed(move |sp| {
+                        let mut next = steps_c.clone();
+                        if let Some(MultiActionStep::Brightness { percent }) = next.get_mut(idx) {
+                            *percent = sp.value().round().clamp(0.0, 100.0) as u8;
+                        }
+                        if let Some(ref f) = *cb.borrow() {
+                            f(s_str.clone(), k_str.clone(), next);
+                        }
+                    });
+                    card.append(&lbl);
+                    card.append(&spin);
+                }
+                MultiActionStep::TriggerKey { key_index } => {
+                    let lbl = Label::new(Some("Trigger Key #:"));
+                    lbl.set_valign(gtk::Align::Center);
+                    let spin = SpinButton::with_range(1.0, 36.0, 1.0);
+                    spin.set_value((*key_index + 1) as f64);
+                    spin.set_size_request(100, -1);
+                    let steps_c = steps.clone();
+                    let cb = self.on_multi_steps_changed.clone();
+                    let s_str = slot.to_string();
+                    let k_str = state_key.clone();
+                    spin.connect_value_changed(move |sp| {
+                        let mut next = steps_c.clone();
+                        if let Some(MultiActionStep::TriggerKey { key_index }) = next.get_mut(idx) {
+                            *key_index = (sp.value().round() as usize).saturating_sub(1);
+                        }
+                        if let Some(ref f) = *cb.borrow() {
+                            f(s_str.clone(), k_str.clone(), next);
+                        }
+                    });
+                    card.append(&lbl);
+                    card.append(&spin);
+                }
+            }
+
+            // Reorder Up / Down & Remove buttons
+            let up_btn = Button::from_icon_name("go-up-symbolic");
+            up_btn.add_css_class("flat");
+            up_btn.set_sensitive(idx > 0);
+            {
+                let steps_c = steps.clone();
+                let cb = self.on_multi_steps_changed.clone();
+                let s_str = slot.to_string();
+                let k_str = state_key.clone();
+                up_btn.connect_clicked(move |_| {
+                    if idx > 0 && idx < steps_c.len() {
+                        let mut next = steps_c.clone();
+                        next.swap(idx - 1, idx);
+                        if let Some(ref f) = *cb.borrow() {
+                            f(s_str.clone(), k_str.clone(), next);
+                        }
+                    }
+                });
+            }
+
+            let down_btn = Button::from_icon_name("go-down-symbolic");
+            down_btn.add_css_class("flat");
+            down_btn.set_sensitive(idx + 1 < steps.len());
+            {
+                let steps_c = steps.clone();
+                let cb = self.on_multi_steps_changed.clone();
+                let s_str = slot.to_string();
+                let k_str = state_key.clone();
+                down_btn.connect_clicked(move |_| {
+                    if idx + 1 < steps_c.len() {
+                        let mut next = steps_c.clone();
+                        next.swap(idx, idx + 1);
+                        if let Some(ref f) = *cb.borrow() {
+                            f(s_str.clone(), k_str.clone(), next);
+                        }
+                    }
+                });
+            }
+
+            let del_btn = Button::from_icon_name("user-trash-symbolic");
+            del_btn.add_css_class("flat");
+            del_btn.add_css_class("destructive-action");
+            {
+                let steps_c = steps.clone();
+                let cb = self.on_multi_steps_changed.clone();
+                let s_str = slot.to_string();
+                let k_str = state_key.clone();
+                del_btn.connect_clicked(move |_| {
+                    let mut next = steps_c.clone();
+                    if idx < next.len() {
+                        next.remove(idx);
+                    }
+                    if let Some(ref f) = *cb.borrow() {
+                        f(s_str.clone(), k_str.clone(), next);
+                    }
+                });
+            }
+
+            card.append(&up_btn);
+            card.append(&down_btn);
+            card.append(&del_btn);
+            self.multi_action_box.append(&card);
+        }
+    }
+
     pub fn mark_assigned(&self) {
         self.delete_button.set_sensitive(true);
         let target = *self.current_target.borrow();
@@ -1623,6 +2285,131 @@ impl PropertyInspector {
             _ => {}
         }
     }
+}
+
+/// Midnight-themed Visual Application Picker Dialog showing each desktop application's real icon + name
+/// with instant search filtering — zero typing commands required!
+pub fn show_app_picker_dialog<F: Fn(InstalledApp) + 'static>(
+    parent: &impl IsA<gtk::Widget>,
+    apps: &[InstalledApp],
+    on_picked: F,
+) {
+    let dialog = adw::Dialog::builder()
+        .title("Choose Application")
+        .content_width(440)
+        .content_height(520)
+        .build();
+
+    let root = Box::new(Orientation::Vertical, 12);
+    root.add_css_class("app-picker-root");
+
+    let header_row = Box::new(Orientation::Horizontal, 8);
+    let heading = Label::new(Some("Choose Application"));
+    heading.add_css_class("title-3");
+    heading.set_xalign(0.0);
+    heading.set_hexpand(true);
+
+    let close_btn = Button::from_icon_name("window-close-symbolic");
+    close_btn.add_css_class("flat");
+    close_btn.add_css_class("circular");
+    let dlg_close = dialog.clone();
+    close_btn.connect_clicked(move |_| {
+        dlg_close.close();
+    });
+    header_row.append(&heading);
+    header_row.append(&close_btn);
+    root.append(&header_row);
+
+    let search = gtk::SearchEntry::new();
+    search.set_placeholder_text(Some("Search installed applications..."));
+    search.add_css_class("store-search-entry");
+    root.append(&search);
+
+    let scrolled = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vscrollbar_policy(gtk::PolicyType::Automatic)
+        .vexpand(true)
+        .build();
+
+    let list_box = Box::new(Orientation::Vertical, 4);
+    let on_picked_rc = Rc::new(on_picked);
+    let mut row_entries: Vec<(Button, String)> = Vec::new();
+
+    for app in apps {
+        let row_btn = Button::new();
+        row_btn.add_css_class("flat");
+        row_btn.add_css_class("app-picker-row");
+
+        let inner = Box::new(Orientation::Horizontal, 12);
+        inner.set_halign(gtk::Align::Fill);
+
+        let icon_img = if !app.icon.is_empty() && std::path::Path::new(&app.icon).exists() {
+            let img = gtk::Image::from_file(&app.icon);
+            img.set_pixel_size(32);
+            img
+        } else if !app.icon.is_empty() {
+            let img = gtk::Image::from_icon_name(&app.icon);
+            img.set_pixel_size(32);
+            img
+        } else {
+            let img = gtk::Image::from_icon_name("application-x-executable-symbolic");
+            img.set_pixel_size(32);
+            img
+        };
+
+        let text_col = Box::new(Orientation::Vertical, 2);
+        text_col.set_valign(gtk::Align::Center);
+        text_col.set_hexpand(true);
+
+        let name_lbl = Label::new(Some(&app.name));
+        name_lbl.set_xalign(0.0);
+        name_lbl.add_css_class("heading");
+        name_lbl.set_ellipsize(pango::EllipsizeMode::End);
+
+        let id_lbl = Label::new(Some(app.desktop_id.trim_end_matches(".desktop")));
+        id_lbl.set_xalign(0.0);
+        id_lbl.add_css_class("dim-label");
+        id_lbl.set_ellipsize(pango::EllipsizeMode::End);
+
+        text_col.append(&name_lbl);
+        text_col.append(&id_lbl);
+        inner.append(&icon_img);
+        inner.append(&text_col);
+        row_btn.set_child(Some(&inner));
+
+        let app_clone = app.clone();
+        let cb = on_picked_rc.clone();
+        let dlg_pick = dialog.clone();
+        row_btn.connect_clicked(move |_| {
+            cb(app_clone.clone());
+            dlg_pick.close();
+        });
+
+        list_box.append(&row_btn);
+        let search_key = format!("{} {}", app.name.to_lowercase(), app.desktop_id.to_lowercase());
+        row_entries.push((row_btn, search_key));
+    }
+
+    if apps.is_empty() {
+        let empty = Label::new(Some("Scanning desktop applications... try again in a moment."));
+        empty.add_css_class("dim-label");
+        empty.set_margin_top(24);
+        list_box.append(&empty);
+    }
+
+    let entries_rc = Rc::new(row_entries);
+    search.connect_search_changed(move |se| {
+        let q = se.text().trim().to_lowercase();
+        for (btn, key) in entries_rc.iter() {
+            btn.set_visible(q.is_empty() || key.contains(&q));
+        }
+    });
+
+    scrolled.set_child(Some(&list_box));
+    root.append(&scrolled);
+    dialog.set_child(Some(&root));
+    dialog.present(Some(parent));
+    search.grab_focus();
 }
 
 pub fn get_action_description(action_id: &str, action_name: &str, plugin_name: &str) -> String {

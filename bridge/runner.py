@@ -155,9 +155,11 @@ def flatten_config_widgets(raw_widgets) -> list:
             return
         seen.add(w)
 
-        # ExpanderRow: emit itself if it has an enable switch, AND walk its inner rows
+        # ExpanderRow: emit itself (as SwitchRow if show_enable_switch else ActionRow header), AND walk its inner rows
         if isinstance(w, Adw.ExpanderRow):
-            if hasattr(w, "get_show_enable_switch") and w.get_show_enable_switch():
+            show_sw = hasattr(w, "get_show_enable_switch") and bool(w.get_show_enable_switch())
+            has_label = bool((w.get_title() if hasattr(w, "get_title") else "") or (w.get_subtitle() if hasattr(w, "get_subtitle") else ""))
+            if show_sw or has_label:
                 collected.append(w)
             # Walk child rows added to expander
             if hasattr(w, "_rows") and isinstance(w._rows, list):
@@ -257,16 +259,26 @@ def serialize_widget_row(row, idx: int) -> dict:
             "active": bool(row.get_active()),
         }
 
-    # 3. Adw.ExpanderRow with enable switch
+    # 3. Adw.ExpanderRow (SwitchRow only when show_enable_switch=True; otherwise header/status ActionRow)
     if isinstance(row, Adw.ExpanderRow):
+        show_sw = hasattr(row, "get_show_enable_switch") and bool(row.get_show_enable_switch())
+        if show_sw:
+            return {
+                "index": idx,
+                "type": "SwitchRow",
+                "title": title,
+                "subtitle": subtitle,
+                "visible": visible,
+                "sensitive": sensitive,
+                "active": bool(row.get_enable_expansion()),
+            }
         return {
             "index": idx,
-            "type": "SwitchRow",
+            "type": "ActionRow",
             "title": title,
             "subtitle": subtitle,
             "visible": visible,
             "sensitive": sensitive,
-            "active": bool(row.get_enable_expansion()),
         }
 
     # 4. Adw.PasswordEntryRow (MUST check BEFORE Adw.EntryRow because PasswordEntryRow subclasses EntryRow!)
@@ -647,12 +659,21 @@ def apply_row_mutation(row, req: dict) -> str:
     return "ignored"
 
 
-def attach_widget_listeners(rows: list, emit_fn):
+def attach_widget_listeners(rows: list, emit_fn, bound_ids: set = None):
     """Attach GTK change signals on every row widget so asynchronous plugin updates stream live to Ballista."""
     for row in rows:
+        if bound_ids is not None:
+            rid = id(row)
+            if rid in bound_ids:
+                continue
+            bound_ids.add(rid)
         try:
             row.connect("notify::visible", lambda *_: emit_fn())
             row.connect("notify::sensitive", lambda *_: emit_fn())
+            if hasattr(row, "get_subtitle"):
+                row.connect("notify::subtitle", lambda *_: emit_fn())
+            if hasattr(row, "get_title"):
+                row.connect("notify::title", lambda *_: emit_fn())
         except Exception:
             pass
 
@@ -678,6 +699,9 @@ def attach_widget_listeners(rows: list, emit_fn):
 
         elif isinstance(row, Adw.ExpanderRow):
             row.connect("notify::enable-expansion", lambda *_: emit_fn())
+            row.connect("notify::expanded", lambda *_: emit_fn())
+            if hasattr(row, "_on_rows_changed_callbacks") and isinstance(row._on_rows_changed_callbacks, list):
+                row._on_rows_changed_callbacks.append(emit_fn)
 
         elif isinstance(row, (Adw.PasswordEntryRow, Adw.EntryRow)):
             row.connect("changed", lambda *_: emit_fn())
@@ -747,8 +771,12 @@ class BridgeRunner:
     def __init__(self):
         self.plugins = {}                     # plugin_id -> PluginBase instance
         self.actions = {}                     # slot -> ActionCore/ActionBase instance
+        self.action_root_widgets = {}         # slot -> root GTK widgets for dynamic re-flattening
         self.action_config_rows = {}          # slot -> flattened list of GTK widgets
+        self.action_bound_ids = {}            # slot -> set of widget ids with attached listeners
+        self.plugin_settings_root_widgets = {}
         self.plugin_settings_rows = {}        # plugin_id -> flattened list of GTK widgets
+        self.plugin_settings_bound_ids = {}
         self._pending_emit_rows = set()
         self._pending_emit_plugin_rows = set()
         self._last_action_rows_hash = {}
@@ -832,7 +860,21 @@ class BridgeRunner:
             self._pending_emit_rows.discard(slot)
             if slot not in self.actions:
                 return False
-            rows = self.action_config_rows.get(slot, [])
+            roots = self.action_root_widgets.get(slot)
+            if roots is not None:
+                rows = flatten_config_widgets(roots)
+                self.action_config_rows[slot] = rows
+                bound = self.action_bound_ids.setdefault(slot, set())
+                emit_cb = lambda s=slot: self.emit_action_config_rows(s)
+                attach_widget_listeners(rows, emit_cb, bound_ids=bound)
+                for rw in roots:
+                    if isinstance(rw, Adw.ExpanderRow) and hasattr(rw, "_on_rows_changed_callbacks"):
+                        eid = ("exp", id(rw))
+                        if eid not in bound:
+                            bound.add(eid)
+                            rw._on_rows_changed_callbacks.append(emit_cb)
+            else:
+                rows = self.action_config_rows.get(slot, [])
             rows_data = [serialize_widget_row(r, idx) for idx, r in enumerate(rows)]
             sig = json.dumps(rows_data, sort_keys=True)
             if not force and self._last_action_rows_hash.get(slot) == sig:
@@ -850,7 +892,15 @@ class BridgeRunner:
 
         def _do_emit():
             self._pending_emit_plugin_rows.discard(plugin_id)
-            rows = self.plugin_settings_rows.get(plugin_id, [])
+            roots = self.plugin_settings_root_widgets.get(plugin_id)
+            if roots is not None:
+                rows = flatten_config_widgets(roots)
+                self.plugin_settings_rows[plugin_id] = rows
+                bound = self.plugin_settings_bound_ids.setdefault(plugin_id, set())
+                emit_cb = lambda pid=plugin_id: self.emit_plugin_settings_rows(pid)
+                attach_widget_listeners(rows, emit_cb, bound_ids=bound)
+            else:
+                rows = self.plugin_settings_rows.get(plugin_id, [])
             rows_data = [serialize_widget_row(r, idx) for idx, r in enumerate(rows)]
             sig = json.dumps(rows_data, sort_keys=True)
             if not force and self._last_plugin_rows_hash.get(plugin_id) == sig:
@@ -1145,10 +1195,20 @@ class BridgeRunner:
         if custom_area is not None:
             raw_widgets.append(custom_area)
 
+        self.action_root_widgets[slot] = list(raw_widgets)
         rows = flatten_config_widgets(raw_widgets)
         self.action_config_rows[slot] = rows
+        bound = set()
+        self.action_bound_ids[slot] = bound
         self._last_action_rows_hash.pop(slot, None)
-        attach_widget_listeners(rows, lambda s=slot: self.emit_action_config_rows(s))
+        emit_cb = lambda s=slot: self.emit_action_config_rows(s)
+        attach_widget_listeners(rows, emit_cb, bound_ids=bound)
+        for rw in raw_widgets:
+            if isinstance(rw, Adw.ExpanderRow) and hasattr(rw, "_on_rows_changed_callbacks"):
+                eid = ("exp", id(rw))
+                if eid not in bound:
+                    bound.add(eid)
+                    rw._on_rows_changed_callbacks.append(emit_cb)
         self.emit_action_config_rows(slot, force=True)
 
         logger.info(f"Created action instance for slot {slot}: {action_id} ({len(rows)} live config rows)")
@@ -1156,7 +1216,9 @@ class BridgeRunner:
 
     def handle_destroy_action(self, slot: str):
         old_act = self.actions.pop(slot, None)
+        self.action_root_widgets.pop(slot, None)
         self.action_config_rows.pop(slot, None)
+        self.action_bound_ids.pop(slot, None)
         self._last_action_rows_hash.pop(slot, None)
         if old_act is not None:
             try:
@@ -1233,10 +1295,13 @@ class BridgeRunner:
         except Exception as e:
             logger.warning(f"Error calling {plugin_id}.get_config_rows(): {e}")
 
+        self.plugin_settings_root_widgets[plugin_id] = list(raw_widgets)
         rows = flatten_config_widgets(raw_widgets)
         self.plugin_settings_rows[plugin_id] = rows
+        bound = set()
+        self.plugin_settings_bound_ids[plugin_id] = bound
         self._last_plugin_rows_hash.pop(plugin_id, None)
-        attach_widget_listeners(rows, lambda pid=plugin_id: self.emit_plugin_settings_rows(pid))
+        attach_widget_listeners(rows, lambda pid=plugin_id: self.emit_plugin_settings_rows(pid), bound_ids=bound)
         self.emit_plugin_settings_rows(plugin_id, force=True)
         return {"status": "ok", "count": len(rows)}
 
@@ -1334,8 +1399,8 @@ class BridgeRunner:
         for slot, action in list(self.actions.items()):
             if not getattr(action, "on_ready_called", False):
                 continue
-            # Only call on_tick if subclass actually implements it
-            if type(action).on_tick is not type(action).__mro__[-2].on_tick if len(type(action).__mro__) >= 2 else True:
+            # Only call on_tick if subclass actually implements it (ActionCore may inherit rpyc.Service)
+            if getattr(type(action), "on_tick", None) is not ActionCore.on_tick:
                 try:
                     action.on_tick()
                 except Exception as e:

@@ -1,9 +1,9 @@
 #![allow(deprecated)]
 
-use crate::core::{ConnectedDevice, HardwareManager};
-use crate::models::{DeviceKind, Profile};
+use crate::core::{autostart, ConnectedDevice, HardwareManager};
+use crate::models::{CloseBehavior, DeviceKind, Profile, WindowState};
 use adw::prelude::*;
-use adw::{ActionRow, EntryRow, PreferencesGroup, PreferencesPage, PreferencesWindow, SwitchRow};
+use adw::{ActionRow, ComboRow, EntryRow, PreferencesGroup, PreferencesPage, PreferencesWindow, SwitchRow};
 use gtk::{Adjustment, Box, Button, Image, ListBox, Orientation, Popover};
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -81,8 +81,9 @@ pub fn create_settings_window(
     dev_row.add_suffix(&dev_dropdown);
     hardware_group.add(&dev_row);
 
-    // Settings-local device path tracker for brightness and name
+    // Settings-local device path & stable key tracker for brightness and name
     let settings_device_path = Rc::new(RefCell::new(initial_dev.as_ref().map(|d| d.dev_path.clone())));
+    let settings_device_key = Rc::new(RefCell::new(initial_dev.as_ref().map(|d| d.stable_key())));
 
     // 2. Custom Device Name Entry (Matching Mockup)
     let initial_name = initial_dev.as_ref().map(|d| d.name.as_str()).unwrap_or("Stream Deck");
@@ -93,23 +94,39 @@ pub fn create_settings_window(
         .build();
     hardware_group.add(&name_row);
 
+    // 3. Brightness Adjustment Slider (persisted per device in WindowState::device_brightness)
+    let initial_bright = initial_dev
+        .as_ref()
+        .map(|d| WindowState::load().brightness_for(&d.stable_key()) as f64)
+        .unwrap_or(80.0);
+    let brightness_adj = Adjustment::new(initial_bright, 0.0, 100.0, 5.0, 10.0, 0.0);
+    let syncing_bright = Rc::new(std::cell::Cell::new(false));
+
     // Handle device dropdown changes in Settings:
-    // Only updates settings_device_path for brightness & name adjustment.
+    // Only updates settings_device_path/key for brightness & name adjustment.
     // DOES NOT touch the main application GUI device or canvas.
     let act_path_for_dev = settings_device_path.clone();
+    let act_key_for_dev = settings_device_key.clone();
     let conn_devs_for_dd = connected_devices.clone();
     let name_row_clone = name_row.clone();
+    let bright_adj_dd = brightness_adj.clone();
+    let sync_bright_dd = syncing_bright.clone();
 
     dev_dropdown.connect_selected_notify(move |dd| {
         let new_idx = dd.selected() as usize;
         let devs = conn_devs_for_dd.borrow();
         if let Some(dev) = devs.get(new_idx) {
             *act_path_for_dev.borrow_mut() = Some(dev.dev_path.clone());
+            let skey = dev.stable_key();
+            *act_key_for_dev.borrow_mut() = Some(skey.clone());
             name_row_clone.set_text(&dev.name);
+            let saved_b = WindowState::load().brightness_for(&skey) as f64;
+            sync_bright_dd.set(true);
+            bright_adj_dd.set_value(saved_b);
+            sync_bright_dd.set(false);
         }
     });
 
-    // 3. Brightness Adjustment Slider (Matching Mockup: [ low-sun ] ─────O───── [ high-sun ])
     let brightness_row = ActionRow::builder()
         .title("Brightness")
         .subtitle("Adjust physical hardware backlight intensity")
@@ -123,7 +140,6 @@ pub fn create_settings_window(
     icon_dim.set_pixel_size(18);
     icon_dim.add_css_class("dim-label");
 
-    let brightness_adj = Adjustment::new(80.0, 0.0, 100.0, 5.0, 10.0, 0.0);
     let scale = gtk::Scale::builder()
         .orientation(Orientation::Horizontal)
         .adjustment(&brightness_adj)
@@ -138,10 +154,20 @@ pub fn create_settings_window(
 
     let hw_bright = hardware_manager.clone();
     let dev_bright = settings_device_path.clone();
+    let dev_key_bright = settings_device_key.clone();
+    let sync_bright_chg = syncing_bright.clone();
     brightness_adj.connect_value_changed(move |adj| {
+        if sync_bright_chg.get() {
+            return;
+        }
         let val = adj.value() as u8;
         if let Some(ref path) = *dev_bright.borrow() {
             let _ = hw_bright.borrow().set_brightness(path, val);
+        }
+        if let Some(ref skey) = *dev_key_bright.borrow() {
+            let mut st = WindowState::load();
+            st.set_brightness_for(skey, val);
+            st.save();
         }
     });
 
@@ -439,14 +465,49 @@ pub fn create_settings_window(
 
     let system_group = PreferencesGroup::builder()
         .title("System Integration")
+        .description("Configure instant desktop login startup and background tray behavior")
         .build();
 
     let autostart_row = SwitchRow::builder()
         .title("Start on login")
-        .subtitle("Automatically launch Ballista background service on desktop login")
-        .active(false)
+        .subtitle("Launch Ballista background service automatically as soon as your desktop session starts")
+        .active(autostart::is_autostart_enabled())
         .build();
+    autostart_row.connect_active_notify(|sw| {
+        if let Err(e) = autostart::set_autostart_enabled(sw.is_active()) {
+            tracing::warn!("Failed to update autostart setting: {e}");
+        }
+    });
     system_group.add(&autostart_row);
+
+    let close_options = gtk::StringList::new(&[
+        "Ask Every Time",
+        "Keep Running in Tray",
+        "Quit Ballista",
+    ]);
+    let initial_close_idx = match WindowState::load().close_behavior {
+        CloseBehavior::Ask => 0,
+        CloseBehavior::MinimizeToTray => 1,
+        CloseBehavior::Quit => 2,
+    };
+    let close_behavior_row = ComboRow::builder()
+        .title("When Closing Window")
+        .subtitle("Choose whether closing the window hides Ballista to the system tray or quits completely")
+        .model(&close_options)
+        .selected(initial_close_idx)
+        .build();
+    close_behavior_row.connect_selected_notify(|row| {
+        let behavior = match row.selected() {
+            1 => CloseBehavior::MinimizeToTray,
+            2 => CloseBehavior::Quit,
+            _ => CloseBehavior::Ask,
+        };
+        let mut st = WindowState::load();
+        st.close_behavior = behavior;
+        st.save();
+    });
+    system_group.add(&close_behavior_row);
+
     system_page.add(&system_group);
 
     let storage_group = PreferencesGroup::builder()

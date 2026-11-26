@@ -72,15 +72,46 @@ headerbar.ballista-headerbar {
     padding: 24px;
 }
 
-/* Flatter, cleaner buttons matching modern card aesthetic */
+/* Suppress Libadwaita's raw square :drop(active) outline/box-shadow so every target uses shape-matched indicators */
+.deck-canvas *:drop(active),
+.deck-canvas *:drop(active):focus,
+.deck-canvas:drop(active),
+.deck-dial-wrapper:drop(active),
+.deck-dial-wrapper:drop(active):focus,
+.deck-touch-slot:drop(active),
+.deck-touch-slot:drop(active):focus,
+.deck-touchscreen-capsule:drop(active),
+.deck-touchscreen-capsule:drop(active):focus {
+    outline: none;
+    outline-width: 0;
+    outline-color: transparent;
+    box-shadow: none;
+    border-color: transparent;
+}
+
+.deck-touchscreen-capsule:drop(active),
+.deck-touchscreen-capsule:drop(active):focus {
+    border-color: rgba(255, 255, 255, 0.08);
+}
+
+.deck-key:drop(active),
+.deck-key:drop(active):focus {
+    outline: none;
+    box-shadow: none;
+}
+
+/* Flatter, cleaner buttons matching modern card aesthetic with GPU-accelerated press animation */
 .deck-key {
     background-color: #191920;
     border: 2px solid rgba(255, 255, 255, 0.08);
     border-radius: 13px;
     padding: 0;
     box-shadow: none;
-    transition: none;
-    transform: none;
+    transform: scale(1.0);
+    transition: transform 115ms cubic-bezier(0.2, 0.8, 0.2, 1),
+                border-color 90ms ease-out,
+                box-shadow 90ms ease-out,
+                filter 90ms ease-out;
 }
 
 .deck-key picture {
@@ -90,25 +121,72 @@ headerbar.ballista-headerbar {
 .deck-key:hover {
     background-color: #21212c;
     border-color: rgba(145, 70, 255, 0.45);
-    transition: none;
-    transform: none;
 }
 
-.deck-key:active,
-.deck-key.pressed {
-    background-color: #262635;
-    border-color: #b072ff;
-    box-shadow: inset 0 2px 6px rgba(0, 0, 0, 0.7), 0 0 10px rgba(145, 70, 255, 0.55);
-    filter: brightness(1.18);
-    transition: none;
-    transform: none;
+.deck-key:active {
+    transform: scale(0.96);
+    transition: transform 60ms ease-out;
 }
 
 .deck-key.selected {
     border: 2px solid #9146ff;
     box-shadow: 0 0 12px rgba(145, 70, 255, 0.45);
-    transition: none;
-    transform: none;
+}
+
+.deck-key.pressed {
+    border-color: #b072ff;
+    box-shadow: 0 0 16px rgba(145, 70, 255, 0.65);
+    transform: scale(0.90);
+    filter: brightness(0.88);
+    transition: transform 65ms cubic-bezier(0.2, 0, 0, 1),
+                border-color 65ms ease-out,
+                box-shadow 65ms ease-out,
+                filter 65ms ease-out;
+}
+
+.deck-key-press-veil {
+    background-color: transparent;
+    border-radius: 11px;
+    box-shadow: none;
+    transition: background-color 75ms ease-out, box-shadow 75ms ease-out;
+}
+
+.deck-key.pressed .deck-key-press-veil {
+    background-color: rgba(0, 0, 0, 0.22);
+    box-shadow: inset 0 3px 10px rgba(0, 0, 0, 0.72);
+}
+
+.deck-key.drop-hover,
+.deck-key.drop-hover:drop(active),
+.deck-key.drop-hover:drop(active):focus {
+    border-color: #b072ff;
+    box-shadow: 0 0 16px rgba(145, 70, 255, 0.65);
+}
+
+.deck-key-drop-veil {
+    background-color: rgba(145, 70, 255, 0.26);
+    border-radius: 11px;
+    box-shadow: inset 0 0 0 1px rgba(216, 180, 254, 0.55);
+}
+
+.deck-touch-drop-veil {
+    background-color: rgba(145, 70, 255, 0.26);
+    box-shadow: inset 0 0 0 1.5px rgba(176, 114, 255, 0.75);
+}
+
+.deck-drop-plus {
+    color: #f3e8ff;
+    -gtk-icon-shadow: 0 1px 4px rgba(0, 0, 0, 0.65);
+}
+
+.deck-key.drag-source {
+    opacity: 0.42;
+    border-style: dashed;
+    border-color: rgba(145, 70, 255, 0.68);
+}
+
+.deck-touch-slot.drag-source {
+    opacity: 0.42;
 }
 
 .deck-key-label {
@@ -124,8 +202,6 @@ headerbar.ballista-headerbar {
     border: 2px solid rgba(255, 255, 255, 0.08);
     border-radius: 13px;
     padding: 0;
-    margin-top: 2px;
-    margin-bottom: 2px;
     box-shadow: none;
     transition: none;
     transform: none;
@@ -146,24 +222,12 @@ headerbar.ballista-headerbar {
 .deck-touch-slot {
     background: transparent;
     border: none;
-    border-radius: 8px;
-    padding: 0 4px;
-    color: #8a8a9e;
+    border-radius: 0;
+    padding: 0;
+    color: #e4e4e7;
     font-size: 11px;
     font-weight: 600;
-    transition: all 120ms ease;
     box-shadow: none;
-}
-
-.deck-touch-slot:hover {
-    background-color: rgba(145, 70, 255, 0.12);
-    color: #ffffff;
-}
-
-.deck-touch-slot.selected {
-    background-color: rgba(145, 70, 255, 0.22);
-    color: #ffffff;
-    box-shadow: inset 0 0 0 2px #9146ff;
 }
 
 /* Stream Deck + Rotary Dial Knobs */
@@ -204,6 +268,75 @@ headerbar.ballista-headerbar {
     border-radius: 22px;
     padding: 3px 8px;
     transition: all 220ms cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
+/* Folder Breadcrumb Navigation Bar */
+.folder-breadcrumb-pill {
+    background-color: #191924;
+    border: 1px solid rgba(145, 70, 255, 0.40);
+    border-radius: 20px;
+    padding: 3px 12px 3px 6px;
+    box-shadow: 0 2px 10px rgba(145, 70, 255, 0.22);
+}
+
+.folder-back-btn {
+    background-color: rgba(145, 70, 255, 0.22);
+    color: #e9d5ff;
+    border-radius: 14px;
+    padding: 2px 10px;
+    font-size: 12px;
+    font-weight: 700;
+}
+
+.folder-back-btn:hover {
+    background-color: #9146ff;
+    color: #ffffff;
+}
+
+.folder-breadcrumb-icon {
+    color: #a866ff;
+}
+
+.folder-breadcrumb-label {
+    font-size: 12px;
+    font-weight: 600;
+    color: #e4e4e7;
+}
+
+/* Visual Application Picker & Multi-Action Step Editor */
+.app-picker-root {
+    background-color: #141418;
+    color: #e4e4e7;
+    padding: 18px 20px;
+}
+
+.app-picker-row {
+    background-color: #1b1b24;
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    border-radius: 10px;
+    padding: 8px 12px;
+    margin: 3px 0;
+}
+
+.app-picker-row:hover {
+    background-color: rgba(145, 70, 255, 0.18);
+    border-color: rgba(145, 70, 255, 0.55);
+}
+
+.multi-step-card {
+    background-color: #1a1a22;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 10px;
+    padding: 6px 10px;
+}
+
+.multi-step-badge {
+    background-color: rgba(145, 70, 255, 0.25);
+    color: #d8b4fe;
+    border-radius: 8px;
+    padding: 1px 7px;
+    font-size: 11px;
+    font-weight: 700;
 }
 
 .page-caption {
@@ -291,6 +424,22 @@ headerbar.ballista-headerbar {
     min-height: 80px;
 }
 
+.inspector-dial-tile {
+    background-color: #191920;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 10px;
+    min-width: 160px;
+    min-height: 80px;
+}
+
+.inspector-touch-tile {
+    background-color: #191920;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 8px;
+    min-width: 160px;
+    min-height: 24px;
+}
+
 /* Vertical & Horizontal Resizable Splitters */
 paned > separator {
     background-color: rgba(255, 255, 255, 0.08);
@@ -356,6 +505,33 @@ paned > separator:hover {
 .action-row:hover {
     background-color: rgba(145, 70, 255, 0.16);
     color: #ffffff;
+}
+
+/* Native Action Surface Exclusivity Badges (KEY / DIAL / KEY · DIAL) */
+.cap-badge {
+    font-size: 9px;
+    font-weight: 800;
+    letter-spacing: 0.45px;
+    border-radius: 6px;
+    padding: 2px 6px;
+}
+
+.cap-badge-key {
+    background-color: rgba(255, 255, 255, 0.08);
+    color: rgba(228, 228, 231, 0.72);
+    border: 1px solid rgba(255, 255, 255, 0.10);
+}
+
+.cap-badge-dial {
+    background-color: rgba(20, 184, 166, 0.18);
+    color: #5eead4;
+    border: 1px solid rgba(45, 212, 191, 0.42);
+}
+
+.cap-badge-both {
+    background-color: rgba(145, 70, 255, 0.18);
+    color: #d8b4fe;
+    border: 1px solid rgba(168, 85, 247, 0.38);
 }
 
 /* ===================== Midnight Theme for Modals, Settings & Store ===================== */
@@ -632,4 +808,85 @@ window.ballista-modal .boxed-list > row:last-child {
     border: 1px solid rgba(255, 255, 255, 0.08);
     border-radius: 0px;
     min-height: 105px;
+}
+
+/* Polished Plugin Install Result Dialog */
+.install-result-root {
+    background-color: #141418;
+    color: #e4e4e7;
+    padding: 24px 26px 22px 26px;
+}
+
+.install-badge-success {
+    background-color: rgba(34, 197, 94, 0.16);
+    border: 2px solid rgba(34, 197, 94, 0.55);
+    color: #4ade80;
+    border-radius: 999px;
+    min-width: 54px;
+    min-height: 54px;
+    box-shadow: 0 0 18px rgba(34, 197, 94, 0.25);
+}
+
+.install-badge-error {
+    background-color: rgba(239, 68, 68, 0.16);
+    border: 2px solid rgba(239, 68, 68, 0.55);
+    color: #f87171;
+    border-radius: 999px;
+    min-width: 54px;
+    min-height: 54px;
+    box-shadow: 0 0 18px rgba(239, 68, 68, 0.25);
+}
+
+.install-thumb-badge {
+    background-color: #22c55e;
+    color: #ffffff;
+    border: 2px solid #141418;
+    border-radius: 999px;
+    min-width: 24px;
+    min-height: 24px;
+}
+
+.install-plugin-card {
+    background-color: #1c1c24;
+    border: 1px solid rgba(255, 255, 255, 0.09);
+    border-radius: 12px;
+    padding: 12px 16px;
+}
+
+.install-version-pill {
+    background-color: rgba(145, 70, 255, 0.18);
+    border: 1px solid rgba(145, 70, 255, 0.4);
+    color: #d8b4fe;
+    border-radius: 999px;
+    padding: 2px 9px;
+    font-size: 11px;
+    font-weight: 700;
+}
+
+.install-primary-btn {
+    background-color: #9146ff;
+    color: #ffffff;
+    font-weight: 700;
+    border-radius: 10px;
+    padding: 8px 20px;
+    font-size: 13px;
+}
+
+.install-primary-btn:hover {
+    background-color: #a866ff;
+}
+
+.install-secondary-btn {
+    background-color: #22222c;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    color: #e4e4e7;
+    font-weight: 600;
+    border-radius: 10px;
+    padding: 8px 16px;
+    font-size: 13px;
+}
+
+.install-secondary-btn:hover {
+    background-color: #2b2b38;
+    border-color: rgba(145, 70, 255, 0.45);
 }

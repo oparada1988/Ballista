@@ -1,10 +1,11 @@
 use crate::core::PluginManager;
+use crate::native_sdk::TargetCaps;
 use gtk::prelude::*;
 use gtk::{
     Box, Button, Image, Label, ListBox, Orientation, Revealer, RevealerTransitionType,
     ScrolledWindow, SearchEntry,
 };
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -14,6 +15,8 @@ pub struct SelectedAction {
     pub action_id: String,
     pub action_name: String,
     pub icon_name: String,
+    #[serde(default)]
+    pub caps: TargetCaps,
 }
 
 pub struct Sidebar {
@@ -21,6 +24,7 @@ pub struct Sidebar {
     pub search_entry: SearchEntry,
     pub list_box: ListBox,
     pub filter_items: Rc<RefCell<Vec<(Box, Revealer, Image, String)>>>,
+    pub active_drag_caps: Rc<Cell<Option<TargetCaps>>>,
 }
 
 impl Sidebar {
@@ -81,11 +85,20 @@ impl Sidebar {
             search_entry,
             list_box,
             filter_items,
+            active_drag_caps: Rc::new(Cell::new(None)),
         }
     }
 
-    pub fn populate_from_plugins<F>(&self, plugin_manager: &PluginManager, on_action_selected: F)
-    where
+    pub fn set_drag_caps_cell(&mut self, cell: Rc<Cell<Option<TargetCaps>>>) {
+        self.active_drag_caps = cell;
+    }
+
+    pub fn populate_from_plugins<F>(
+        &self,
+        plugin_manager: &PluginManager,
+        native_host: &crate::native_sdk::NativePluginHost,
+        on_action_selected: F,
+    ) where
         F: Fn(SelectedAction) + 'static + Clone,
     {
         // Clear existing rows
@@ -94,21 +107,25 @@ impl Sidebar {
         }
         self.filter_items.borrow_mut().clear();
 
-        // 1. Built-in Core System Actions (Collapsible)
-        let core_actions = vec![
-            ("system.hotkey", "Hotkey Trigger", "input-keyboard-symbolic"),
-            ("system.url", "Open Website", "web-browser-symbolic"),
-            ("system.terminal", "Run Terminal Command", "utilities-terminal-symbolic"),
-        ];
+        // 1. Native Rust Ballista Built-In Plugins ("Ballista" core suite + any future native plugins)
+        for (plugin_id, plugin_name, descriptors) in native_host.list_plugins() {
+            let visible_actions: Vec<(&str, &str, &str, Option<TargetCaps>)> = descriptors
+                .iter()
+                .filter(|d| d.show_in_sidebar)
+                .map(|d| (d.id.as_str(), d.name.as_str(), d.icon_name.as_str(), Some(d.caps)))
+                .collect();
 
-        self.append_collapsible_category(
-            "System",
-            "system",
-            &core_actions,
-            on_action_selected.clone(),
-        );
+            if !visible_actions.is_empty() {
+                self.append_collapsible_category(
+                    &plugin_name,
+                    &plugin_id,
+                    &visible_actions,
+                    on_action_selected.clone(),
+                );
+            }
+        }
 
-        // 2. Dynamically Discovered Real Plugins (e.g. AppLauncher)
+        // 2. Dynamically Discovered StreamController / External Plugins
         if plugin_manager.plugins.is_empty() {
             let empty_hint = Box::new(Orientation::Vertical, 8);
             empty_hint.set_margin_top(16);
@@ -116,7 +133,7 @@ impl Sidebar {
             empty_hint.set_margin_end(16);
 
             let hint_label = Label::new(Some(
-                "No external plugins installed.\nClick the Store (:::+) icon above to install App Launcher!",
+                "No external plugins installed.\nClick the Store icon above to install plugins!",
             ));
             hint_label.set_wrap(true);
             hint_label.add_css_class("dim-label");
@@ -126,10 +143,10 @@ impl Sidebar {
             self.list_box.append(&empty_hint);
         } else {
             for (plugin_id, plugin) in &plugin_manager.plugins {
-                let actions_tuples: Vec<(&str, &str, &str)> = plugin
+                let actions_tuples: Vec<(&str, &str, &str, Option<TargetCaps>)> = plugin
                     .actions
                     .iter()
-                    .map(|a| (a.id.as_str(), a.name.as_str(), a.icon_name_or_file.as_str()))
+                    .map(|a| (a.id.as_str(), a.name.as_str(), a.icon_name_or_file.as_str(), None))
                     .collect();
 
                 self.append_collapsible_category(
@@ -146,7 +163,7 @@ impl Sidebar {
         &self,
         category_name: &str,
         plugin_id: &str,
-        actions: &[(&str, &str, &str)],
+        actions: &[(&str, &str, &str, Option<TargetCaps>)],
         on_action_selected: F,
     ) where
         F: Fn(SelectedAction) + 'static + Clone,
@@ -192,8 +209,9 @@ impl Sidebar {
         actions_box.set_margin_end(4);
         actions_box.set_margin_bottom(4);
 
-        for (action_id, action_name, icon_name) in actions {
-            let row = Box::new(Orientation::Horizontal, 12);
+        for (action_id, action_name, icon_name, explicit_caps) in actions {
+            let caps = explicit_caps.unwrap_or(TargetCaps::KEYS_AND_DIALS);
+            let row = Box::new(Orientation::Horizontal, 10);
             row.add_css_class("action-row");
 
             let icon = if std::path::Path::new(icon_name).exists() {
@@ -207,8 +225,10 @@ impl Sidebar {
             };
 
             let label_box = Box::new(Orientation::Vertical, 1);
+            label_box.set_hexpand(true);
             let title = Label::new(Some(action_name));
             title.set_xalign(0.0);
+            title.set_ellipsize(pango::EllipsizeMode::End);
             title.add_css_class("heading");
 
             let sub = Label::new(Some(category_name));
@@ -219,6 +239,25 @@ impl Sidebar {
             label_box.append(&sub);
             row.append(&icon);
             row.append(&label_box);
+
+            // Surface Exclusivity Badge for Native Ballista Actions (KEY / DIAL / KEY · DIAL)
+            if let Some(native_caps) = explicit_caps {
+                let badge = Label::new(Some(native_caps.badge_label()));
+                badge.add_css_class("cap-badge");
+                if native_caps.keys && native_caps.dials {
+                    badge.add_css_class("cap-badge-both");
+                    badge.set_tooltip_text(Some("Works on LCD Keys & Rotary Dials (adapts layout)"));
+                } else if native_caps.dials {
+                    badge.add_css_class("cap-badge-dial");
+                    badge.set_tooltip_text(Some("Dial Exclusive — drag onto a Stream Deck + Dial or Touch Strip"));
+                } else {
+                    badge.add_css_class("cap-badge-key");
+                    badge.set_tooltip_text(Some("Key Exclusive — drag onto an LCD Key"));
+                }
+                badge.set_valign(gtk::Align::Center);
+                row.append(&badge);
+            }
+
             row.set_cursor_from_name(Some("grab"));
 
             let sel_action = SelectedAction {
@@ -227,9 +266,10 @@ impl Sidebar {
                 action_id: action_id.to_string(),
                 action_name: action_name.to_string(),
                 icon_name: icon_name.to_string(),
+                caps,
             };
 
-            // 1. Drag and Drop: Allow dragging action item onto any Key, Dial, or Touch slot
+            // 1. Drag and Drop: Allow dragging action item onto compatible Key, Dial, or Touch slots
             let drag_source = gtk::DragSource::new();
             drag_source.set_actions(gtk::gdk::DragAction::COPY);
             let drag_data = sel_action.clone();
@@ -238,35 +278,50 @@ impl Sidebar {
                 Some(gtk::gdk::ContentProvider::for_value(&json.to_value()))
             });
 
-            // Set the dragged icon to the action icon (clean icon, zero text clutter)
+            // Set the dragged cursor preview to a compact, uniform 44x44 rounded Midnight chip
             let icon_for_drag = icon_name.to_string();
             let get_drag_paintable = move || -> Option<gtk::gdk::Paintable> {
-                if std::path::Path::new(&icon_for_drag).exists() {
-                    crate::ui::canvas::lookup_icon_paintable(Some(&icon_for_drag), None, 36, 6.0)
+                let tex = if std::path::Path::new(&icon_for_drag).exists() {
+                    crate::ui::canvas::create_drag_chip_texture(Some(&icon_for_drag), None)
                 } else {
-                    crate::ui::canvas::lookup_icon_paintable(None, Some(&icon_for_drag), 36, 6.0)
-                }
+                    crate::ui::canvas::create_drag_chip_texture(None, Some(&icon_for_drag))
+                };
+                tex.map(|t| t.upcast())
             };
 
             if let Some(paintable) = get_drag_paintable() {
-                drag_source.set_icon(Some(&paintable), 18, 18);
+                drag_source.set_icon(Some(&paintable), 22, 22);
             }
 
             let icon_drag_begin = icon_name.to_string();
+            let drag_caps_begin = self.active_drag_caps.clone();
             drag_source.connect_drag_begin(move |src, _drag| {
-                let p = if std::path::Path::new(&icon_drag_begin).exists() {
-                    crate::ui::canvas::lookup_icon_paintable(Some(&icon_drag_begin), None, 36, 6.0)
+                drag_caps_begin.set(Some(caps));
+                let tex = if std::path::Path::new(&icon_drag_begin).exists() {
+                    crate::ui::canvas::create_drag_chip_texture(Some(&icon_drag_begin), None)
                 } else {
-                    crate::ui::canvas::lookup_icon_paintable(None, Some(&icon_drag_begin), 36, 6.0)
+                    crate::ui::canvas::create_drag_chip_texture(None, Some(&icon_drag_begin))
                 };
-                if let Some(paintable) = p {
-                    src.set_icon(Some(&paintable), 18, 18);
+                if let Some(t) = tex {
+                    let paintable: gtk::gdk::Paintable = t.upcast();
+                    src.set_icon(Some(&paintable), 22, 22);
                 }
+            });
+
+            let drag_caps_end = self.active_drag_caps.clone();
+            drag_source.connect_drag_end(move |_src, _drag, _del| {
+                drag_caps_end.set(None);
+            });
+
+            let drag_caps_cancel = self.active_drag_caps.clone();
+            drag_source.connect_drag_cancel(move |_src, _drag, _reason| {
+                drag_caps_cancel.set(None);
+                true
             });
 
             row.add_controller(drag_source);
 
-            // 2. Right-Click Context Menu: "Add to Key"
+            // 2. Right-Click Context Menu: target-aware Add label
             let right_click = gtk::GestureClick::new();
             right_click.set_button(3); // Secondary button (right-click)
 
@@ -280,7 +335,14 @@ impl Sidebar {
             pop_box.set_margin_start(4);
             pop_box.set_margin_end(4);
 
-            let add_item_btn = Button::with_label("Add to Key");
+            let add_label = if caps.keys && caps.dials {
+                "Add to Selected Slot"
+            } else if caps.dials {
+                "Add to Dial"
+            } else {
+                "Add to Key"
+            };
+            let add_item_btn = Button::with_label(add_label);
             add_item_btn.add_css_class("flat");
             let pop_weak = popover.downgrade();
             let cb = on_action_selected.clone();

@@ -2,7 +2,7 @@ import gi
 gi.require_version("Adw", "1")
 from gi.repository import Adw
 from GtkHelper.GenerativeUI.GenerativeUI import GenerativeUI
-from GtkHelper.GtkHelper import better_disconnect
+from GtkHelper.GtkHelper import BetterExpander, better_disconnect
 
 
 class ExpanderRow(GenerativeUI[bool]):
@@ -21,14 +21,13 @@ class ExpanderRow(GenerativeUI[bool]):
         complex_var_name: bool = False,
     ):
         super().__init__(action_core, var_name, bool(default_value), can_reset, auto_add, complex_var_name, on_change)
-        self._widget = Adw.ExpanderRow(
+        self._widget = BetterExpander(
             title=self.get_translation(title, title),
             subtitle=self.get_translation(subtitle, subtitle),
             show_enable_switch=show_enable_switch,
             enable_expansion=bool(default_value) if show_enable_switch else True,
             expanded=start_expanded,
         )
-        self._rows: list = []
         self.connect_signals()
 
     def connect_signals(self):
@@ -52,16 +51,24 @@ class ExpanderRow(GenerativeUI[bool]):
     def get_enable_expansion(self) -> bool:
         return self._widget.get_enable_expansion()
 
+    def set_expanded(self, expanded: bool):
+        self._widget.set_expanded(bool(expanded))
+
+    def get_expanded(self) -> bool:
+        return self._widget.get_expanded()
+
     def add_row(self, widget):
         w = widget.widget if hasattr(widget, "widget") else widget
         if w is not None:
             self._widget.add_row(w)
-            self._rows.append(w)
+
+    def remove_row(self, widget):
+        w = widget.widget if hasattr(widget, "widget") else widget
+        if w is not None:
+            self._widget.remove(w)
+
+    def get_rows(self) -> list:
+        return self._widget.get_rows()
 
     def clear_rows(self):
-        for r in list(self._rows):
-            try:
-                self._widget.remove(r)
-            except Exception:
-                pass
-        self._rows.clear()
+        self._widget.clear()

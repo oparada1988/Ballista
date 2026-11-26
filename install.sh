@@ -15,6 +15,7 @@ SYSTEM_INSTALL=false
 SKIP_DEPS=false
 SKIP_UDEV=false
 SKIP_BUILD=false
+NO_AUTOSTART=false
 UNINSTALL=false
 PURGE=false
 
@@ -40,6 +41,7 @@ Options:
   --skip-deps     Skip checking/installing distro build & runtime packages
   --skip-udev     Skip installing Elgato Stream Deck udev rules
   --skip-build    Skip running 'cargo build --release' (use existing binary)
+  --no-autostart  Do not enable automatic login background startup service
   --uninstall     Uninstall Ballista (preserves installed plugins & settings)
   --purge         With --uninstall, also remove ~/.local/share/ballista/{plugins,settings}
   -h, --help      Show this help message
@@ -55,9 +57,10 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --system)     SYSTEM_INSTALL=true; shift ;;
         --skip-deps)  SKIP_DEPS=true; shift ;;
-        --skip-udev)  SKIP_UDEV=true; shift ;;
-        --skip-build) SKIP_BUILD=true; shift ;;
-        --uninstall)  UNINSTALL=true; shift ;;
+        --skip-udev)    SKIP_UDEV=true; shift ;;
+        --skip-build)   SKIP_BUILD=true; shift ;;
+        --no-autostart) NO_AUTOSTART=true; shift ;;
+        --uninstall)    UNINSTALL=true; shift ;;
         --purge)      PURGE=true; shift ;;
         -h|--help)    usage; exit 0 ;;
         *)
@@ -92,6 +95,14 @@ fi
 # ------------------------------------------------------------------------------
 if [[ "$UNINSTALL" == true ]]; then
     info "Uninstalling Ballista from ${BIN_DIR} and ${DATA_DIR}..."
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl --user disable --now ballista.service >/dev/null 2>&1 || true
+    fi
+    rm -f "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/ballista.service"
+    rm -f "${XDG_CONFIG_HOME:-$HOME/.config}/autostart/${APP_ID}.desktop"
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl --user daemon-reload >/dev/null 2>&1 || true
+    fi
     $SUDO_CMD rm -f "$BIN_DIR/ballista"
     $SUDO_CMD rm -rf "$DATA_DIR/bridge" "$DATA_DIR/icons" "$DATA_DIR/venv"
     $SUDO_CMD rm -f "$APPS_DIR/${APP_ID}.desktop"
@@ -320,6 +331,55 @@ if [[ "$SKIP_UDEV" == false ]]; then
 fi
 
 # ------------------------------------------------------------------------------
+# 6. Enable Fast Login Startup Service (enabled by default on new installs)
+# ------------------------------------------------------------------------------
+AUTOSTART_DESC="disabled (--no-autostart)"
+if [[ "$NO_AUTOSTART" == false ]]; then
+    SYSTEMD_USER_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+    XDG_AUTOSTART_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/autostart"
+    if command -v systemctl >/dev/null 2>&1 && systemctl --user is-active --quiet graphical-session.target 2>/dev/null; then
+        info "Enabling fast systemd user login service ($SYSTEMD_USER_DIR/ballista.service)..."
+        mkdir -p "$SYSTEMD_USER_DIR"
+        rm -f "$XDG_AUTOSTART_DIR/${APP_ID}.desktop"
+        cat > "$SYSTEMD_USER_DIR/ballista.service" <<EOF
+[Unit]
+Description=Ballista - Elgato Stream Deck Background Service
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart="$BIN_DIR/ballista" --background
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target
+EOF
+        systemctl --user daemon-reload
+        systemctl --user enable ballista.service >/dev/null 2>&1 || true
+        AUTOSTART_DESC="enabled (systemd --user: ballista.service)"
+        success "Enabled systemd user login service (starts instantaneously with desktop session)."
+    else
+        info "Enabling XDG autostart entry ($XDG_AUTOSTART_DIR/${APP_ID}.desktop)..."
+        mkdir -p "$XDG_AUTOSTART_DIR"
+        cat > "$XDG_AUTOSTART_DIR/${APP_ID}.desktop" <<EOF
+[Desktop Entry]
+Type=Application
+Name=Ballista
+Comment=Elgato Stream Deck background service
+Exec="$BIN_DIR/ballista" --background
+Icon=${APP_ID}
+Terminal=false
+X-GNOME-Autostart-enabled=true
+X-GNOME-Autostart-Delay=0
+EOF
+        AUTOSTART_DESC="enabled (XDG autostart)"
+        success "Enabled XDG autostart login service."
+    fi
+fi
+
+# ------------------------------------------------------------------------------
 # Done!
 # ------------------------------------------------------------------------------
 echo ""
@@ -328,6 +388,7 @@ echo "  Binary:      $BIN_DIR/ballista"
 echo "  Bridge:      $DATA_DIR/bridge/runner.py"
 echo "  Python venv: $VENV_DIR/bin/python3"
 echo "  Launcher:    $APPS_DIR/${APP_ID}.desktop"
+echo "  Autostart:   $AUTOSTART_DESC"
 if [[ "$SYSTEM_INSTALL" == false ]] && [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then
     echo ""
     warn "$BIN_DIR is not currently in your PATH. Add this to ~/.bashrc or ~/.zshrc:"

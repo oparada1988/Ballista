@@ -236,7 +236,36 @@ pub fn create_store_window(
     let header_bar = HeaderBar::new();
     header_bar.add_css_class("ballista-headerbar");
 
-    let install_local_btn = Button::with_label("Install Local Plugin...");
+    let install_local_popover = gtk::Popover::new();
+    let install_menu_box = Box::new(Orientation::Vertical, 4);
+    install_menu_box.set_margin_top(6);
+    install_menu_box.set_margin_bottom(6);
+    install_menu_box.set_margin_start(6);
+    install_menu_box.set_margin_end(6);
+
+    let install_zip_btn = Button::new();
+    install_zip_btn.add_css_class("flat");
+    let zip_btn_box = Box::new(Orientation::Horizontal, 8);
+    zip_btn_box.append(&Image::from_icon_name("package-x-generic-symbolic"));
+    zip_btn_box.append(&Label::new(Some("Install from ZIP (.zip)...")));
+    install_zip_btn.set_child(Some(&zip_btn_box));
+
+    let install_folder_btn = Button::new();
+    install_folder_btn.add_css_class("flat");
+    let folder_btn_box = Box::new(Orientation::Horizontal, 8);
+    folder_btn_box.append(&Image::from_icon_name("folder-open-symbolic"));
+    folder_btn_box.append(&Label::new(Some("Install from Folder...")));
+    install_folder_btn.set_child(Some(&folder_btn_box));
+
+    install_menu_box.append(&install_zip_btn);
+    install_menu_box.append(&install_folder_btn);
+    install_local_popover.set_child(Some(&install_menu_box));
+
+    let install_local_btn = gtk::MenuButton::builder()
+        .label("Install Local")
+        .popover(&install_local_popover)
+        .tooltip_text("Install a plugin from a .zip archive or extracted folder")
+        .build();
     install_local_btn.add_css_class("flat");
     header_bar.pack_start(&install_local_btn);
 
@@ -1238,38 +1267,318 @@ pub fn create_store_window(
     toolbar_view.set_content(Some(&stack));
     window.set_content(Some(&toolbar_view));
 
-    // Handle "Install Local Plugin..." dialog
-    let pm_local = plugin_manager.clone();
-    let on_installed_local = on_plugin_installed.clone();
-    let ref_hdr_local = refresh_header_status.clone();
-    let ref_cat_local = refresh_main_catalog_cell.clone();
-    let window_ref = window.clone();
-    install_local_btn.connect_clicked(move |_| {
-        let dialog = FileDialog::builder()
-            .title("Select Plugin Folder (containing manifest.json)")
-            .build();
+    // Handle "Install from ZIP (.zip)..." dialog
+    {
+        let pm_zip = plugin_manager.clone();
+        let on_installed_zip = on_plugin_installed.clone();
+        let ref_hdr_zip = refresh_header_status.clone();
+        let ref_cat_zip = refresh_main_catalog_cell.clone();
+        let window_zip = window.clone();
+        let popover_zip = install_local_popover.clone();
+        let menu_btn_zip = install_local_btn.clone();
+        let my_plugins_zip = my_plugins_btn.clone();
 
-        let pm_inner = pm_local.clone();
-        let cb_inner = on_installed_local.clone();
-        let ref_hdr_in = ref_hdr_local.clone();
-        let ref_cat_in = ref_cat_local.clone();
-        dialog.select_folder(Some(&window_ref), Option::<&gio::Cancellable>::None, move |result| {
-            if let Ok(file) = result {
-                if let Some(path) = file.path() {
-                    let res = pm_inner.borrow_mut().install_from_dir(&path);
-                    if res.is_ok() {
-                        cb_inner();
-                        ref_hdr_in();
-                        if let Some(ref rc) = *ref_cat_in.borrow() {
-                            rc();
+        install_zip_btn.connect_clicked(move |_| {
+            popover_zip.popdown();
+            let dialog = FileDialog::builder()
+                .title("Select Plugin Archive (.zip)")
+                .build();
+
+            let filter = gtk::FileFilter::new();
+            filter.set_name(Some("Plugin ZIP Archives (*.zip)"));
+            filter.add_mime_type("application/zip");
+            filter.add_mime_type("application/x-zip-compressed");
+            filter.add_pattern("*.zip");
+            let filters = gio::ListStore::new::<gtk::FileFilter>();
+            filters.append(&filter);
+            dialog.set_filters(Some(&filters));
+
+            let pm_inner = pm_zip.clone();
+            let cb_inner = on_installed_zip.clone();
+            let ref_hdr_in = ref_hdr_zip.clone();
+            let ref_cat_in = ref_cat_zip.clone();
+            let win_in = window_zip.clone();
+            let btn_in = menu_btn_zip.clone();
+            let my_plugins_in = my_plugins_zip.clone();
+
+            dialog.open(Some(&window_zip), Option::<&gio::Cancellable>::None, move |result| {
+                if let Ok(file) = result {
+                    if let Some(path) = file.path() {
+                        btn_in.set_sensitive(false);
+                        btn_in.set_label("Installing...");
+
+                        let p_dir = pm_inner.borrow().plugins_dir.clone();
+                        let (tx, rx) = async_channel::bounded::<Result<crate::core::plugin_manager::InstalledPluginSummary, String>>(1);
+                        std::thread::spawn(move || {
+                            let res = PluginManager::extract_plugin_zip(&p_dir, &path);
+                            let _ = tx.send_blocking(res);
+                        });
+
+                        let pm_done = pm_inner.clone();
+                        let cb_done = cb_inner.clone();
+                        let ref_hdr_done = ref_hdr_in.clone();
+                        let ref_cat_done = ref_cat_in.clone();
+                        let win_done = win_in.clone();
+                        let btn_done = btn_in.clone();
+                        let my_plugins_done = my_plugins_in.clone();
+
+                        glib::spawn_future_local(async move {
+                            if let Ok(res) = rx.recv().await {
+                                btn_done.set_label("Install Local");
+                                btn_done.set_sensitive(true);
+                                match res {
+                                    Ok(summary) => {
+                                        pm_done.borrow_mut().rescan_plugins();
+                                        cb_done();
+                                        ref_hdr_done();
+                                        if let Some(ref rc) = *ref_cat_done.borrow() {
+                                            rc();
+                                        }
+                                        show_plugin_installed_dialog(&win_done, &summary, my_plugins_done.clone());
+                                    }
+                                    Err(err) => {
+                                        tracing::error!("Failed to install plugin from ZIP: {err}");
+                                        show_plugin_install_error_dialog(&win_done, "ZIP Installation Failed", &err);
+                                    }
+                                }
+                            }
+                        });
+                    }
+                }
+            });
+        });
+    }
+
+    // Handle "Install from Folder..." dialog
+    {
+        let pm_local = plugin_manager.clone();
+        let on_installed_local = on_plugin_installed.clone();
+        let ref_hdr_local = refresh_header_status.clone();
+        let ref_cat_local = refresh_main_catalog_cell.clone();
+        let window_ref = window.clone();
+        let popover_folder = install_local_popover.clone();
+
+        install_folder_btn.connect_clicked(move |_| {
+            popover_folder.popdown();
+            let dialog = FileDialog::builder()
+                .title("Select Plugin Folder (containing manifest.json)")
+                .build();
+
+            let pm_inner = pm_local.clone();
+            let cb_inner = on_installed_local.clone();
+            let ref_hdr_in = ref_hdr_local.clone();
+            let ref_cat_in = ref_cat_local.clone();
+            let win_in = window_ref.clone();
+            dialog.select_folder(Some(&window_ref), Option::<&gio::Cancellable>::None, move |result| {
+                if let Ok(file) = result {
+                    if let Some(path) = file.path() {
+                        match pm_inner.borrow_mut().install_from_dir(&path) {
+                            Ok(_) => {
+                                cb_inner();
+                                ref_hdr_in();
+                                if let Some(ref rc) = *ref_cat_in.borrow() {
+                                    rc();
+                                }
+                            }
+                            Err(err) => {
+                                tracing::error!("Failed to install plugin from folder: {err}");
+                                show_plugin_install_error_dialog(&win_in, "Folder Installation Failed", &err);
+                            }
                         }
                     }
                 }
-            }
+            });
         });
-    });
+    }
 
     window
+}
+
+fn show_plugin_installed_dialog(
+    parent: &Window,
+    summary: &crate::core::plugin_manager::InstalledPluginSummary,
+    my_plugins_btn: Button,
+) {
+    let dialog = adw::Dialog::builder()
+        .content_width(400)
+        .can_close(true)
+        .build();
+
+    let root = Box::new(Orientation::Vertical, 14);
+    root.add_css_class("install-result-root");
+    root.set_halign(gtk::Align::Fill);
+
+    // Top Hero: Plugin thumbnail with green verified checkmark OR green glow checkmark badge
+    let hero_has_thumb = summary
+        .thumbnail_path
+        .as_deref()
+        .filter(|p| std::path::Path::new(p).exists())
+        .and_then(|p| crate::ui::canvas::create_rounded_texture(p, 168, 78, 12.0, true));
+
+    if let Some(tex) = hero_has_thumb {
+        let ov = gtk::Overlay::new();
+        ov.set_halign(gtk::Align::Center);
+        let pic = Picture::new();
+        pic.set_paintable(Some(&tex));
+        pic.set_size_request(168, 78);
+        pic.set_content_fit(gtk::ContentFit::Contain);
+        ov.set_child(Some(&pic));
+
+        let badge = Box::new(Orientation::Horizontal, 0);
+        badge.add_css_class("install-thumb-badge");
+        badge.set_halign(gtk::Align::End);
+        badge.set_valign(gtk::Align::End);
+        let chk = Image::from_icon_name("object-select-symbolic");
+        chk.set_pixel_size(14);
+        chk.set_halign(gtk::Align::Center);
+        chk.set_valign(gtk::Align::Center);
+        chk.set_hexpand(true);
+        chk.set_vexpand(true);
+        badge.append(&chk);
+        ov.add_overlay(&badge);
+        root.append(&ov);
+    } else {
+        let badge = Box::new(Orientation::Horizontal, 0);
+        badge.add_css_class("install-badge-success");
+        badge.set_halign(gtk::Align::Center);
+        let chk = Image::from_icon_name("object-select-symbolic");
+        chk.set_pixel_size(26);
+        chk.set_halign(gtk::Align::Center);
+        chk.set_valign(gtk::Align::Center);
+        chk.set_hexpand(true);
+        chk.set_vexpand(true);
+        badge.append(&chk);
+        root.append(&badge);
+    }
+
+    // Title & Subtitle
+    let header_box = Box::new(Orientation::Vertical, 4);
+    let heading = Label::new(Some("Plugin Installed"));
+    heading.add_css_class("title-2");
+    heading.set_halign(gtk::Align::Center);
+
+    let subtitle = Label::new(Some("Actions are ready to drag & drop from the sidebar."));
+    subtitle.add_css_class("dim-label");
+    subtitle.set_halign(gtk::Align::Center);
+    subtitle.set_wrap(true);
+    subtitle.set_justify(gtk::Justification::Center);
+
+    header_box.append(&heading);
+    header_box.append(&subtitle);
+    root.append(&header_box);
+
+    // Midnight Summary Card
+    let card = Box::new(Orientation::Vertical, 6);
+    card.add_css_class("install-plugin-card");
+
+    let top_row = Box::new(Orientation::Horizontal, 8);
+    let name_lbl = Label::new(Some(&summary.name));
+    name_lbl.add_css_class("heading");
+    name_lbl.set_hexpand(true);
+    name_lbl.set_xalign(0.0);
+    name_lbl.set_wrap(true);
+
+    let ver_str = if summary.version.starts_with('v') {
+        summary.version.clone()
+    } else {
+        format!("v{}", summary.version)
+    };
+    let ver_pill = Label::new(Some(&ver_str));
+    ver_pill.add_css_class("install-version-pill");
+    ver_pill.set_valign(gtk::Align::Center);
+
+    top_row.append(&name_lbl);
+    top_row.append(&ver_pill);
+    card.append(&top_row);
+
+    let meta_text = if !summary.author.is_empty() {
+        format!("by {} • {}", summary.author, summary.id)
+    } else {
+        summary.id.clone()
+    };
+    let meta_lbl = Label::new(Some(&meta_text));
+    meta_lbl.add_css_class("dim-label");
+    meta_lbl.set_xalign(0.0);
+    meta_lbl.set_ellipsize(pango::EllipsizeMode::End);
+    card.append(&meta_lbl);
+
+    root.append(&card);
+
+    // Bottom Action Buttons
+    let btn_row = Box::new(Orientation::Horizontal, 10);
+    btn_row.set_homogeneous(true);
+    btn_row.set_margin_top(4);
+
+    let view_btn = Button::with_label("My Plugins");
+    view_btn.add_css_class("install-secondary-btn");
+
+    let done_btn = Button::with_label("Done");
+    done_btn.add_css_class("install-primary-btn");
+
+    let dlg_view = dialog.clone();
+    view_btn.connect_clicked(move |_| {
+        dlg_view.close();
+        my_plugins_btn.emit_clicked();
+    });
+
+    let dlg_done = dialog.clone();
+    done_btn.connect_clicked(move |_| {
+        dlg_done.close();
+    });
+
+    btn_row.append(&view_btn);
+    btn_row.append(&done_btn);
+    root.append(&btn_row);
+
+    dialog.set_child(Some(&root));
+    dialog.present(Some(parent));
+}
+
+fn show_plugin_install_error_dialog(parent: &Window, title: &str, err: &str) {
+    let dialog = adw::Dialog::builder()
+        .content_width(390)
+        .can_close(true)
+        .build();
+
+    let root = Box::new(Orientation::Vertical, 14);
+    root.add_css_class("install-result-root");
+
+    let badge = Box::new(Orientation::Horizontal, 0);
+    badge.add_css_class("install-badge-error");
+    badge.set_halign(gtk::Align::Center);
+    let icon = Image::from_icon_name("dialog-error-symbolic");
+    icon.set_pixel_size(26);
+    icon.set_halign(gtk::Align::Center);
+    icon.set_valign(gtk::Align::Center);
+    icon.set_hexpand(true);
+    icon.set_vexpand(true);
+    badge.append(&icon);
+    root.append(&badge);
+
+    let heading = Label::new(Some(title));
+    heading.add_css_class("title-2");
+    heading.set_halign(gtk::Align::Center);
+    root.append(&heading);
+
+    let card = Box::new(Orientation::Vertical, 4);
+    card.add_css_class("install-plugin-card");
+    let err_lbl = Label::new(Some(err));
+    err_lbl.set_wrap(true);
+    err_lbl.set_xalign(0.0);
+    card.append(&err_lbl);
+    root.append(&card);
+
+    let close_btn = Button::with_label("Close");
+    close_btn.add_css_class("install-secondary-btn");
+    close_btn.set_margin_top(4);
+    let dlg_close = dialog.clone();
+    close_btn.connect_clicked(move |_| {
+        dlg_close.close();
+    });
+    root.append(&close_btn);
+
+    dialog.set_child(Some(&root));
+    dialog.present(Some(parent));
 }
 
 // =========================================================================

@@ -4,15 +4,26 @@ use super::inspector::{rgba_to_hex, InspectorTarget, PropertyInspector};
 use super::settings::create_settings_window;
 use super::sidebar::Sidebar;
 use super::store::create_store_window;
-use std::collections::HashMap;
-use crate::core::{ConnectedDevice, HardwareEvent, HardwareManager, PluginManager};
-use crate::models::{DeviceKind, KeyAction, KeyAppearance, Profile, TextVerticalAlign, WindowState};
+use crate::core::{
+    ConnectedDevice, HardwareEvent, HardwareManager, PluginManager, TrayCommand, TrayController,
+};
+use crate::models::{
+    CloseBehavior, DeviceKind, KeyAction, KeyAppearance, Profile, ProfileStore, TextVerticalAlign,
+    WindowState,
+};
+use crate::native_sdk::{
+    BrightnessOp, ConfigChange, HostCommand, LabelPos, MultiActionStep, NativePluginHost, PageNav,
+};
 use adw::prelude::*;
 use adw::{ApplicationWindow, ToolbarView};
 use gtk::gdk::RGBA;
 use gtk::{Orientation, Paned};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::rc::Rc;
+
+type NativeCommandDispatcher =
+    Rc<dyn Fn(String, Vec<HostCommand>, Option<HashMap<String, serde_json::Value>>)>;
 
 pub struct MainWindow {
     pub window: ApplicationWindow,
@@ -24,15 +35,84 @@ pub struct MainWindow {
     pub profiles: Rc<RefCell<Vec<Profile>>>,
     pub active_profile_id: Rc<RefCell<String>>,
     pub plugin_manager: Rc<RefCell<PluginManager>>,
+    pub native_host: NativePluginHost,
     pub hardware_manager: Rc<RefCell<HardwareManager>>,
     pub connected_devices: Rc<RefCell<Vec<ConnectedDevice>>>,
     pub active_device_idx: Rc<RefCell<usize>>,
+    pub tray: Rc<RefCell<TrayController>>,
 }
 
 impl MainWindow {
-    pub fn new(app: &adw::Application) -> Self {
-        // Load saved window & layout state
+    pub fn new(
+        app: &adw::Application,
+        hold_guard: Rc<RefCell<Option<gio::ApplicationHoldGuard>>>,
+    ) -> Self {
+        let boot_t0 = std::time::Instant::now();
+
+        // Phase 1 — Instant Hardware Boot:
+        // Initialize Native Rust Plugin Host FIRST (<1ms) so saved built-in Ballista actions
+        // (Clock, System Metrics, Media, Folder, Launcher, etc.) render immediately on hardware boot!
         let state = WindowState::load();
+        let profile_store = ProfileStore::load_or_default();
+        let native_host = NativePluginHost::new();
+        native_host.register_plugin(Box::new(
+            crate::plugins::ballista_core::BallistaCorePlugin::new(),
+        ));
+
+        let hardware_manager = Rc::new(RefCell::new(HardwareManager::new()));
+        hardware_manager.borrow().set_native_host(native_host.clone());
+        let devices = hardware_manager.borrow().scan_devices();
+
+        let boot_targets: Vec<_> = devices
+            .iter()
+            .map(|d| {
+                let skey = d.stable_key();
+                let prof = profile_store.active_profile_for(&skey, d.kind);
+                let bright = state.brightness_for(&skey);
+                (d.dev_path.clone(), d.kind, prof, bright)
+            })
+            .collect();
+        if let Some(first_target) = boot_targets.first() {
+            if let Some(pg) = first_target.2.current_page() {
+                let _ = native_host.sync_page(pg);
+            }
+        }
+        if !boot_targets.is_empty() {
+            hardware_manager.borrow().sync_all_devices_async(boot_targets);
+        }
+        tracing::info!(
+            "Phase-1 boot hardware dispatch queued for {} device(s) in {:?}",
+            devices.len(),
+            boot_t0.elapsed()
+        );
+
+        let profiles = Rc::new(RefCell::new(profile_store.profiles));
+        let active_by_device = Rc::new(RefCell::new(profile_store.active_by_device));
+        let connected_devices = Rc::new(RefCell::new(devices));
+        let active_device_idx = Rc::new(RefCell::new(0));
+
+        // Phase 2 — Non-blocking Python StreamController bridge & plugin discovery
+        let plugin_manager = Rc::new(RefCell::new(PluginManager::new()));
+
+        let initial_dev = connected_devices.borrow().first().cloned();
+        let initial_kind = initial_dev
+            .as_ref()
+            .map(|d| d.kind)
+            .unwrap_or(DeviceKind::StreamDeckMK2);
+        let initial_dev_key = initial_dev
+            .as_ref()
+            .map(|d| d.stable_key())
+            .unwrap_or_else(|| format!("{initial_kind:?}"));
+
+        let initial_p = {
+            let store_view = ProfileStore {
+                profiles: profiles.borrow().clone(),
+                active_by_device: active_by_device.borrow().clone(),
+            };
+            store_view.active_profile_for(&initial_dev_key, initial_kind)
+        };
+        let active_profile_id = Rc::new(RefCell::new(initial_p.id.clone()));
+        let profile = Rc::new(RefCell::new(initial_p));
 
         let window = ApplicationWindow::builder()
             .application(app)
@@ -44,40 +124,6 @@ impl MainWindow {
         window.add_css_class("ballista-main");
 
         let toolbar_view = ToolbarView::new();
-
-        // 1. Data Models & Engines
-        let initial_profiles = vec![
-            Profile::new_for_device("Default Profile", DeviceKind::StreamDeckPlus),
-            Profile::new_for_device("Streaming & Audio", DeviceKind::StreamDeckPlus),
-            Profile::new_for_device("Default Profile", DeviceKind::StreamDeckPlusXL),
-            Profile::new_for_device("Default Profile", DeviceKind::StreamDeckXL),
-            Profile::new_for_device("Studio Master", DeviceKind::StreamDeckXL),
-            Profile::new_for_device("Default Profile", DeviceKind::StreamDeckMK2),
-            Profile::new_for_device("Default Profile", DeviceKind::StreamDeckOriginal),
-            Profile::new_for_device("Default Profile", DeviceKind::StreamDeckMini),
-            Profile::new_for_device("Default Profile", DeviceKind::StreamDeckNeo),
-            Profile::new_for_device("Default Profile", DeviceKind::StreamDeckPedal),
-            Profile::new_for_device("Default Profile", DeviceKind::StreamDeckStudio),
-        ];
-        let profiles = Rc::new(RefCell::new(initial_profiles));
-        let plugin_manager = Rc::new(RefCell::new(PluginManager::new()));
-        let hardware_manager = Rc::new(RefCell::new(HardwareManager::new()));
-
-        // Scan real hardware
-        let devices = hardware_manager.borrow().scan_devices();
-        let connected_devices = Rc::new(RefCell::new(devices));
-        let active_device_idx = Rc::new(RefCell::new(0));
-
-        let initial_kind = connected_devices
-            .borrow()
-            .first()
-            .map(|d| d.kind)
-            .unwrap_or(DeviceKind::StreamDeckMK2);
-
-        let initial_p = profiles.borrow().iter().find(|p| p.device_kind == initial_kind).cloned()
-            .unwrap_or_else(|| profiles.borrow()[0].clone());
-        let active_profile_id = Rc::new(RefCell::new(initial_p.id.clone()));
-        let profile = Rc::new(RefCell::new(initial_p));
 
         // 2. Header
         let header = Header::new();
@@ -95,6 +141,7 @@ impl MainWindow {
 
         // 4. Canvas (Guaranteed minimum height to prevent hiding button grid)
         let canvas = Rc::new(Canvas::new(initial_kind));
+        canvas.set_native_host(native_host.clone());
         canvas.container.set_size_request(-1, 280);
         work_paned.set_start_child(Some(&canvas.container));
         work_paned.set_resize_start_child(true);
@@ -120,6 +167,7 @@ impl MainWindow {
         *inspector.on_open_plugin_settings.borrow_mut() = Some(std::boxed::Box::new(move |pid, pname| {
             open_ps_insp(pid, pname);
         }));
+        inspector.set_native_host(native_host.clone());
         let insp_scroll = gtk::ScrolledWindow::new();
         insp_scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
         insp_scroll.set_child(Some(&inspector.container));
@@ -131,8 +179,10 @@ impl MainWindow {
         work_paned.set_shrink_end_child(false);
         work_paned.set_position(state.work_paned_position.max(280));
 
-        // 6. Sidebar (Full Height)
-        let sidebar = Rc::new(Sidebar::new());
+        // 6. Sidebar (Full Height) — shares active drag capabilities with Canvas for real-time drop exclusivity
+        let mut sidebar_inner = Sidebar::new();
+        sidebar_inner.set_drag_caps_cell(canvas.active_drag_caps.clone());
+        let sidebar = Rc::new(sidebar_inner);
         paned.set_start_child(Some(&work_paned));
         paned.set_resize_start_child(true);
         paned.set_shrink_start_child(false);
@@ -182,35 +232,197 @@ impl MainWindow {
             s.save();
         });
 
-        // Persist on Close Request & gracefully shut down Python plugin bridge + USB hardware handles
+        // Unified Atomic Profile Persistence Helper (syncs active profile back into `profiles` & writes profiles.json)
+        let persist_profiles: Rc<dyn Fn()> = {
+            let p_cur = profile.clone();
+            let profs = profiles.clone();
+            let act_map = active_by_device.clone();
+            let devs = connected_devices.clone();
+            let act_idx = active_device_idx.clone();
+            Rc::new(move || {
+                let current_p = p_cur.borrow().clone();
+                {
+                    let mut list = profs.borrow_mut();
+                    if let Some(slot) = list.iter_mut().find(|p| p.id == current_p.id) {
+                        *slot = current_p.clone();
+                    } else {
+                        list.push(current_p.clone());
+                    }
+                }
+                {
+                    let d_lock = devs.borrow();
+                    if let Some(dev) = d_lock.get(*act_idx.borrow()) {
+                        act_map
+                            .borrow_mut()
+                            .insert(dev.stable_key(), current_p.id.clone());
+                    }
+                }
+                ProfileStore::save_profiles(&profs.borrow(), &act_map.borrow());
+            })
+        };
+
+        // Native Linux StatusNotifierItem System Tray (GNOME/KDE/Waybar/Hyprland/XFCE)
+        let (tray_tx, tray_rx) = async_channel::unbounded::<TrayCommand>();
+        let initial_tray_names: Vec<String> = connected_devices
+            .borrow()
+            .iter()
+            .map(|d| d.name.clone())
+            .collect();
+        let tray = Rc::new(RefCell::new(TrayController::start(
+            tray_tx,
+            initial_tray_names,
+        )));
+
+        // Full Graceful Quit Helper (triggered ONLY by Tray "Quit Ballista", Ctrl+Q, or Close Dialog "Quit")
+        let is_quitting = Rc::new(Cell::new(false));
+        let perform_full_quit: Rc<dyn Fn()> = {
+            let quitting = is_quitting.clone();
+            let win_q = window.clone();
+            let paned_q = paned.clone();
+            let work_paned_q = work_paned.clone();
+            let pm_q = plugin_manager.clone();
+            let hw_q = hardware_manager.clone();
+            let tray_q = tray.clone();
+            let persist_q = persist_profiles.clone();
+            let hold_q = hold_guard.clone();
+            let app_q = app.clone();
+            Rc::new(move || {
+                if quitting.replace(true) {
+                    return;
+                }
+                tracing::info!("Shutting down Ballista cleanly...");
+                let w = win_q.width().max(600);
+                let h = win_q.height().max(400);
+                let s = WindowState {
+                    window_width: w,
+                    window_height: h,
+                    sidebar_position: paned_q.position(),
+                    work_paned_position: work_paned_q.position(),
+                    ..WindowState::load()
+                };
+                s.save();
+                persist_q();
+                tray_q.borrow().shutdown();
+                pm_q.borrow().bridge.shutdown();
+                hw_q.borrow().shutdown();
+                *hold_q.borrow_mut() = None;
+                app_q.quit();
+            })
+        };
+
+        // Register Ctrl+Q application quit shortcut
+        {
+            let quit_action = gio::SimpleAction::new("quit", None);
+            let quit_cb = perform_full_quit.clone();
+            quit_action.connect_activate(move |_, _| {
+                quit_cb();
+            });
+            app.add_action(&quit_action);
+            app.set_accels_for_action("app.quit", &["<Primary>q"]);
+        }
+
+        // Window Close Request: Ask / Minimize to Tray / Quit cleanly
         let win_close = window.clone();
         let paned_close = paned.clone();
         let work_paned_close = work_paned.clone();
-        let pm_close = plugin_manager.clone();
-        let hw_close = hardware_manager.clone();
+        let persist_close = persist_profiles.clone();
+        let quit_close = perform_full_quit.clone();
+        let is_quitting_close = is_quitting.clone();
         window.connect_close_request(move |_| {
+            if is_quitting_close.get() {
+                return glib::Propagation::Proceed;
+            }
             let w = win_close.width().max(600);
             let h = win_close.height().max(400);
-            let s = WindowState {
-                window_width: w,
-                window_height: h,
-                sidebar_position: paned_close.position(),
-                work_paned_position: work_paned_close.position(),
-                ..WindowState::load()
-            };
-            s.save();
-            pm_close.borrow().bridge.shutdown();
-            hw_close.borrow().shutdown();
-            glib::Propagation::Proceed
+            let mut st = WindowState::load();
+            st.window_width = w;
+            st.window_height = h;
+            st.sidebar_position = paned_close.position();
+            st.work_paned_position = work_paned_close.position();
+            st.save();
+            persist_close();
+
+            match st.close_behavior {
+                CloseBehavior::MinimizeToTray => {
+                    win_close.set_visible(false);
+                    glib::Propagation::Stop
+                }
+                CloseBehavior::Quit => {
+                    quit_close();
+                    glib::Propagation::Proceed
+                }
+                CloseBehavior::Ask => {
+                    let remember_cb = gtk::CheckButton::with_label("Remember my choice");
+                    remember_cb.set_active(true);
+                    remember_cb.set_halign(gtk::Align::Center);
+                    remember_cb.set_margin_top(6);
+
+                    let dialog = adw::AlertDialog::builder()
+                        .heading("Keep Ballista Running in Background?")
+                        .body("Closing the window can hide Ballista to the system tray so your Stream Deck keys, dials, and plugins remain active.")
+                        .extra_child(&remember_cb)
+                        .build();
+                    dialog.add_responses(&[
+                        ("cancel", "Cancel"),
+                        ("quit", "Quit Ballista"),
+                        ("tray", "Keep in Tray"),
+                    ]);
+                    dialog.set_response_appearance("quit", adw::ResponseAppearance::Destructive);
+                    dialog.set_response_appearance("tray", adw::ResponseAppearance::Suggested);
+                    dialog.set_default_response(Some("tray"));
+                    dialog.set_close_response("cancel");
+
+                    let win_dlg = win_close.clone();
+                    let quit_dlg = quit_close.clone();
+                    let rem_dlg = remember_cb.clone();
+                    dialog.choose(Some(&win_close), gio::Cancellable::NONE, move |resp| {
+                        let remember = rem_dlg.is_active();
+                        match resp.as_str() {
+                            "tray" => {
+                                if remember {
+                                    let mut s = WindowState::load();
+                                    s.close_behavior = CloseBehavior::MinimizeToTray;
+                                    s.save();
+                                }
+                                win_dlg.set_visible(false);
+                            }
+                            "quit" => {
+                                if remember {
+                                    let mut s = WindowState::load();
+                                    s.close_behavior = CloseBehavior::Quit;
+                                    s.save();
+                                }
+                                quit_dlg();
+                            }
+                            _ => {}
+                        }
+                    });
+                    glib::Propagation::Stop
+                }
+            }
         });
 
         toolbar_view.set_content(Some(&paned));
         window.set_content(Some(&toolbar_view));
 
-        // Populate Installed Apps and Plugin Manager into Inspector
+        // Populate Plugin Manager into Inspector & scan freedesktop desktop apps asynchronously (zero startup delay)
         *inspector.plugin_manager.borrow_mut() = Some(plugin_manager.borrow().clone());
-        let apps = plugin_manager.borrow().installed_apps.clone();
-        inspector.populate_installed_apps(&apps);
+        {
+            let (apps_tx, apps_rx) = async_channel::bounded(1);
+            std::thread::spawn(move || {
+                let apps = PluginManager::collect_installed_apps();
+                let _ = apps_tx.send_blocking(apps);
+            });
+            let pm_apps = plugin_manager.clone();
+            let insp_apps = inspector.clone();
+            glib::spawn_future_local(async move {
+                if let Ok(apps) = apps_rx.recv().await {
+                    insp_apps.populate_installed_apps(&apps);
+                    pm_apps.borrow_mut().installed_apps = apps;
+                    *insp_apps.plugin_manager.borrow_mut() = Some(pm_apps.borrow().clone());
+                }
+            });
+        }
 
         let prof_param = profile.clone();
         let insp_param = inspector.clone();
@@ -219,6 +431,7 @@ impl MainWindow {
         let devs_param = connected_devices.clone();
         let act_param = active_device_idx.clone();
         let pm_param = plugin_manager.clone();
+        let persist_param = persist_profiles.clone();
 
         *inspector.on_parameter_changed.borrow_mut() = Some(std::boxed::Box::new(move |key, val| {
             let target = *insp_param.current_target.borrow();
@@ -283,6 +496,7 @@ impl MainWindow {
             pm_param.borrow().bridge.update_action_settings(&format_target_slot(target), settings_json);
 
             // Immediately re-render canvas and sync hardware for any parameter change
+            persist_param();
             let prof = prof_param.borrow();
             canvas_param.render_profile_page(&prof);
             if appearance_affected {
@@ -294,14 +508,656 @@ impl MainWindow {
             Self::sync_hardware(&devs_param, *act_param.borrow(), &hw_param, &prof_param.borrow());
         }));
 
+        // ===================== Native Rust Plugin Host Command Dispatcher =====================
+        let deck_sleeping = Rc::new(Cell::new(false));
+        let (multi_ui_tx, multi_ui_rx) = async_channel::unbounded::<MultiActionStep>();
+
+        let dispatch_native: NativeCommandDispatcher = {
+            let prof_nat = profile.clone();
+            let profs_nat = profiles.clone();
+            let act_id_nat = active_profile_id.clone();
+            let act_by_dev_nat = active_by_device.clone();
+            let hdr_nat = header.clone();
+            let canvas_nat = canvas.clone();
+            let insp_nat = inspector.clone();
+            let pm_nat = plugin_manager.clone();
+            let nh_nat = native_host.clone();
+            let hw_nat = hardware_manager.clone();
+            let devs_nat = connected_devices.clone();
+            let act_nat = active_device_idx.clone();
+            let win_nat = window.clone();
+            let persist_nat = persist_profiles.clone();
+            let sleep_nat = deck_sleeping.clone();
+            let multi_tx = multi_ui_tx.clone();
+
+            Rc::new(move |slot, cmds, updated_settings| {
+                let target = parse_slot_target(&slot);
+                let mut need_persist = false;
+                let mut need_full_render = false;
+                let mut need_single_redraw = false;
+                let mut need_full_hw_sync = false;
+                let mut need_refresh_rows = false;
+                let mut need_sync_page = false;
+
+                // Apply updated native settings back into KeyAction persistence model
+                if let Some(settings_map) = updated_settings {
+                    let mut prof = prof_nat.borrow_mut();
+                    if let Some(page) = prof.current_page_mut() {
+                        if let Some(action) = match target {
+                            InspectorTarget::Key(k) => page.keys.get_mut(&k),
+                            InspectorTarget::Dial(d) => page.dial_actions.get_mut(&d),
+                            InspectorTarget::Touchscreen => page.touchscreen_action.as_mut(),
+                        } {
+                            for (k, v) in settings_map {
+                                let val_str = match &v {
+                                    serde_json::Value::String(s) => s.clone(),
+                                    serde_json::Value::Number(n) => n.to_string(),
+                                    serde_json::Value::Bool(b) => b.to_string(),
+                                    serde_json::Value::Null => String::new(),
+                                    other => other.to_string(),
+                                };
+                                action.raw_settings.insert(k.clone(), v);
+                                action.parameters.insert(k, val_str);
+                            }
+                            need_persist = true;
+                        }
+                    }
+                }
+
+                for cmd in cmds {
+                    match cmd {
+                        HostCommand::PersistSettings => {
+                            need_persist = true;
+                        }
+                        HostCommand::DirtyVisual => {
+                            need_single_redraw = true;
+                        }
+                        HostCommand::RefreshConfigRows => {
+                            need_refresh_rows = true;
+                        }
+                        HostCommand::SetLabel {
+                            position,
+                            text,
+                            font_size,
+                            color,
+                        } => {
+                            let mut prof = prof_nat.borrow_mut();
+                            if let Some(page) = prof.current_page_mut() {
+                                if let Some(action) = match target {
+                                    InspectorTarget::Key(k) => page.keys.get_mut(&k),
+                                    InspectorTarget::Dial(d) => page.dial_actions.get_mut(&d),
+                                    InspectorTarget::Touchscreen => page.touchscreen_action.as_mut(),
+                                } {
+                                    let apply = |app: &mut KeyAppearance| {
+                                        let opt = if text.is_empty() { None } else { Some(text.clone()) };
+                                        match position {
+                                            LabelPos::Top => app.top_label = opt,
+                                            LabelPos::Center => app.center_label = opt,
+                                            LabelPos::Bottom => app.bottom_label = opt,
+                                        }
+                                        if let Some(fs) = font_size {
+                                            app.font_size = fs;
+                                        }
+                                        if let Some(ref c) = color {
+                                            app.text_color = c.clone();
+                                        }
+                                    };
+                                    apply(&mut action.appearance);
+                                    let st_i = action.current_state;
+                                    if st_i < action.states.len() {
+                                        apply(&mut action.states[st_i]);
+                                    }
+                                    need_full_render = true;
+                                    need_single_redraw = true;
+                                }
+                            }
+                        }
+                        HostCommand::SetTitle(new_title) => {
+                            let mut prof = prof_nat.borrow_mut();
+                            if let Some(page) = prof.current_page_mut() {
+                                if let Some(action) = match target {
+                                    InspectorTarget::Key(k) => page.keys.get_mut(&k),
+                                    InspectorTarget::Dial(d) => page.dial_actions.get_mut(&d),
+                                    InspectorTarget::Touchscreen => page.touchscreen_action.as_mut(),
+                                } {
+                                    action.appearance.title = new_title.clone();
+                                    action.appearance.show_title = !new_title.is_empty();
+                                    for st in action.states.iter_mut() {
+                                        st.title = new_title.clone();
+                                        st.show_title = !new_title.is_empty();
+                                    }
+                                    need_persist = true;
+                                    need_full_render = true;
+                                    need_single_redraw = true;
+                                }
+                            }
+                        }
+                        HostCommand::SetMedia { path, icon_name } => {
+                            let mut prof = prof_nat.borrow_mut();
+                            if let Some(page) = prof.current_page_mut() {
+                                if let Some(action) = match target {
+                                    InspectorTarget::Key(k) => page.keys.get_mut(&k),
+                                    InspectorTarget::Dial(d) => page.dial_actions.get_mut(&d),
+                                    InspectorTarget::Touchscreen => page.touchscreen_action.as_mut(),
+                                } {
+                                    action.appearance.icon_path = path.clone();
+                                    for st in action.states.iter_mut() {
+                                        st.icon_path = path.clone();
+                                    }
+                                    if let Some(iname) = icon_name {
+                                        action.parameters.insert("icon_name".into(), iname);
+                                    }
+                                    need_persist = true;
+                                    need_full_render = true;
+                                    need_single_redraw = true;
+                                }
+                            }
+                        }
+                        HostCommand::SetBackgroundColor(bg) => {
+                            let mut prof = prof_nat.borrow_mut();
+                            if let Some(page) = prof.current_page_mut() {
+                                if let Some(action) = match target {
+                                    InspectorTarget::Key(k) => page.keys.get_mut(&k),
+                                    InspectorTarget::Dial(d) => page.dial_actions.get_mut(&d),
+                                    InspectorTarget::Touchscreen => page.touchscreen_action.as_mut(),
+                                } {
+                                    action.appearance.bg_color = bg.clone();
+                                    for st in action.states.iter_mut() {
+                                        st.bg_color = bg.clone();
+                                    }
+                                    need_persist = true;
+                                    need_full_render = true;
+                                    need_single_redraw = true;
+                                }
+                            }
+                        }
+                        HostCommand::EnterFolder {
+                            folder_id,
+                            folder_name,
+                        } => {
+                            {
+                                let mut prof = prof_nat.borrow_mut();
+                                prof.enter_folder(&folder_id, &folder_name);
+                            }
+                            need_persist = true;
+                            need_sync_page = true;
+                            need_full_render = true;
+                            need_full_hw_sync = true;
+                        }
+                        HostCommand::ExitFolder => {
+                            let exited = {
+                                let mut prof = prof_nat.borrow_mut();
+                                prof.exit_folder()
+                            };
+                            if exited {
+                                need_sync_page = true;
+                                need_full_render = true;
+                                need_full_hw_sync = true;
+                            }
+                        }
+                        HostCommand::SwitchPage(nav) => {
+                            let changed = {
+                                let mut prof = prof_nat.borrow_mut();
+                                match nav {
+                                    PageNav::Next => prof.next_page(),
+                                    PageNav::Prev => prof.prev_page(),
+                                    PageNav::Index(i) => prof.set_page(i),
+                                }
+                            };
+                            if changed {
+                                need_persist = true;
+                                need_sync_page = true;
+                                need_full_render = true;
+                                need_full_hw_sync = true;
+                            }
+                        }
+                        HostCommand::SwitchProfile(target_name) => {
+                            let cur_idx = *act_nat.borrow();
+                            let cur_dev = devs_nat.borrow().get(cur_idx).cloned();
+                            let dev_kind = cur_dev
+                                .as_ref()
+                                .map(|d| d.kind)
+                                .unwrap_or(DeviceKind::StreamDeckPlus);
+                            let dev_key = cur_dev
+                                .as_ref()
+                                .map(|d| d.stable_key())
+                                .unwrap_or_else(|| format!("{dev_kind:?}"));
+                            persist_nat();
+                            let profs_b = profs_nat.borrow();
+                            let found = profs_b
+                                .iter()
+                                .find(|p| p.device_kind == dev_kind && p.name == target_name)
+                                .cloned();
+                            if let Some(next_p) = found {
+                                *act_id_nat.borrow_mut() = next_p.id.clone();
+                                *prof_nat.borrow_mut() = next_p.clone();
+                                act_by_dev_nat.borrow_mut().insert(dev_key, next_p.id.clone());
+                                let p_names: Vec<String> = profs_b
+                                    .iter()
+                                    .filter(|p| p.device_kind == dev_kind)
+                                    .map(|p| p.name.clone())
+                                    .collect();
+                                let sel_pos = p_names
+                                    .iter()
+                                    .position(|n| n == &next_p.name)
+                                    .unwrap_or(0);
+                                ProfileStore::save_profiles(&profs_b, &act_by_dev_nat.borrow());
+                                drop(profs_b);
+                                hdr_nat.update_profiles(&p_names, sel_pos);
+                                need_sync_page = true;
+                                need_full_render = true;
+                                need_full_hw_sync = true;
+                            }
+                        }
+                        HostCommand::SetBrightness(op) => {
+                            let cur_idx = *act_nat.borrow();
+                            if let Some(dev) = devs_nat.borrow().get(cur_idx).cloned() {
+                                let skey = dev.stable_key();
+                                let mut ws = WindowState::load();
+                                let cur = ws.brightness_for(&skey);
+                                let next_b = match op {
+                                    BrightnessOp::Set(v) => v.min(100),
+                                    BrightnessOp::Delta(d) => (cur as i16 + d).clamp(0, 100) as u8,
+                                };
+                                ws.set_brightness_for(&skey, next_b);
+                                ws.save();
+                                sleep_nat.set(next_b == 0);
+                                nh_nat.set_current_brightness(next_b);
+                                let _ = hw_nat.borrow().set_brightness(&dev.dev_path, next_b);
+                            }
+                        }
+                        HostCommand::ToggleSleep => {
+                            let cur_idx = *act_nat.borrow();
+                            if let Some(dev) = devs_nat.borrow().get(cur_idx).cloned() {
+                                let skey = dev.stable_key();
+                                let ws = WindowState::load();
+                                let was_sleeping = sleep_nat.get();
+                                if was_sleeping {
+                                    sleep_nat.set(false);
+                                    let restored = ws.brightness_for(&skey).max(10);
+                                    nh_nat.set_current_brightness(restored);
+                                    let _ = hw_nat.borrow().set_brightness(&dev.dev_path, restored);
+                                } else {
+                                    sleep_nat.set(true);
+                                    nh_nat.set_current_brightness(0);
+                                    let _ = hw_nat.borrow().set_brightness(&dev.dev_path, 0);
+                                }
+                            }
+                        }
+                        HostCommand::OpenAppPicker => {
+                            let apps = insp_nat.installed_apps.borrow().clone();
+                            let prof_p = prof_nat.clone();
+                            let nh_p = nh_nat.clone();
+                            let can_p = canvas_nat.clone();
+                            let insp_p = insp_nat.clone();
+                            let hw_p = hw_nat.clone();
+                            let devs_p = devs_nat.clone();
+                            let act_p = act_nat.clone();
+                            let persist_p = persist_nat.clone();
+                            let slot_p = slot.clone();
+                            let tgt_p = target;
+
+                            super::inspector::show_app_picker_dialog(&win_nat, &apps, move |picked| {
+                                let resolved_icon =
+                                    super::canvas::resolve_icon_path(&picked.icon, 128);
+                                let mut updates: HashMap<String, serde_json::Value> = HashMap::new();
+                                updates.insert("desktop_id".into(), serde_json::json!(picked.desktop_id));
+                                updates.insert("app_name".into(), serde_json::json!(picked.name));
+                                updates.insert("icon_name".into(), serde_json::json!(picked.icon));
+                                if let Some(ref ip) = resolved_icon {
+                                    updates.insert("icon_path".into(), serde_json::json!(ip));
+                                }
+                                {
+                                    let mut prof = prof_p.borrow_mut();
+                                    if let Some(page) = prof.current_page_mut() {
+                                        let action = get_target_mut(page, tgt_p);
+                                        action.parameters.insert("desktop_id".into(), picked.desktop_id.clone());
+                                        action.parameters.insert("app_name".into(), picked.name.clone());
+                                        action.parameters.insert("icon_name".into(), picked.icon.clone());
+                                        if let Some(ref ip) = resolved_icon {
+                                            action.parameters.insert("icon_path".into(), ip.clone());
+                                        }
+                                        for (k, v) in &updates {
+                                            action.raw_settings.insert(k.clone(), v.clone());
+                                        }
+                                        action.appearance.title = picked.name.clone();
+                                        action.appearance.show_title = true;
+                                        action.appearance.icon_path = resolved_icon.clone();
+                                        for st in action.states.iter_mut() {
+                                            st.title = picked.name.clone();
+                                            st.show_title = true;
+                                            st.icon_path = resolved_icon.clone();
+                                        }
+                                    }
+                                }
+                                let _ = nh_p.update_slot_settings(&slot_p, updates);
+                                persist_p();
+                                let prof = prof_p.borrow();
+                                can_p.render_profile_page(&prof);
+                                insp_p.set_key_action(get_target_ref(&prof, tgt_p));
+                                drop(prof);
+                                Self::sync_hardware(&devs_p, *act_p.borrow(), &hw_p, &prof_p.borrow());
+                            });
+                        }
+                        HostCommand::OpenFilePicker { directories_only } => {
+                            let dialog = gtk::FileDialog::builder()
+                                .title(if directories_only { "Choose Folder" } else { "Choose File" })
+                                .modal(true)
+                                .build();
+                            let prof_f = prof_nat.clone();
+                            let nh_f = nh_nat.clone();
+                            let can_f = canvas_nat.clone();
+                            let insp_f = insp_nat.clone();
+                            let hw_f = hw_nat.clone();
+                            let devs_f = devs_nat.clone();
+                            let act_f = act_nat.clone();
+                            let persist_f = persist_nat.clone();
+                            let slot_f = slot.clone();
+                            let tgt_f = target;
+                            let apply_chosen = move |res: Result<gio::File, glib::Error>| {
+                                if let Ok(file) = res {
+                                    if let Some(path) = file.path() {
+                                        let p_str = path.to_string_lossy().to_string();
+                                        let label = path
+                                            .file_name()
+                                            .and_then(|n| n.to_str())
+                                            .unwrap_or(&p_str)
+                                            .to_string();
+                                        let mut updates = HashMap::new();
+                                        updates.insert("file_path".into(), serde_json::json!(p_str));
+                                        {
+                                            let mut prof = prof_f.borrow_mut();
+                                            if let Some(page) = prof.current_page_mut() {
+                                                let action = get_target_mut(page, tgt_f);
+                                                action.parameters.insert("file_path".into(), p_str.clone());
+                                                action.raw_settings.insert("file_path".into(), serde_json::json!(p_str));
+                                                action.appearance.title = label.clone();
+                                                action.appearance.show_title = true;
+                                                for st in action.states.iter_mut() {
+                                                    st.title = label.clone();
+                                                    st.show_title = true;
+                                                }
+                                            }
+                                        }
+                                        let _ = nh_f.update_slot_settings(&slot_f, updates);
+                                        persist_f();
+                                        let prof = prof_f.borrow();
+                                        can_f.render_profile_page(&prof);
+                                        insp_f.set_key_action(get_target_ref(&prof, tgt_f));
+                                        drop(prof);
+                                        Self::sync_hardware(&devs_f, *act_f.borrow(), &hw_f, &prof_f.borrow());
+                                    }
+                                }
+                            };
+                            if directories_only {
+                                dialog.select_folder(Some(&win_nat), gio::Cancellable::NONE, apply_chosen);
+                            } else {
+                                dialog.open(Some(&win_nat), gio::Cancellable::NONE, apply_chosen);
+                            }
+                        }
+                        HostCommand::ExecuteMultiAction { steps } => {
+                            let tx_bg = multi_tx.clone();
+                            std::thread::spawn(move || {
+                                for step in steps {
+                                    match step {
+                                        MultiActionStep::Delay { ms } => {
+                                            std::thread::sleep(std::time::Duration::from_millis(ms));
+                                        }
+                                        MultiActionStep::RunCommand { command } => {
+                                            crate::plugins::ballista_core::run_command::execute_shell_command(&command, "", false);
+                                        }
+                                        MultiActionStep::Hotkey { keys } => {
+                                            crate::plugins::ballista_core::hotkey::fire_hotkey(&keys);
+                                        }
+                                        MultiActionStep::TypeText { text, press_enter } => {
+                                            crate::plugins::ballista_core::hotkey::fire_type_text(&text, press_enter);
+                                        }
+                                        MultiActionStep::LaunchApp { desktop_id, .. } => {
+                                            crate::plugins::ballista_core::launcher::launch_desktop_app(&desktop_id, "");
+                                        }
+                                        MultiActionStep::OpenUrl { url } => {
+                                            crate::plugins::ballista_core::launcher::open_url_or_path(&url);
+                                        }
+                                        MultiActionStep::Media { action } => {
+                                            crate::plugins::ballista_core::media::trigger_mpris_action(&action);
+                                        }
+                                        ui_step @ (MultiActionStep::SwitchPage { .. }
+                                        | MultiActionStep::Brightness { .. }
+                                        | MultiActionStep::TriggerKey { .. }) => {
+                                            let _ = tx_bg.send_blocking(ui_step);
+                                        }
+                                    }
+                                }
+                            });
+                        }
+                    }
+                }
+
+                if need_persist {
+                    persist_nat();
+                }
+
+                if need_sync_page {
+                    let prof = prof_nat.borrow();
+                    sync_bridge_for_current_page(&prof, &pm_nat.borrow(), &nh_nat);
+                    canvas_nat.render_profile_page(&prof);
+                    let cur_target = *insp_nat.current_target.borrow();
+                    insp_nat.set_key_action(get_target_ref(&prof, cur_target));
+                    drop(prof);
+                    if need_full_hw_sync {
+                        Self::sync_hardware(&devs_nat, *act_nat.borrow(), &hw_nat, &prof_nat.borrow());
+                    }
+                    return;
+                }
+
+                if need_full_render {
+                    let prof = prof_nat.borrow();
+                    canvas_nat.render_profile_page(&prof);
+                    if target == *insp_nat.current_target.borrow() {
+                        if let Some(act) = get_target_ref(&prof, target) {
+                            insp_nat.update_preview_only(act);
+                        }
+                    }
+                }
+
+                if need_refresh_rows {
+                    let cur_t = *insp_nat.current_target.borrow();
+                    if format_target_slot(cur_t) == slot {
+                        if let Some(rows) = nh_nat.config_rows(&slot) {
+                            insp_nat.render_live_config_rows(&slot, &rows);
+                        }
+                        let prof = prof_nat.borrow();
+                        if let Some(act) = get_target_ref(&prof, cur_t) {
+                            if act.action_id == "ballista.multi_action" {
+                                insp_nat.render_multi_action_editor(&slot, act);
+                            }
+                        }
+                    }
+                }
+
+                if need_single_redraw {
+                    canvas_nat.redraw_native_slot(&slot);
+                    insp_nat.redraw_native_preview(&slot);
+                    if !sleep_nat.get() {
+                        let devs = devs_nat.borrow();
+                        let cur_idx = *act_nat.borrow();
+                        if let Some(dev) = devs.get(cur_idx) {
+                            hw_nat.borrow().sync_single_slot(
+                                &dev.dev_path,
+                                dev.kind,
+                                &prof_nat.borrow(),
+                                &slot,
+                            );
+                        }
+                    }
+                } else if need_full_hw_sync && !sleep_nat.get() {
+                    Self::sync_hardware(&devs_nat, *act_nat.borrow(), &hw_nat, &prof_nat.borrow());
+                }
+            })
+        };
+
+        // Wire Folder Breadcrumb Back Button
+        {
+            let disp_back = dispatch_native.clone();
+            canvas.set_folder_back_callback(move || {
+                disp_back("folder".into(), vec![HostCommand::ExitFolder], None);
+            });
+        }
+
+        // Wire Multi-Action Main-Thread Step Receiver (SwitchPage, Brightness, TriggerKey)
+        {
+            let disp_multi = dispatch_native.clone();
+            let prof_multi = profile.clone();
+            let pm_multi = plugin_manager.clone();
+            let nh_multi = native_host.clone();
+            let can_multi = canvas.clone();
+            glib::spawn_future_local(async move {
+                while let Ok(step) = multi_ui_rx.recv().await {
+                    match step {
+                        MultiActionStep::SwitchPage { target } => {
+                            let nav = match target.as_str() {
+                                "next" => PageNav::Next,
+                                "prev" => PageNav::Prev,
+                                num => PageNav::Index(num.parse::<usize>().unwrap_or(1).saturating_sub(1)),
+                            };
+                            disp_multi("multi".into(), vec![HostCommand::SwitchPage(nav)], None);
+                        }
+                        MultiActionStep::Brightness { percent } => {
+                            disp_multi(
+                                "multi".into(),
+                                vec![HostCommand::SetBrightness(BrightnessOp::Set(percent))],
+                                None,
+                            );
+                        }
+                        MultiActionStep::TriggerKey { key_index } => {
+                            let slot = format!("key_{key_index}");
+                            can_multi.pulse_key_press(key_index, 130);
+                            if nh_multi.has_slot(&slot) {
+                                let (cmds, updated) = nh_multi.handle_key_event(&slot, true);
+                                disp_multi(slot.clone(), cmds, updated);
+                                let nh_up = nh_multi.clone();
+                                let disp_up = disp_multi.clone();
+                                glib::timeout_add_local_once(
+                                    std::time::Duration::from_millis(100),
+                                    move || {
+                                        let (cmds2, upd2) = nh_up.handle_key_event(&slot, false);
+                                        disp_up(slot, cmds2, upd2);
+                                    },
+                                );
+                            } else {
+                                let is_bridge = prof_multi
+                                    .borrow()
+                                    .current_page()
+                                    .and_then(|p| p.keys.get(&key_index))
+                                    .map(|a| !a.plugin_id.is_empty() && a.plugin_id != "system")
+                                    .unwrap_or(false);
+                                if is_bridge {
+                                    pm_multi.borrow().bridge.send_key_event(&slot, true);
+                                    let pm_up = pm_multi.clone();
+                                    glib::timeout_add_local_once(
+                                        std::time::Duration::from_millis(110),
+                                        move || {
+                                            pm_up.borrow().bridge.send_key_event(&slot, false);
+                                        },
+                                    );
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            });
+        }
+
+        // Native Plugin Periodic Tick Loop (250ms cadence; only ticks actions whose tick_interval() is due!)
+        {
+            let nh_tick = native_host.clone();
+            let disp_tick = dispatch_native.clone();
+            glib::timeout_add_local(std::time::Duration::from_millis(250), move || {
+                for (slot, cmds) in nh_tick.tick_due() {
+                    let upd = nh_tick.get_slot_settings(&slot);
+                    disp_tick(slot, cmds, upd);
+                }
+                glib::ControlFlow::Continue
+            });
+        }
+
+        // Wire Multi-Action Step Sequence Editor saves
+        {
+            let prof_ms = profile.clone();
+            let nh_ms = native_host.clone();
+            let can_ms = canvas.clone();
+            let insp_ms = inspector.clone();
+            let hw_ms = hardware_manager.clone();
+            let devs_ms = connected_devices.clone();
+            let act_ms = active_device_idx.clone();
+            let persist_ms = persist_profiles.clone();
+            inspector.on_multi_steps_changed.borrow_mut().replace(std::boxed::Box::new(
+                move |slot, state_key, steps| {
+                    let target = parse_slot_target(&slot);
+                    let steps_val = serde_json::to_value(&steps).unwrap_or(serde_json::json!([]));
+                    let mut updates = HashMap::new();
+                    updates.insert(state_key.clone(), steps_val.clone());
+                    {
+                        let mut prof = prof_ms.borrow_mut();
+                        if let Some(page) = prof.current_page_mut() {
+                            if let Some(act) = match target {
+                                InspectorTarget::Key(k) => page.keys.get_mut(&k),
+                                InspectorTarget::Dial(d) => page.dial_actions.get_mut(&d),
+                                InspectorTarget::Touchscreen => page.touchscreen_action.as_mut(),
+                            } {
+                                act.raw_settings.insert(state_key, steps_val);
+                            }
+                        }
+                    }
+                    let _ = nh_ms.update_slot_settings(&slot, updates);
+                    persist_ms();
+                    can_ms.redraw_native_slot(&slot);
+                    insp_ms.redraw_native_preview(&slot);
+                    let prof = prof_ms.borrow();
+                    if let Some(act) = get_target_ref(&prof, target) {
+                        insp_ms.render_multi_action_editor(&slot, act);
+                    }
+                    let devs = devs_ms.borrow();
+                    if let Some(dev) = devs.get(*act_ms.borrow()) {
+                        hw_ms.borrow().sync_single_slot(&dev.dev_path, dev.kind, &prof, &slot);
+                    }
+                },
+            ));
+        }
+
         let pm_row = plugin_manager.clone();
+        let nh_row = native_host.clone();
+        let disp_row = dispatch_native.clone();
         inspector.on_config_row_changed.borrow_mut().replace(std::boxed::Box::new(move |slot, index, selected, active, text, color, value| {
-            pm_row.borrow().bridge.set_action_config_row(&slot, index, selected, active, text, color, value);
+            if nh_row.has_slot(&slot) {
+                let (cmds, updated) = nh_row.on_config_changed(
+                    &slot,
+                    index,
+                    ConfigChange {
+                        selected,
+                        active,
+                        text,
+                        value,
+                        color,
+                    },
+                );
+                disp_row(slot, cmds, updated);
+            } else {
+                pm_row.borrow().bridge.set_action_config_row(&slot, index, selected, active, text, color, value);
+            }
         }));
 
         let pm_btn = plugin_manager.clone();
+        let nh_btn = native_host.clone();
+        let disp_btn = dispatch_native.clone();
         inspector.on_config_button_clicked.borrow_mut().replace(std::boxed::Box::new(move |slot, index| {
-            pm_btn.borrow().bridge.trigger_action_config_button(&slot, index);
+            if nh_btn.has_slot(&slot) {
+                let (cmds, updated) = nh_btn.on_button_clicked(&slot, index);
+                disp_btn(slot, cmds, updated);
+            } else {
+                pm_btn.borrow().bridge.trigger_action_config_button(&slot, index);
+            }
         }));
 
         // Unified Action Assignment Helper (used by Sidebar click, post-install Sidebar, and Drag & Drop)
@@ -313,28 +1169,107 @@ impl MainWindow {
             let devs_assign = connected_devices.clone();
             let act_assign = active_device_idx.clone();
             let pm_assign = plugin_manager.clone();
+            let nh_assign = native_host.clone();
+            let disp_assign = dispatch_native.clone();
+            let persist_assign = persist_profiles.clone();
 
-            Rc::new(move |target, sel, select_in_ui| {
+            Rc::new(move |mut target, sel, mut select_in_ui| {
+                // Enforce Action Button Type Exclusivity (`TargetCaps`):
+                // - Direct drag-and-drop onto an incompatible slot is refused cleanly.
+                // - Right-click "Add" auto-targets a compatible slot on the active deck when available.
+                let is_native = nh_assign.is_native_plugin(&sel.plugin_id);
+                let caps = if is_native {
+                    nh_assign.action_caps(&sel.plugin_id, &sel.action_id)
+                } else {
+                    sel.caps
+                };
+                let target_surface = match target {
+                    InspectorTarget::Key(_) => crate::native_sdk::SlotSurface::Key,
+                    InspectorTarget::Dial(_) => crate::native_sdk::SlotSurface::Dial,
+                    InspectorTarget::Touchscreen => crate::native_sdk::SlotSurface::Touchscreen,
+                };
+                if !caps.supports(target_surface) {
+                    if select_in_ui {
+                        // Direct drag-and-drop onto an incompatible surface: hard reject!
+                        return;
+                    }
+                    // Sidebar right-click "Add": auto-route to the first empty compatible slot if the device supports it
+                    let dev_kind = devs_assign
+                        .borrow()
+                        .get(*act_assign.borrow())
+                        .map(|d| d.kind)
+                        .unwrap_or(DeviceKind::StreamDeckPlus);
+                    let prof = prof_assign.borrow();
+                    let redirected = if caps.dials && dev_kind.has_dials() {
+                        let d_idx = (0..dev_kind.dial_count())
+                            .find(|d| {
+                                prof.current_page()
+                                    .map(|pg| !pg.dial_actions.contains_key(d))
+                                    .unwrap_or(true)
+                            })
+                            .unwrap_or(0);
+                        Some(InspectorTarget::Dial(d_idx))
+                    } else if caps.keys && dev_kind.total_keys() > 0 {
+                        let k_idx = (0..dev_kind.total_keys())
+                            .find(|k| {
+                                prof.current_page()
+                                    .map(|pg| !pg.keys.contains_key(k))
+                                    .unwrap_or(true)
+                            })
+                            .unwrap_or(0);
+                        Some(InspectorTarget::Key(k_idx))
+                    } else {
+                        None
+                    };
+                    drop(prof);
+                    if let Some(next_target) = redirected {
+                        target = next_target;
+                        select_in_ui = true;
+                    } else {
+                        tracing::info!(
+                            "Action '{}' requires {:?} which is unavailable on {:?}",
+                            sel.action_name,
+                            caps,
+                            dev_kind
+                        );
+                        return;
+                    }
+                }
+
                 let slot = format_target_slot(target);
+                nh_assign.destroy_slot(&slot);
                 {
                     let pm = pm_assign.borrow();
                     pm.bridge.destroy_action(&slot);
                     pm.clear_live_config_rows(&slot);
                 }
 
-                let action_stem = sel.action_id.split("::").last().unwrap_or(&sel.action_id);
-                let states = pm_assign.borrow().resolve_action_states(&sel.plugin_id, action_stem);
                 let mut action = KeyAction::new(&sel.plugin_id, &sel.plugin_name, &sel.action_id, &sel.action_name);
-                if !states.is_empty() {
-                    action.appearance = states[0].clone();
-                    action.states = states;
-                    action.current_state = 0;
+
+                if is_native {
+                    if let Some(desc) = nh_assign.find_descriptor(&sel.plugin_id, &sel.action_id) {
+                        action.appearance.title = desc.default_title.clone();
+                        action.appearance.show_title = !desc.default_title.is_empty();
+                        if let Some(st) = action.states.first_mut() {
+                            st.title = desc.default_title;
+                            st.show_title = action.appearance.show_title;
+                        }
+                    }
                 } else {
-                    action.appearance.title = sel.action_name.clone();
+                    let action_stem = sel.action_id.split("::").last().unwrap_or(&sel.action_id);
+                    let states = pm_assign.borrow().resolve_action_states(&sel.plugin_id, action_stem);
+                    if !states.is_empty() {
+                        action.appearance = states[0].clone();
+                        action.states = states;
+                        action.current_state = 0;
+                    } else {
+                        action.appearance.title = sel.action_name.clone();
+                    }
+                    if !sel.icon_name.is_empty() {
+                        action.parameters.insert("icon_name".into(), sel.icon_name.clone());
+                    }
                 }
-                if !sel.icon_name.is_empty() {
-                    action.parameters.insert("icon_name".into(), sel.icon_name.clone());
-                }
+
                 let merged_settings = action.merged_settings_json();
                 {
                     let mut prof = prof_assign.borrow_mut();
@@ -353,7 +1288,18 @@ impl MainWindow {
                     }
                 }
 
-                if !sel.plugin_id.is_empty() && sel.plugin_id != "system" {
+                if is_native {
+                    let emitted = {
+                        let prof = prof_assign.borrow();
+                        prof.current_page()
+                            .map(|pg| nh_assign.sync_page(pg))
+                            .unwrap_or_default()
+                    };
+                    for (s, cmds) in emitted {
+                        let upd = nh_assign.get_slot_settings(&s);
+                        disp_assign(s, cmds, upd);
+                    }
+                } else if !sel.plugin_id.is_empty() && sel.plugin_id != "system" {
                     pm_assign.borrow().bridge.create_action(
                         &slot,
                         &sel.plugin_id,
@@ -376,6 +1322,7 @@ impl MainWindow {
                 insp_assign.set_key_action(get_target_ref(&prof, target));
                 insp_assign.highlight_action_settings();
                 drop(prof);
+                persist_assign();
                 Self::sync_hardware(&devs_assign, *act_assign.borrow(), &hw_assign, &prof_assign.borrow());
             })
         };
@@ -384,6 +1331,7 @@ impl MainWindow {
         let refresh_sidebar: Rc<dyn Fn()> = {
             let sb_ref = sidebar.clone();
             let pm_ref = plugin_manager.clone();
+            let nh_ref = native_host.clone();
             let insp_ref = inspector.clone();
             let assign_ref = assign_action.clone();
             Rc::new(move || {
@@ -391,7 +1339,7 @@ impl MainWindow {
                 *insp_ref.plugin_manager.borrow_mut() = Some(pm.clone());
                 let insp_click = insp_ref.clone();
                 let assign_click = assign_ref.clone();
-                sb_ref.populate_from_plugins(&pm, move |sel| {
+                sb_ref.populate_from_plugins(&pm, &nh_ref, move |sel| {
                     let target = *insp_click.current_target.borrow();
                     assign_click(target, sel, false);
                 });
@@ -413,6 +1361,7 @@ impl MainWindow {
         let pm_bridge = plugin_manager.clone();
         let active_ps_bridge = active_plugin_settings.clone();
         let refresh_sidebar_bridge = refresh_sidebar.clone();
+        let persist_bridge = persist_profiles.clone();
 
         glib::spawn_future_local(async move {
             while let Ok(event) = bridge_receiver.recv().await {
@@ -474,6 +1423,7 @@ impl MainWindow {
                             }
                         }
                         if updated {
+                            persist_bridge();
                             let prof = prof_bridge.borrow();
                             canvas_bridge.render_profile_page(&prof);
                             if target == *insp_bridge.current_target.borrow() {
@@ -537,6 +1487,7 @@ impl MainWindow {
                             }
                         }
                         if updated {
+                            persist_bridge();
                             let prof = prof_bridge.borrow();
                             canvas_bridge.render_profile_page(&prof);
                             if target == *insp_bridge.current_target.borrow() {
@@ -562,6 +1513,7 @@ impl MainWindow {
                             }
                         }
                         if updated {
+                            persist_bridge();
                             let prof = prof_bridge.borrow();
                             canvas_bridge.render_profile_page(&prof);
                             if target == *insp_bridge.current_target.borrow() {
@@ -590,6 +1542,8 @@ impl MainWindow {
                                 action.parameters.insert(k, val_str);
                             }
                         }
+                        drop(prof);
+                        persist_bridge();
                     }
                     crate::core::plugin_bridge::BridgeEvent::ActionConfigRows { slot, rows } => {
                         pm_bridge.borrow().set_live_config_rows(&slot, rows.clone());
@@ -612,6 +1566,7 @@ impl MainWindow {
                                 }
                             }
                         }
+                        persist_bridge();
                         let prof = prof_bridge.borrow();
                         canvas_bridge.render_profile_page(&prof);
                         if target == *insp_bridge.current_target.borrow() {
@@ -635,7 +1590,7 @@ impl MainWindow {
                 }
             }
         });
-        // Initial Canvas Render & Physical Hardware Sync
+        // Initial Canvas Render (Phase-1 parallel hardware boot already lit all connected decks!)
         canvas.update_scale(state.work_paned_position);
         canvas.render_profile_page(&profile.borrow());
         canvas.select_key(0);
@@ -643,7 +1598,6 @@ impl MainWindow {
         let prof_init = profile.borrow();
         inspector.set_key_action(prof_init.current_page().and_then(|p| p.keys.get(&0)));
         drop(prof_init);
-        Self::sync_hardware(&connected_devices, 0, &hardware_manager, &profile.borrow());
 
         // Wire canvas button click handlers
         Self::bind_canvas_events(
@@ -651,32 +1605,112 @@ impl MainWindow {
             &inspector,
             &profile,
             &plugin_manager,
+            &native_host,
+            &dispatch_native,
             &connected_devices,
             &active_device_idx,
             &hardware_manager,
         );
 
-        // ===================== Hardware Event Channel Setup =====================
-        let (sender, receiver) = async_channel::unbounded::<HardwareEvent>();
+        // ===================== Multi-Device Hardware Event Channel Setup =====================
+        // Receives `(device_index, HardwareEvent)` from ALL connected Stream Decks simultaneously!
+        let (sender, receiver) = async_channel::unbounded::<(usize, HardwareEvent)>();
 
         let canvas_hw = canvas.clone();
         let inspector_hw = inspector.clone();
         let profile_hw = profile.clone();
+        let profiles_hw = profiles.clone();
+        let active_by_dev_hw = active_by_device.clone();
         let pm_hw = plugin_manager.clone();
+        let nh_hw = native_host.clone();
+        let disp_hw = dispatch_native.clone();
+        let sleep_hw = deck_sleeping.clone();
         let devs_hw = connected_devices.clone();
         let act_hw = active_device_idx.clone();
         let hwm_hw = hardware_manager.clone();
+        let persist_hw = persist_profiles.clone();
 
         glib::spawn_future_local(async move {
-            while let Ok(event) = receiver.recv().await {
+            while let Ok((dev_idx, event)) = receiver.recv().await {
+                let is_active_deck = dev_idx == *act_hw.borrow();
+                if !is_active_deck {
+                    // Handle hardware events on secondary connected decks running in the background!
+                    let dev_opt = devs_hw.borrow().get(dev_idx).cloned();
+                    if let Some(dev) = dev_opt {
+                        let skey = dev.stable_key();
+                        let target_pid = active_by_dev_hw.borrow().get(&skey).cloned();
+                        let mut updated_prof: Option<Profile> = None;
+                        {
+                            let mut prof_list = profiles_hw.borrow_mut();
+                            let found_idx = target_pid
+                                .as_deref()
+                                .and_then(|pid| {
+                                    prof_list.iter().position(|p| p.id == pid && p.device_kind == dev.kind)
+                                })
+                                .or_else(|| prof_list.iter().position(|p| p.device_kind == dev.kind));
+                            if let Some(p_idx) = found_idx {
+                                let bg_prof = &mut prof_list[p_idx];
+                                let mut changed = false;
+                                match event {
+                                    HardwareEvent::KeyDown { key_index } => {
+                                        if let Some(page) = bg_prof.current_page_mut() {
+                                            if let Some(act) = page.keys.get_mut(&key_index) {
+                                                if act.states.len() > 1 && (act.plugin_id.is_empty() || act.plugin_id == "system") {
+                                                    act.toggle_state();
+                                                    changed = true;
+                                                }
+                                                if act.action_id == "app_launcher.launch" {
+                                                    if let Some(did) = act.parameters.get("desktop_id") {
+                                                        let _ = pm_hw.borrow().launch_app_desktop(did);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    HardwareEvent::TouchSwipe { is_right } => {
+                                        if is_right { bg_prof.prev_page(); } else { bg_prof.next_page(); }
+                                        changed = true;
+                                    }
+                                    _ => {}
+                                }
+                                if changed {
+                                    updated_prof = Some(bg_prof.clone());
+                                }
+                            }
+                        }
+                        if let Some(up) = updated_prof {
+                            hwm_hw.borrow().sync_hardware_page(&dev.dev_path, dev.kind, &up);
+                            ProfileStore::save_profiles(&profiles_hw.borrow(), &active_by_dev_hw.borrow());
+                        }
+                    }
+                    continue;
+                }
+
                 match event {
                     HardwareEvent::KeyDown { key_index } => {
                         tracing::info!("Physical Stream Deck Key Down: key {}", key_index);
+                        if sleep_hw.get() {
+                            disp_hw("sleep".into(), vec![HostCommand::ToggleSleep], None);
+                            continue;
+                        }
                         let prev_target = *inspector_hw.current_target.borrow();
                         let new_target = InspectorTarget::Key(key_index);
                         canvas_hw.select_key(key_index);
                         canvas_hw.set_key_pressed(key_index, true);
                         inspector_hw.set_target(new_target);
+
+                        let slot_str = format!("key_{key_index}");
+                        if nh_hw.has_slot(&slot_str) {
+                            let (cmds, updated) = nh_hw.handle_key_event(&slot_str, true);
+                            disp_hw(slot_str, cmds, updated);
+                            let prof = profile_hw.borrow();
+                            if prev_target != new_target {
+                                if let Some(page) = prof.current_page() {
+                                    inspector_hw.set_key_action(page.keys.get(&key_index));
+                                }
+                            }
+                            continue;
+                        }
 
                         let mut is_plugin_action = false;
                         let mut toggled = false;
@@ -702,7 +1736,7 @@ impl MainWindow {
                         }
 
                         if is_plugin_action {
-                            pm_hw.borrow().bridge.send_key_event(&format!("key_{key_index}"), true);
+                            pm_hw.borrow().bridge.send_key_event(&slot_str, true);
                         }
 
                         let prof = profile_hw.borrow();
@@ -719,6 +1753,12 @@ impl MainWindow {
                     HardwareEvent::KeyUp { key_index } => {
                         tracing::info!("Physical Stream Deck Key Up: key {}", key_index);
                         canvas_hw.set_key_pressed(key_index, false);
+                        let slot_str = format!("key_{key_index}");
+                        if nh_hw.has_slot(&slot_str) {
+                            let (cmds, updated) = nh_hw.handle_key_event(&slot_str, false);
+                            disp_hw(slot_str, cmds, updated);
+                            continue;
+                        }
                         let is_plugin_action = profile_hw
                             .borrow()
                             .current_page()
@@ -726,26 +1766,55 @@ impl MainWindow {
                             .map(|a| !a.plugin_id.is_empty() && a.plugin_id != "system")
                             .unwrap_or(false);
                         if is_plugin_action {
-                            pm_hw.borrow().bridge.send_key_event(&format!("key_{key_index}"), false);
+                            pm_hw.borrow().bridge.send_key_event(&slot_str, false);
                         }
                     }
                     HardwareEvent::DialRotate { dial_index, delta } => {
                         tracing::info!("Physical Stream Deck Dial Rotate: dial {}, delta {}", dial_index, delta);
                         canvas_hw.rotate_dial(dial_index, delta);
-                        pm_hw.borrow().bridge.send_dial_event(&format!("dial_{dial_index}"), "turn", delta);
+                        let slot_str = format!("dial_{dial_index}");
+                        if nh_hw.has_slot(&slot_str) {
+                            let (cmds, updated) = nh_hw.handle_dial_rotate(&slot_str, delta);
+                            disp_hw(slot_str, cmds, updated);
+                        } else {
+                            pm_hw.borrow().bridge.send_dial_event(&slot_str, "turn", delta);
+                        }
                     }
                     HardwareEvent::DialPress { dial_index } => {
                         tracing::info!("Physical Stream Deck Dial Press: dial {}", dial_index);
-                        pm_hw.borrow().bridge.send_dial_event(&format!("dial_{dial_index}"), "press", 0);
+                        canvas_hw.set_dial_pressed(dial_index, true);
+                        let slot_str = format!("dial_{dial_index}");
+                        if nh_hw.has_slot(&slot_str) {
+                            let (cmds, updated) = nh_hw.handle_dial_press(&slot_str, true);
+                            disp_hw(slot_str, cmds, updated);
+                        } else {
+                            pm_hw.borrow().bridge.send_dial_event(&slot_str, "press", 0);
+                        }
                     }
                     HardwareEvent::DialRelease { dial_index } => {
                         tracing::info!("Physical Stream Deck Dial Release: dial {}", dial_index);
-                        pm_hw.borrow().bridge.send_dial_event(&format!("dial_{dial_index}"), "release", 0);
+                        canvas_hw.set_dial_pressed(dial_index, false);
+                        let slot_str = format!("dial_{dial_index}");
+                        if nh_hw.has_slot(&slot_str) {
+                            let (cmds, updated) = nh_hw.handle_dial_press(&slot_str, false);
+                            disp_hw(slot_str, cmds, updated);
+                        } else {
+                            pm_hw.borrow().bridge.send_dial_event(&slot_str, "release", 0);
+                        }
                     }
                     HardwareEvent::TouchTap { slot, x, y } => {
                         tracing::info!("Physical Stream Deck Touch Tap: slot {}, x {}, y {}", slot, x, y);
-                        inspector_hw.title_label.set_text(&format!("Stream Deck + Touch Slot {}", slot + 1));
-                        pm_hw.borrow().bridge.send_dial_event(&format!("dial_{slot}"), "tap", 0);
+                        canvas_hw.pulse_dial_press(slot, 115);
+                        let slot_str = format!("dial_{slot}");
+                        if nh_hw.has_slot(&slot_str) {
+                            let local_x = (x as f64 - (slot as f64 * 200.0)).clamp(0.0, 200.0);
+                            let norm_x = (local_x / 200.0).clamp(0.0, 1.0);
+                            let norm_y = (y as f64 / 100.0).clamp(0.0, 1.0);
+                            let (cmds, updated) = nh_hw.handle_touch_tap(&slot_str, norm_x, norm_y);
+                            disp_hw(slot_str, cmds, updated);
+                        } else {
+                            pm_hw.borrow().bridge.send_dial_event(&slot_str, "tap", 0);
+                        }
                     }
                     HardwareEvent::TouchSwipe { is_right } => {
                         tracing::info!("Physical Stream Deck Touch Swipe: right={}", is_right);
@@ -765,7 +1834,8 @@ impl MainWindow {
                             }
                             let p_imm = p.clone();
                             drop(p);
-                            sync_bridge_for_current_page(&p_imm, &pm_hw.borrow());
+                            persist_hw();
+                            sync_bridge_for_current_page(&p_imm, &pm_hw.borrow(), &nh_hw);
                             canvas_hw.render_profile_page(&p_imm);
                             let cur_target = *inspector_hw.current_target.borrow();
                             inspector_hw.set_key_action(get_target_ref(&p_imm, cur_target));
@@ -776,38 +1846,45 @@ impl MainWindow {
             }
         });
 
-        // Start Hardware Listener for initial device
-        let sender_hw_loop = sender.clone();
-        if let Some(first_dev) = connected_devices.borrow().first() {
-            let s = sender_hw_loop.clone();
-            hardware_manager.borrow().start_listener(
-                first_dev.dev_path.clone(),
-                first_dev.kind,
-                move |event| {
-                    let _ = s.send_blocking(event);
-                },
-            );
-            let _ = hardware_manager.borrow().set_brightness(&first_dev.dev_path, 80);
-            hardware_manager.borrow().sync_hardware_page(&first_dev.dev_path, first_dev.kind, &profile.borrow());
+        // Start simultaneous USB HID listeners for EVERY connected Stream Deck
+        {
+            let devs = connected_devices.borrow();
+            for (idx, dev) in devs.iter().enumerate() {
+                let s = sender.clone();
+                hardware_manager.borrow().start_listener(
+                    dev.dev_path.clone(),
+                    dev.kind,
+                    move |event| {
+                        let _ = s.send_blocking((idx, event));
+                    },
+                );
+            }
         }
 
         // ===================== Synchronize Profile & Header =====================
-        let sync_all = {
+        let sync_all_with_hw = {
             let profs = profiles.clone();
             let act_id = active_profile_id.clone();
+            let act_by_dev = active_by_device.clone();
             let p_cur = profile.clone();
             let c_cur = canvas.clone();
             let insp_cur = inspector.clone();
             let pm_cur = plugin_manager.clone();
+            let nh_cur = native_host.clone();
             let d_cur = connected_devices.clone();
             let act_idx = active_device_idx.clone();
             let h_cur = hardware_manager.clone();
             let hdr = header.clone();
 
-            Rc::new(move || {
+            Rc::new(move |push_to_hw: bool| {
                 let devs = d_cur.borrow();
                 let cur_idx = *act_idx.borrow();
-                let dev_kind = devs.get(cur_idx).map(|d| d.kind).unwrap_or(DeviceKind::StreamDeckPlus);
+                let cur_dev = devs.get(cur_idx).cloned();
+                let dev_kind = cur_dev.as_ref().map(|d| d.kind).unwrap_or(DeviceKind::StreamDeckPlus);
+                let dev_key = cur_dev
+                    .as_ref()
+                    .map(|d| d.stable_key())
+                    .unwrap_or_else(|| format!("{dev_kind:?}"));
                 drop(devs);
 
                 let mut profs_b = profs.borrow_mut();
@@ -819,8 +1896,14 @@ impl MainWindow {
                     .collect();
 
                 let cur_id = act_id.borrow().clone();
-                let found_idx = matching_indices.iter().find(|&&i| profs_b[i].id == cur_id)
+                let found_idx = matching_indices
+                    .iter()
+                    .find(|&&i| profs_b[i].id == cur_id)
                     .copied()
+                    .or_else(|| {
+                        let mapped = act_by_dev.borrow().get(&dev_key).cloned();
+                        mapped.and_then(|mid| matching_indices.iter().find(|&&i| profs_b[i].id == mid).copied())
+                    })
                     .or_else(|| matching_indices.first().copied());
 
                 if let Some(target_idx) = found_idx {
@@ -833,6 +1916,8 @@ impl MainWindow {
                     profs_b.push(new_p);
                 }
 
+                act_by_dev.borrow_mut().insert(dev_key, act_id.borrow().clone());
+
                 let p_names: Vec<String> = profs_b
                     .iter()
                     .filter(|p| p.device_kind == dev_kind)
@@ -843,20 +1928,43 @@ impl MainWindow {
                     .filter(|p| p.device_kind == dev_kind)
                     .position(|p| p.id == *act_id.borrow())
                     .unwrap_or(0);
+                ProfileStore::save_profiles(&profs_b, &act_by_dev.borrow());
                 drop(profs_b);
 
                 hdr.update_profiles(&p_names, selected_pos);
                 let prof = p_cur.borrow();
-                sync_bridge_for_current_page(&prof, &pm_cur.borrow());
+                let cur_b = {
+                    let ws = WindowState::load();
+                    d_cur
+                        .borrow()
+                        .get(cur_idx)
+                        .map(|d| ws.brightness_for(&d.stable_key()))
+                        .unwrap_or(80)
+                };
+                nh_cur.set_deck_state(
+                    p_names,
+                    prof.name.clone(),
+                    prof.current_page_idx,
+                    prof.pages.len(),
+                    cur_b,
+                );
+                sync_bridge_for_current_page(&prof, &pm_cur.borrow(), &nh_cur);
                 c_cur.render_profile_page(&prof);
                 let cur_target = *insp_cur.current_target.borrow();
                 insp_cur.set_key_action(get_target_ref(&prof, cur_target));
-                Self::sync_hardware(&d_cur, cur_idx, &h_cur, &prof);
+                if push_to_hw {
+                    Self::sync_hardware(&d_cur, cur_idx, &h_cur, &prof);
+                }
             })
         };
 
-        // Run initial synchronization
-        sync_all();
+        let sync_all: Rc<dyn Fn()> = {
+            let f = sync_all_with_hw.clone();
+            Rc::new(move || f(true))
+        };
+
+        // Run initial UI & bridge sync without redundant synchronous hardware write (Phase-1 parallel boot already pushed hardware!)
+        sync_all_with_hw(false);
 
         // Connect Header Profile Dropdown switching
         let profs_dd = profiles.clone();
@@ -864,6 +1972,7 @@ impl MainWindow {
         let devs_dd = connected_devices.clone();
         let act_idx_dd = active_device_idx.clone();
         let sync_dd = sync_all.clone();
+        let persist_dd = persist_profiles.clone();
         header.profile_dropdown.connect_selected_notify(move |dd| {
             let sel = dd.selected() as usize;
             let devs = devs_dd.borrow();
@@ -875,8 +1984,10 @@ impl MainWindow {
             let matching: Vec<_> = profs_b.iter().filter(|p| p.device_kind == dev_kind).collect();
             if let Some(target) = matching.get(sel) {
                 if target.id != *act_id_dd.borrow() {
-                    *act_id_dd.borrow_mut() = target.id.clone();
+                    let target_id = target.id.clone();
                     drop(profs_b);
+                    persist_dd();
+                    *act_id_dd.borrow_mut() = target_id;
                     sync_dd();
                 }
             }
@@ -887,23 +1998,32 @@ impl MainWindow {
         let profile_dev = profile.clone();
         let inspector_dev = inspector.clone();
         let pm_dev = plugin_manager.clone();
+        let nh_dev = native_host.clone();
+        let disp_dev = dispatch_native.clone();
         let devs_select = connected_devices.clone();
         let hw_dev_switch = hardware_manager.clone();
         let active_idx_switch = active_device_idx.clone();
-        let sender_switch = sender.clone();
+        let act_id_dev = active_profile_id.clone();
+        let act_by_dev_sw = active_by_device.clone();
         let sync_dev_change = sync_all.clone();
+        let persist_dev = persist_profiles.clone();
         let work_paned_dev = work_paned.clone();
 
         header.device_dropdown.connect_selected_notify(move |dd| {
             let sel_idx = dd.selected() as usize;
-            let devs = devs_select.borrow();
-            if let Some(dev) = devs.get(sel_idx) {
+            // Save edits on the previous device before switching active canvas view
+            persist_dev();
+            let dev_opt = devs_select.borrow().get(sel_idx).cloned();
+            if let Some(dev) = dev_opt {
                 *active_idx_switch.borrow_mut() = sel_idx;
+
+                if let Some(saved_pid) = act_by_dev_sw.borrow().get(&dev.stable_key()).cloned() {
+                    *act_id_dev.borrow_mut() = saved_pid;
+                }
 
                 // 1. Rebuild canvas grid, touchscreen, and dials for the selected device
                 canvas_dev.build_hardware_layout(dev.kind);
                 canvas_dev.update_scale(work_paned_dev.position());
-                drop(devs);
                 canvas_dev.select_key(0);
                 inspector_dev.set_target(InspectorTarget::Key(0));
                 sync_dev_change();
@@ -914,27 +2034,104 @@ impl MainWindow {
                     &inspector_dev,
                     &profile_dev,
                     &pm_dev,
+                    &nh_dev,
+                    &disp_dev,
                     &devs_select,
                     &active_idx_switch,
                     &hw_dev_switch,
                 );
-
-                // 3. Reconnect hardware listener thread to this device
-                let s = sender_switch.clone();
-                let devs_lock = devs_select.borrow();
-                if let Some(d) = devs_lock.get(sel_idx) {
-                    hw_dev_switch.borrow().start_listener(
-                        d.dev_path.clone(),
-                        d.kind,
-                        move |event| {
-                            let _ = s.send_blocking(event);
-                        },
-                    );
-                    let _ = hw_dev_switch.borrow().set_brightness(&d.dev_path, 80);
-                    hw_dev_switch.borrow().sync_hardware_page(&d.dev_path, d.kind, &profile_dev.borrow());
-                }
             }
         });
+
+        // ===================== Wire Native System Tray Events =====================
+        {
+            let win_tray = window.clone();
+            let quit_tray = perform_full_quit.clone();
+            let hw_tray = hardware_manager.clone();
+            let devs_tray = connected_devices.clone();
+            let hdr_tray = header.clone();
+            let tray_handle_ref = tray.clone();
+            let sender_tray = sender.clone();
+            let profs_tray = profiles.clone();
+            let act_map_tray = active_by_device.clone();
+            let sync_tray = sync_all.clone();
+            let canvas_tray = canvas.clone();
+            let work_paned_tray = work_paned.clone();
+            let insp_tray = inspector.clone();
+            let prof_tray = profile.clone();
+            let pm_tray = plugin_manager.clone();
+            let nh_tray = native_host.clone();
+            let disp_tray = dispatch_native.clone();
+            let act_idx_tray = active_device_idx.clone();
+
+            glib::spawn_future_local(async move {
+                while let Ok(cmd) = tray_rx.recv().await {
+                    match cmd {
+                        TrayCommand::ToggleWindow => {
+                            if win_tray.is_visible() {
+                                win_tray.set_visible(false);
+                            } else {
+                                win_tray.set_visible(true);
+                                win_tray.present();
+                            }
+                        }
+                        TrayCommand::ShowWindow => {
+                            win_tray.set_visible(true);
+                            win_tray.present();
+                        }
+                        TrayCommand::RescanHardware => {
+                            tracing::info!("Rescanning connected Elgato hardware via system tray...");
+                            hw_tray.borrow().stop_all_listeners();
+                            let new_devs = hw_tray.borrow().scan_devices();
+                            let tray_names: Vec<String> = new_devs.iter().map(|d| d.name.clone()).collect();
+                            *devs_tray.borrow_mut() = new_devs.clone();
+                            *act_idx_tray.borrow_mut() = 0;
+
+                            hdr_tray.populate_devices(&new_devs);
+                            tray_handle_ref.borrow().update_devices(tray_names);
+
+                            let st = WindowState::load();
+                            let store_snap = ProfileStore {
+                                profiles: profs_tray.borrow().clone(),
+                                active_by_device: act_map_tray.borrow().clone(),
+                            };
+                            let mut targets = Vec::new();
+                            for (idx, d) in new_devs.iter().enumerate() {
+                                let skey = d.stable_key();
+                                let p = store_snap.active_profile_for(&skey, d.kind);
+                                let b = st.brightness_for(&skey);
+                                targets.push((d.dev_path.clone(), d.kind, p, b));
+                                let s = sender_tray.clone();
+                                hw_tray.borrow().start_listener(d.dev_path.clone(), d.kind, move |ev| {
+                                    let _ = s.send_blocking((idx, ev));
+                                });
+                            }
+                            hw_tray.borrow().sync_all_devices_async(targets);
+
+                            if let Some(first) = new_devs.first() {
+                                canvas_tray.build_hardware_layout(first.kind);
+                                canvas_tray.update_scale(work_paned_tray.position());
+                                Self::bind_canvas_events(
+                                    &canvas_tray,
+                                    &insp_tray,
+                                    &prof_tray,
+                                    &pm_tray,
+                                    &nh_tray,
+                                    &disp_tray,
+                                    &devs_tray,
+                                    &act_idx_tray,
+                                    &hw_tray,
+                                );
+                            }
+                            sync_tray();
+                        }
+                        TrayCommand::Quit => {
+                            quit_tray();
+                        }
+                    }
+                }
+            });
+        }
 
         // ===================== Connect Header Actions =====================
         let win_clone1 = window.clone();
@@ -981,17 +2178,20 @@ impl MainWindow {
         let canvas_page_add = canvas.clone();
         let insp_page_add = inspector.clone();
         let pm_page_add = plugin_manager.clone();
+        let nh_page_add = native_host.clone();
         let hw_page_add = hardware_manager.clone();
         let devs_page_add = connected_devices.clone();
         let act_page_add = active_device_idx.clone();
+        let persist_page_add = persist_profiles.clone();
 
         canvas.add_page_btn.connect_clicked(move |_| {
             {
                 let mut p = prof_page_add.borrow_mut();
                 p.add_page();
             }
+            persist_page_add();
             let p = prof_page_add.borrow();
-            sync_bridge_for_current_page(&p, &pm_page_add.borrow());
+            sync_bridge_for_current_page(&p, &pm_page_add.borrow(), &nh_page_add);
             canvas_page_add.render_profile_page(&p);
             let cur_target = *insp_page_add.current_target.borrow();
             insp_page_add.set_key_action(get_target_ref(&p, cur_target));
@@ -1003,17 +2203,20 @@ impl MainWindow {
         let canvas_page_del = canvas.clone();
         let insp_page_del = inspector.clone();
         let pm_page_del = plugin_manager.clone();
+        let nh_page_del = native_host.clone();
         let hw_page_del = hardware_manager.clone();
         let devs_page_del = connected_devices.clone();
         let act_page_del = active_device_idx.clone();
+        let persist_page_del = persist_profiles.clone();
 
         canvas.remove_page_btn.connect_clicked(move |_| {
             {
                 let mut p = prof_page_del.borrow_mut();
                 p.remove_current_page();
             }
+            persist_page_del();
             let p = prof_page_del.borrow();
-            sync_bridge_for_current_page(&p, &pm_page_del.borrow());
+            sync_bridge_for_current_page(&p, &pm_page_del.borrow(), &nh_page_del);
             canvas_page_del.render_profile_page(&p);
             let cur_target = *insp_page_del.current_target.borrow();
             insp_page_del.set_key_action(get_target_ref(&p, cur_target));
@@ -1025,17 +2228,20 @@ impl MainWindow {
         let canvas_page_sel = canvas.clone();
         let insp_page_sel = inspector.clone();
         let pm_page_sel = plugin_manager.clone();
+        let nh_page_sel = native_host.clone();
         let hw_page_sel = hardware_manager.clone();
         let devs_page_sel = connected_devices.clone();
         let act_page_sel = active_device_idx.clone();
+        let persist_page_sel = persist_profiles.clone();
 
         canvas.set_page_callback(move |page_idx| {
             {
                 let mut p = prof_page_sel.borrow_mut();
                 p.set_page(page_idx);
             }
+            persist_page_sel();
             let p = prof_page_sel.borrow();
-            sync_bridge_for_current_page(&p, &pm_page_sel.borrow());
+            sync_bridge_for_current_page(&p, &pm_page_sel.borrow(), &nh_page_sel);
             canvas_page_sel.render_profile_page(&p);
             let cur_target = *insp_page_sel.current_target.borrow();
             insp_page_sel.set_key_action(get_target_ref(&p, cur_target));
@@ -1053,6 +2259,7 @@ impl MainWindow {
         let devs_title = connected_devices.clone();
         let act_title = active_device_idx.clone();
         let insp_updating_title = inspector.is_updating.clone();
+        let persist_title = persist_profiles.clone();
 
         let insp_ui_title = inspector.clone();
         inspector.title_entry.connect_changed(move |entry| {
@@ -1068,6 +2275,7 @@ impl MainWindow {
                     mutate_target_appearance(page, target, st, |app| app.title = text.clone());
                 }
             }
+            persist_title();
             insp_ui_title.preview_inner_label.set_text(&text);
             if !text.is_empty() {
                 insp_ui_title.mark_assigned();
@@ -1085,6 +2293,7 @@ impl MainWindow {
         let hw_title_toggle = hardware_manager.clone();
         let devs_title_toggle = connected_devices.clone();
         let act_title_toggle = active_device_idx.clone();
+        let persist_title_toggle = persist_profiles.clone();
 
         inspector.title_toggle_btn.connect_clicked(move |btn| {
             let target = *insp_title_toggle.current_target.borrow();
@@ -1099,6 +2308,7 @@ impl MainWindow {
                     });
                 }
             }
+            persist_title_toggle();
             btn.set_icon_name(if is_shown { "view-reveal-symbolic" } else { "view-conceal-symbolic" });
             btn.set_tooltip_text(Some(if is_shown { "Hide Title on Key" } else { "Show Title on Key" }));
 
@@ -1121,6 +2331,7 @@ impl MainWindow {
         let hw_font = hardware_manager.clone();
         let devs_font = connected_devices.clone();
         let act_font = active_device_idx.clone();
+        let persist_font = persist_profiles.clone();
 
         inspector.font_dialog_button.connect_font_desc_notify(move |fdb| {
             if insp_font.is_updating.get() {
@@ -1140,6 +2351,7 @@ impl MainWindow {
                         });
                     }
                 }
+                persist_font();
                 insp_font.is_updating.set(true);
                 insp_font.font_size_spin.set_value(sz as f64);
                 insp_font.is_updating.set(false);
@@ -1158,6 +2370,7 @@ impl MainWindow {
         let hw_spin = hardware_manager.clone();
         let devs_spin = connected_devices.clone();
         let act_spin = active_device_idx.clone();
+        let persist_spin = persist_profiles.clone();
 
         inspector.font_size_spin.connect_value_changed(move |spin| {
             if insp_spin.is_updating.get() {
@@ -1172,6 +2385,7 @@ impl MainWindow {
                     mutate_target_appearance(page, target, st, |app| app.font_size = sz);
                 }
             }
+            persist_spin();
             let prof = prof_spin.borrow();
             canvas_spin.render_profile_page(&prof);
             drop(prof);
@@ -1187,6 +2401,7 @@ impl MainWindow {
         let act_bg = active_device_idx.clone();
         let insp_updating_bg = inspector.is_updating.clone();
         let insp_bg_state = inspector.clone();
+        let persist_bg = persist_profiles.clone();
 
         inspector.btn_color_picker.connect_rgba_notify(move |cp| {
             if insp_updating_bg.get() {
@@ -1201,6 +2416,7 @@ impl MainWindow {
                     mutate_target_appearance(page, target, st, |app| app.bg_color = Some(hex));
                 }
             }
+            persist_bg();
             let prof = prof_bg.borrow();
             canvas_bg.render_profile_page(&prof);
             drop(prof);
@@ -1214,6 +2430,7 @@ impl MainWindow {
         let hw_bg_rst = hardware_manager.clone();
         let devs_bg_rst = connected_devices.clone();
         let act_bg_rst = active_device_idx.clone();
+        let persist_bg_rst = persist_profiles.clone();
 
         inspector.btn_color_reset.connect_clicked(move |_| {
             let target = *insp_bg_rst.current_target.borrow();
@@ -1224,6 +2441,7 @@ impl MainWindow {
                     mutate_target_appearance(page, target, st, |app| app.bg_color = None);
                 }
             }
+            persist_bg_rst();
             insp_bg_rst.is_updating.set(true);
             insp_bg_rst.btn_color_picker.set_rgba(&RGBA::new(0.098, 0.098, 0.125, 1.0));
             insp_bg_rst.is_updating.set(false);
@@ -1243,6 +2461,7 @@ impl MainWindow {
         let act_fg = active_device_idx.clone();
         let insp_updating_fg = inspector.is_updating.clone();
         let insp_fg_state = inspector.clone();
+        let persist_fg = persist_profiles.clone();
 
         inspector.text_color_picker.connect_rgba_notify(move |cp| {
             if insp_updating_fg.get() {
@@ -1257,6 +2476,7 @@ impl MainWindow {
                     mutate_target_appearance(page, target, st, |app| app.text_color = hex);
                 }
             }
+            persist_fg();
             let prof = prof_fg.borrow();
             canvas_fg.render_profile_page(&prof);
             drop(prof);
@@ -1271,6 +2491,7 @@ impl MainWindow {
         let devs_icon = connected_devices.clone();
         let act_icon = active_device_idx.clone();
         let win_icon = window.clone();
+        let persist_icon = persist_profiles.clone();
 
         inspector.browse_icon_btn.connect_clicked(move |_| {
             let target = *insp_icon.current_target.borrow();
@@ -1304,6 +2525,7 @@ impl MainWindow {
             let hw_c = hw_icon.clone();
             let devs_c = devs_icon.clone();
             let act_c = act_icon.clone();
+            let persist_c = persist_icon.clone();
 
             dialog.open(Some(&win_icon), gio::Cancellable::NONE, move |res| {
                 if let Ok(file) = res {
@@ -1317,6 +2539,7 @@ impl MainWindow {
                                 mutate_target_appearance(page, target, st, |app| app.icon_path = Some(path_str.clone()));
                             }
                         }
+                        persist_c();
                         insp_c.mark_assigned();
                         let p = prof_c.borrow();
                         let act_opt = p.current_page().and_then(|pg| match target {
@@ -1340,6 +2563,7 @@ impl MainWindow {
         let hw_rst_icon = hardware_manager.clone();
         let devs_rst_icon = connected_devices.clone();
         let act_rst_icon = active_device_idx.clone();
+        let persist_rst_icon = persist_profiles.clone();
 
         inspector.clear_icon_btn.connect_clicked(move |_| {
             let target = *insp_rst_icon.current_target.borrow();
@@ -1350,6 +2574,7 @@ impl MainWindow {
                     mutate_target_appearance(page, target, st, |app| app.icon_path = None);
                 }
             }
+            persist_rst_icon();
             insp_rst_icon.preview_icon.set_visible(false);
             let p = prof_rst_icon.borrow();
             canvas_rst_icon.render_profile_page(&p);
@@ -1364,6 +2589,7 @@ impl MainWindow {
         let hw_scale = hardware_manager.clone();
         let devs_scale = connected_devices.clone();
         let act_scale = active_device_idx.clone();
+        let persist_scale = persist_profiles.clone();
 
         inspector.icon_scale_spin.connect_value_changed(move |spin| {
             if insp_scale.is_updating.get() {
@@ -1378,6 +2604,7 @@ impl MainWindow {
                     mutate_target_appearance(page, target, st, |app| app.icon_scale = val);
                 }
             }
+            persist_scale();
 
             let prof = prof_scale.borrow();
             let act_opt = prof.current_page().and_then(|pg| match target {
@@ -1400,7 +2627,8 @@ impl MainWindow {
                            insp: Rc<PropertyInspector>,
                            hw: Rc<RefCell<HardwareManager>>,
                            devs: Rc<RefCell<Vec<ConnectedDevice>>>,
-                           act: Rc<RefCell<usize>>| {
+                           act: Rc<RefCell<usize>>,
+                           persist: Rc<dyn Fn()>| {
             btn.connect_clicked(move |_| {
                 let target = *target_ref.borrow();
                 let st = insp.selected_state_idx.get();
@@ -1410,6 +2638,7 @@ impl MainWindow {
                         mutate_target_appearance(page, target, st, |app| app.vertical_align = pos);
                     }
                 }
+                persist();
                 let p = prof.borrow();
                 can.render_profile_page(&p);
 
@@ -1435,9 +2664,9 @@ impl MainWindow {
             });
         };
 
-        connect_pos(&inspector.pos_top_btn, TextVerticalAlign::Top, profile.clone(), canvas.clone(), inspector.current_target.clone(), inspector.clone(), hardware_manager.clone(), connected_devices.clone(), active_device_idx.clone());
-        connect_pos(&inspector.pos_mid_btn, TextVerticalAlign::Center, profile.clone(), canvas.clone(), inspector.current_target.clone(), inspector.clone(), hardware_manager.clone(), connected_devices.clone(), active_device_idx.clone());
-        connect_pos(&inspector.pos_bot_btn, TextVerticalAlign::Bottom, profile.clone(), canvas.clone(), inspector.current_target.clone(), inspector.clone(), hardware_manager.clone(), connected_devices.clone(), active_device_idx.clone());
+        connect_pos(&inspector.pos_top_btn, TextVerticalAlign::Top, profile.clone(), canvas.clone(), inspector.current_target.clone(), inspector.clone(), hardware_manager.clone(), connected_devices.clone(), active_device_idx.clone(), persist_profiles.clone());
+        connect_pos(&inspector.pos_mid_btn, TextVerticalAlign::Center, profile.clone(), canvas.clone(), inspector.current_target.clone(), inspector.clone(), hardware_manager.clone(), connected_devices.clone(), active_device_idx.clone(), persist_profiles.clone());
+        connect_pos(&inspector.pos_bot_btn, TextVerticalAlign::Bottom, profile.clone(), canvas.clone(), inspector.current_target.clone(), inspector.clone(), hardware_manager.clone(), connected_devices.clone(), active_device_idx.clone(), persist_profiles.clone());
 
         // 10. Multi-State Selector Radio Buttons (State 0 / State 1)
         let prof_state = profile.clone();
@@ -1446,6 +2675,7 @@ impl MainWindow {
         let hw_state = hardware_manager.clone();
         let devs_state = connected_devices.clone();
         let act_state = active_device_idx.clone();
+        let persist_state = persist_profiles.clone();
 
         let handle_state_toggle = move |target_state: usize| {
             if insp_state.is_updating.get() {
@@ -1461,6 +2691,7 @@ impl MainWindow {
                     action.set_active_state(target_state);
                 }
             }
+            persist_state();
 
             let prof = prof_state.borrow();
             canvas_state.render_profile_page(&prof);
@@ -1498,6 +2729,7 @@ impl MainWindow {
         let devs_app = connected_devices.clone();
         let act_app = active_device_idx.clone();
         let pm_app_dd = plugin_manager.clone();
+        let persist_app_dd = persist_profiles.clone();
 
         inspector.app_dropdown.connect_selected_notify(move |dd| {
             if insp_app_dd.is_updating.get() {
@@ -1553,6 +2785,7 @@ impl MainWindow {
                         HashMap::new()
                     }
                 };
+                persist_app_dd();
 
                 // Notify bridge if relevant
                 pm_app_dd.borrow().bridge.update_action_settings(&format_target_slot(target), settings_json);
@@ -1572,35 +2805,43 @@ impl MainWindow {
         // App Arguments Entry Changed
         let prof_args = profile.clone();
         let insp_args = inspector.clone();
+        let persist_args = persist_profiles.clone();
         inspector.args_entry.connect_changed(move |entry| {
             if insp_args.is_updating.get() {
                 return;
             }
             let target = *insp_args.current_target.borrow();
-            let mut prof = prof_args.borrow_mut();
-            if let Some(page) = prof.current_page_mut() {
-                let action = get_target_mut(page, target);
-                action.parameters.insert("args".into(), entry.text().to_string());
+            {
+                let mut prof = prof_args.borrow_mut();
+                if let Some(page) = prof.current_page_mut() {
+                    let action = get_target_mut(page, target);
+                    action.parameters.insert("args".into(), entry.text().to_string());
+                }
             }
+            persist_args();
         });
 
         // Touch Strip Swipe Dropdown Selection
         let prof_swipe_dd = profile.clone();
         let insp_swipe_dd = inspector.clone();
+        let persist_swipe_dd = persist_profiles.clone();
         inspector.swipe_dropdown.connect_selected_notify(move |dd| {
             if insp_swipe_dd.is_updating.get() {
                 return;
             }
             let sel = dd.selected();
-            let mut prof = prof_swipe_dd.borrow_mut();
-            if let Some(page) = prof.current_page_mut() {
-                let action = page.get_or_create_touchscreen();
-                if sel == 1 {
-                    action.action_id = "disabled".into();
-                } else {
-                    action.action_id = "switch_pages".into();
+            {
+                let mut prof = prof_swipe_dd.borrow_mut();
+                if let Some(page) = prof.current_page_mut() {
+                    let action = page.get_or_create_touchscreen();
+                    if sel == 1 {
+                        action.action_id = "disabled".into();
+                    } else {
+                        action.action_id = "switch_pages".into();
+                    }
                 }
             }
+            persist_swipe_dd();
         });
 
         // Delete (Clear Action) Button
@@ -1611,10 +2852,13 @@ impl MainWindow {
         let devs_del = connected_devices.clone();
         let act_del = active_device_idx.clone();
         let pm_del_key = plugin_manager.clone();
+        let nh_del_key = native_host.clone();
+        let persist_del = persist_profiles.clone();
 
         inspector.delete_button.connect_clicked(move |_| {
             let target = *insp_del_key.current_target.borrow();
             let slot = format_target_slot(target);
+            nh_del_key.destroy_slot(&slot);
             {
                 let pm = pm_del_key.borrow();
                 pm.bridge.destroy_action(&slot);
@@ -1630,6 +2874,7 @@ impl MainWindow {
                     }
                 }
             }
+            persist_del();
             let prof = prof_del_key.borrow();
             canvas_del_key.render_profile_page(&prof);
             insp_del_key.set_key_action(None);
@@ -1646,6 +2891,170 @@ impl MainWindow {
             assign_drop(target, sel, true);
         });
 
+        // Wire Canvas Drag-and-Drop Move / Swap between Buttons & Dials
+        {
+            let prof_mv = profile.clone();
+            let canvas_mv = canvas.clone();
+            let insp_mv = inspector.clone();
+            let hw_mv = hardware_manager.clone();
+            let devs_mv = connected_devices.clone();
+            let act_mv = active_device_idx.clone();
+            let pm_mv = plugin_manager.clone();
+            let nh_mv = native_host.clone();
+            let disp_mv = dispatch_native.clone();
+            let persist_mv = persist_profiles.clone();
+
+            canvas.set_slot_moved_callback(move |from, to| {
+                if from == to
+                    || matches!(from, InspectorTarget::Touchscreen)
+                    || matches!(to, InspectorTarget::Touchscreen)
+                {
+                    return;
+                }
+
+                let from_slot = format_target_slot(from);
+                let to_slot = format_target_slot(to);
+
+                let from_surface = match from {
+                    InspectorTarget::Key(_) => crate::native_sdk::SlotSurface::Key,
+                    InspectorTarget::Dial(_) => crate::native_sdk::SlotSurface::Dial,
+                    InspectorTarget::Touchscreen => crate::native_sdk::SlotSurface::Touchscreen,
+                };
+                let to_surface = match to {
+                    InspectorTarget::Key(_) => crate::native_sdk::SlotSurface::Key,
+                    InspectorTarget::Dial(_) => crate::native_sdk::SlotSurface::Dial,
+                    InspectorTarget::Touchscreen => crate::native_sdk::SlotSurface::Touchscreen,
+                };
+
+                // 1. Mutate profile page cleanly (Move if destination empty, Swap if occupied) with TargetCaps check
+                let (moved_to_action, swapped_from_action) = {
+                    let mut prof = prof_mv.borrow_mut();
+                    let Some(page) = prof.current_page_mut() else {
+                        return;
+                    };
+                    let src_caps = match from {
+                        InspectorTarget::Key(k) => page.keys.get(&k),
+                        InspectorTarget::Dial(d) => page.dial_actions.get(&d),
+                        InspectorTarget::Touchscreen => None,
+                    }
+                    .map(|a| nh_mv.action_caps(&a.plugin_id, &a.action_id));
+                    if let Some(sc) = src_caps {
+                        if !sc.supports(to_surface) {
+                            return;
+                        }
+                    } else {
+                        return;
+                    }
+                    let dst_caps = match to {
+                        InspectorTarget::Key(k) => page.keys.get(&k),
+                        InspectorTarget::Dial(d) => page.dial_actions.get(&d),
+                        InspectorTarget::Touchscreen => None,
+                    }
+                    .map(|a| nh_mv.action_caps(&a.plugin_id, &a.action_id));
+                    if let Some(dc) = dst_caps {
+                        if !dc.supports(from_surface) {
+                            return;
+                        }
+                    }
+
+                    let src_act = match from {
+                        InspectorTarget::Key(k) => page.keys.remove(&k),
+                        InspectorTarget::Dial(d) => page.dial_actions.remove(&d),
+                        InspectorTarget::Touchscreen => None,
+                    };
+                    let Some(src_act) = src_act else {
+                        return;
+                    };
+                    let dst_act = match to {
+                        InspectorTarget::Key(k) => page.keys.remove(&k),
+                        InspectorTarget::Dial(d) => page.dial_actions.remove(&d),
+                        InspectorTarget::Touchscreen => None,
+                    };
+
+                    let moved_clone = src_act.clone();
+                    match to {
+                        InspectorTarget::Key(k) => {
+                            page.keys.insert(k, src_act);
+                        }
+                        InspectorTarget::Dial(d) => {
+                            page.dial_actions.insert(d, src_act);
+                        }
+                        InspectorTarget::Touchscreen => {}
+                    }
+
+                    let swapped_clone = dst_act.clone();
+                    if let Some(swapped) = dst_act {
+                        match from {
+                            InspectorTarget::Key(k) => {
+                                page.keys.insert(k, swapped);
+                            }
+                            InspectorTarget::Dial(d) => {
+                                page.dial_actions.insert(d, swapped);
+                            }
+                            InspectorTarget::Touchscreen => {}
+                        }
+                    }
+                    (moved_clone, swapped_clone)
+                };
+
+                // 2. Granular runtime teardown ONLY on the 2 affected slots (zero disruption to other keys!)
+                nh_mv.destroy_slot(&from_slot);
+                nh_mv.destroy_slot(&to_slot);
+                {
+                    let pm = pm_mv.borrow();
+                    pm.bridge.destroy_action(&from_slot);
+                    pm.clear_live_config_rows(&from_slot);
+                    pm.bridge.destroy_action(&to_slot);
+                    pm.clear_live_config_rows(&to_slot);
+                }
+
+                // 3. Rebind native plugin slots (diff-based) + external StreamController slots if applicable
+                let emitted = {
+                    let prof = prof_mv.borrow();
+                    prof.current_page()
+                        .map(|pg| nh_mv.sync_page(pg))
+                        .unwrap_or_default()
+                };
+                for (s, cmds) in emitted {
+                    let upd = nh_mv.get_slot_settings(&s);
+                    disp_mv(s, cmds, upd);
+                }
+
+                let rebind_external = |slot: &str, act: &KeyAction| {
+                    if !act.plugin_id.is_empty()
+                        && act.plugin_id != "system"
+                        && !nh_mv.is_native_plugin(&act.plugin_id)
+                    {
+                        pm_mv.borrow().bridge.create_action(
+                            slot,
+                            &act.plugin_id,
+                            &act.action_id,
+                            act.merged_settings_json(),
+                        );
+                    }
+                };
+                rebind_external(&to_slot, &moved_to_action);
+                if let Some(ref swapped) = swapped_from_action {
+                    rebind_external(&from_slot, swapped);
+                }
+
+                // 4. Follow selection to the destination slot, refresh UI, persist, and sync hardware
+                insp_mv.set_target(to);
+                match to {
+                    InspectorTarget::Key(k) => canvas_mv.select_key(k),
+                    InspectorTarget::Dial(d) => canvas_mv.select_dial_and_touch(d),
+                    InspectorTarget::Touchscreen => canvas_mv.select_touchscreen_panoramic(),
+                }
+
+                let prof = prof_mv.borrow();
+                canvas_mv.render_profile_page(&prof);
+                insp_mv.set_key_action(get_target_ref(&prof, to));
+                drop(prof);
+                persist_mv();
+                Self::sync_hardware(&devs_mv, *act_mv.borrow(), &hw_mv, &prof_mv.borrow());
+            });
+        }
+
         Self {
             window,
             header,
@@ -1656,10 +3065,17 @@ impl MainWindow {
             profiles,
             active_profile_id,
             plugin_manager,
+            native_host,
             hardware_manager,
             connected_devices,
             active_device_idx,
+            tray,
         }
+    }
+
+    pub fn show_and_present(&self) {
+        self.window.set_visible(true);
+        self.window.present();
     }
 
     /// Syncs active profile page to physical hardware keys
@@ -1681,6 +3097,8 @@ impl MainWindow {
         inspector: &Rc<PropertyInspector>,
         profile: &Rc<RefCell<Profile>>,
         plugin_manager: &Rc<RefCell<PluginManager>>,
+        native_host: &NativePluginHost,
+        dispatch_native: &NativeCommandDispatcher,
         devices: &Rc<RefCell<Vec<ConnectedDevice>>>,
         active_device_idx: &Rc<RefCell<usize>>,
         hw: &Rc<RefCell<HardwareManager>>,
@@ -1694,21 +3112,38 @@ impl MainWindow {
             let act_dev_ref = active_device_idx.clone();
             let hw_ref = hw.clone();
             let pm_can = plugin_manager.clone();
+            let nh_can = native_host.clone();
+            let disp_can = dispatch_native.clone();
 
-            btn.connect_clicked(move |_| {
+            // Dedicated GestureClick (Capture phase):
+            // - Single-click selects the key cleanly for editing without accidentally firing actions
+            // - Double-click fires the key action with a tactile press-in / spring-back animation
+            let key_click = gtk::GestureClick::new();
+            key_click.set_button(1);
+            key_click.set_propagation_phase(gtk::PropagationPhase::Capture);
+            key_click.connect_pressed(move |_gesture, n_press, _x, _y| {
                 let prev_target = *insp_ref.current_target.borrow();
                 let new_target = InspectorTarget::Key(idx);
                 can_ref.select_key(idx);
                 insp_ref.set_target(new_target);
 
                 let mut toggled = false;
-                if prev_target == new_target {
-                    // Clicking an already-selected key tests/triggers it
-                    can_ref.set_key_pressed(idx, true);
-                    let can_timeout = can_ref.clone();
-                    glib::timeout_add_local_once(std::time::Duration::from_millis(130), move || {
-                        can_timeout.set_key_pressed(idx, false);
-                    });
+                if n_press == 2 {
+                    // Double-click triggers the action + plays tactile push-in / spring-back animation
+                    can_ref.pulse_key_press(idx, 135);
+
+                    let slot_str = format!("key_{idx}");
+                    if nh_can.has_slot(&slot_str) {
+                        let (cmds, updated) = nh_can.handle_key_event(&slot_str, true);
+                        disp_can(slot_str.clone(), cmds, updated);
+                        let nh_up = nh_can.clone();
+                        let disp_up = disp_can.clone();
+                        glib::timeout_add_local_once(std::time::Duration::from_millis(120), move || {
+                            let (c2, u2) = nh_up.handle_key_event(&slot_str, false);
+                            disp_up(slot_str, c2, u2);
+                        });
+                        return;
+                    }
 
                     let mut is_plugin_action = false;
                     {
@@ -1733,7 +3168,6 @@ impl MainWindow {
                     }
 
                     if is_plugin_action {
-                        let slot_str = format!("key_{idx}");
                         pm_can.borrow().bridge.send_key_event(&slot_str, true);
                         let pm_up = pm_can.clone();
                         let slot_up = slot_str.clone();
@@ -1755,6 +3189,7 @@ impl MainWindow {
                     }
                 }
             });
+            btn.add_controller(key_click);
         }
 
         // Rotary Dials Click:
@@ -1768,6 +3203,32 @@ impl MainWindow {
             let prof = prof_dial.borrow();
             if let Some(page) = prof.current_page() {
                 insp_dial.set_key_action(page.dial_actions.get(&dial_idx));
+            }
+        });
+
+        // Rotary Dials Double-Click: tactile circular press pulse + native or bridge press/release
+        let can_dial_press = canvas.clone();
+        let pm_dial_press = plugin_manager.clone();
+        let nh_dial_press = native_host.clone();
+        let disp_dial_press = dispatch_native.clone();
+        canvas.set_dial_press_callback(move |dial_idx| {
+            can_dial_press.pulse_dial_press(dial_idx, 135);
+            let slot_str = format!("dial_{dial_idx}");
+            if nh_dial_press.has_slot(&slot_str) {
+                let (cmds, updated) = nh_dial_press.handle_dial_press(&slot_str, true);
+                disp_dial_press(slot_str.clone(), cmds, updated);
+                let nh_up = nh_dial_press.clone();
+                let disp_up = disp_dial_press.clone();
+                glib::timeout_add_local_once(std::time::Duration::from_millis(120), move || {
+                    let (c2, u2) = nh_up.handle_dial_press(&slot_str, false);
+                    disp_up(slot_str, c2, u2);
+                });
+            } else {
+                pm_dial_press.borrow().bridge.send_dial_event(&slot_str, "press", 0);
+                let pm_up = pm_dial_press.clone();
+                glib::timeout_add_local_once(std::time::Duration::from_millis(120), move || {
+                    pm_up.borrow().bridge.send_dial_event(&slot_str, "release", 0);
+                });
             }
         });
 
@@ -1791,6 +3252,7 @@ impl MainWindow {
             let can_swipe = canvas.clone();
             let insp_swipe = inspector.clone();
             let pm_swipe = plugin_manager.clone();
+            let nh_swipe = native_host.clone();
             let hw_swipe = hw.clone();
             let devs_swipe = devices.clone();
             let act_swipe = active_device_idx.clone();
@@ -1818,7 +3280,7 @@ impl MainWindow {
                 }
                 let p_imm = p.clone();
                 drop(p);
-                sync_bridge_for_current_page(&p_imm, &pm_swipe.borrow());
+                sync_bridge_for_current_page(&p_imm, &pm_swipe.borrow(), &nh_swipe);
                 can_swipe.render_profile_page(&p_imm);
                 let cur_target = *insp_swipe.current_target.borrow();
                 insp_swipe.set_key_action(get_target_ref(&p_imm, cur_target));
@@ -1828,9 +3290,17 @@ impl MainWindow {
         }
 
         let pm_rot = plugin_manager.clone();
+        let nh_rot = native_host.clone();
+        let disp_rot = dispatch_native.clone();
         canvas.set_dial_rotate_callback(move |dial_idx, delta| {
             tracing::info!("Software Dial Rotate: dial {}, delta {}", dial_idx, delta);
-            pm_rot.borrow().bridge.send_dial_event(&format!("dial_{dial_idx}"), "turn", delta);
+            let slot_str = format!("dial_{dial_idx}");
+            if nh_rot.has_slot(&slot_str) {
+                let (cmds, updated) = nh_rot.handle_dial_rotate(&slot_str, delta);
+                disp_rot(slot_str, cmds, updated);
+            } else {
+                pm_rot.borrow().bridge.send_dial_event(&slot_str, "turn", delta);
+            }
         });
     }
 
@@ -1865,12 +3335,21 @@ fn parse_bridge_color(color: &serde_json::Value) -> Option<String> {
     None
 }
 
-fn sync_bridge_for_current_page(profile: &Profile, pm: &PluginManager) {
+fn sync_bridge_for_current_page(
+    profile: &Profile,
+    pm: &PluginManager,
+    native_host: &NativePluginHost,
+) {
+    native_host.set_page_state(&profile.name, profile.current_page_idx, profile.pages.len());
     pm.bridge.clear_all_actions();
     pm.clear_all_live_config_rows();
     if let Some(page) = profile.current_page() {
+        let _ = native_host.sync_page(page);
         for (k, act) in &page.keys {
-            if !act.plugin_id.is_empty() && act.plugin_id != "system" {
+            if !act.plugin_id.is_empty()
+                && act.plugin_id != "system"
+                && !native_host.is_native_plugin(&act.plugin_id)
+            {
                 pm.bridge.create_action(
                     &format!("key_{k}"),
                     &act.plugin_id,
@@ -1880,7 +3359,10 @@ fn sync_bridge_for_current_page(profile: &Profile, pm: &PluginManager) {
             }
         }
         for (d, act) in &page.dial_actions {
-            if !act.plugin_id.is_empty() && act.plugin_id != "system" {
+            if !act.plugin_id.is_empty()
+                && act.plugin_id != "system"
+                && !native_host.is_native_plugin(&act.plugin_id)
+            {
                 pm.bridge.create_action(
                     &format!("dial_{d}"),
                     &act.plugin_id,
@@ -1890,7 +3372,10 @@ fn sync_bridge_for_current_page(profile: &Profile, pm: &PluginManager) {
             }
         }
         if let Some(ref act) = page.touchscreen_action {
-            if !act.plugin_id.is_empty() && act.plugin_id != "system" {
+            if !act.plugin_id.is_empty()
+                && act.plugin_id != "system"
+                && !native_host.is_native_plugin(&act.plugin_id)
+            {
                 pm.bridge.create_action(
                     "touchscreen",
                     &act.plugin_id,

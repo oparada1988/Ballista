@@ -144,6 +144,7 @@ pub fn open_plugin_settings_dialog(
                                 let str_opts: Vec<&str> = row.options.iter().map(|s| s.as_str()).collect();
                                 let model = gtk::StringList::new(&str_opts);
                                 cr.set_model(Some(&model));
+                                cr.set_enable_search(row.options.len() > 8);
                             }
                             if row.selected < row.options.len() && cr.selected() as usize != row.selected {
                                 cr.set_selected(row.selected as u32);
@@ -306,11 +307,19 @@ pub fn open_plugin_settings_dialog(
                 "ComboRow" => {
                     let str_opts: Vec<&str> = row.options.iter().map(|s| s.as_str()).collect();
                     let model = gtk::StringList::new(&str_opts);
+                    let search_expr = gtk::PropertyExpression::new(
+                        gtk::StringObject::static_type(),
+                        gtk::Expression::NONE,
+                        "string",
+                    );
                     let cr = ComboRow::new();
                     cr.set_title(&glib::markup_escape_text(&row.title));
                     if !row.subtitle.is_empty() {
                         cr.set_subtitle(&glib::markup_escape_text(&row.subtitle));
                     }
+                    cr.set_expression(Some(&search_expr));
+                    cr.set_enable_search(row.options.len() > 8);
+                    cr.set_search_match_mode(gtk::StringFilterMatchMode::Substring);
                     cr.set_model(Some(&model));
                     if row.selected < row.options.len() {
                         cr.set_selected(row.selected as u32);
