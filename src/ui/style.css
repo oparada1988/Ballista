@@ -785,7 +785,7 @@ window.ballista-modal .boxed-list > row:last-child {
     background-color: #ef4444;
 }
 
-/* Plugin Detail Subpage */
+/* Plugin Detail Subpage (Redesigned Two-Column Hero & 16:9 Gallery) */
 .store-detail-header-card {
     background-color: #191920;
     border: 1px solid rgba(255, 255, 255, 0.08);
@@ -793,21 +793,299 @@ window.ballista-modal .boxed-list > row:last-child {
     padding: 18px 22px;
 }
 
-.store-detail-desc-card {
-    background-color: #161619;
-    border: 1px solid rgba(255, 255, 255, 0.06);
-    border-radius: 12px;
-    padding: 18px 22px;
-    color: #e4e4e7;
+.store-detail-icon-frame {
+    background-color: #1b1b24;
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    border-radius: 20px;
+    min-width: 148px;
+    min-height: 148px;
+    box-shadow: 0 10px 24px rgba(0, 0, 0, 0.42);
+}
+
+.store-runtime-badge {
+    border-radius: 8px;
+    padding: 6px 10px;
+    font-size: 11.5px;
+    font-weight: 700;
+}
+
+.store-runtime-ballista {
+    background: linear-gradient(135deg, rgba(145, 70, 255, 0.28) 0%, rgba(124, 58, 237, 0.16) 100%);
+    border: 1px solid rgba(168, 85, 247, 0.65);
+    color: #e9d5ff;
+    box-shadow: 0 0 12px rgba(145, 70, 255, 0.18);
+}
+
+.store-runtime-sc {
+    background: linear-gradient(135deg, rgba(217, 119, 6, 0.24) 0%, rgba(245, 158, 11, 0.12) 100%);
+    border: 1px solid rgba(245, 158, 11, 0.58);
+    color: #fcd34d;
+    box-shadow: 0 0 10px rgba(217, 119, 6, 0.14);
+}
+
+.store-runtime-sub {
+    font-size: 10.5px;
+    color: #7c7c90;
+    font-weight: 500;
+}
+
+.store-meta-divider {
+    background-color: rgba(255, 255, 255, 0.06);
+    min-height: 1px;
+    margin: 4px 0;
+}
+
+.store-meta-row {
+    font-size: 12px;
+    color: #d4d4d8;
+    font-weight: 600;
+}
+
+.store-meta-icon {
+    color: #7c7c92;
+}
+
+.store-meta-update-arrow {
+    color: #fbbf24;
+    font-weight: 700;
+    font-size: 11px;
+}
+
+.store-source-link {
+    background: transparent;
+    border: none;
+    box-shadow: none;
+    padding: 2px 0;
+    color: #c084fc;
+    font-size: 12px;
+    font-weight: 600;
+}
+
+.store-source-link:hover {
+    color: #e9d5ff;
+    background: transparent;
+}
+
+.store-detail-title {
+    font-size: 28px;
+    font-weight: 800;
+    color: #ffffff;
+}
+
+.store-detail-tagline {
     font-size: 13px;
-    line-height: 1.6;
+    color: #a1a1b2;
+}
+
+.store-device-note {
+    font-size: 11.5px;
+    color: #7c7c90;
+}
+
+.store-detail-desc-card {
+    background-color: #16161b;
+    border: 1px solid rgba(255, 255, 255, 0.07);
+    border-radius: 12px;
+    padding: 15px 18px;
+    color: #d4d4dc;
+    font-size: 13px;
+}
+
+.store-desc-tag {
+    font-size: 11px;
+    font-weight: 600;
+    color: #a9a9bc;
+    background-color: rgba(255, 255, 255, 0.045);
+    border: 1px solid rgba(255, 255, 255, 0.07);
+    border-radius: 6px;
+    padding: 2px 8px;
+}
+
+.btn-gear-detail {
+    background-color: #1d1d24;
+    border: 1px solid rgba(255, 255, 255, 0.10);
+    color: #e4e4e7;
+    border-radius: 9px;
+    min-width: 36px;
+    min-height: 36px;
+    padding: 0;
+}
+
+.btn-gear-detail:hover {
+    background-color: #262632;
+    border-color: rgba(145, 70, 255, 0.50);
+    color: #ffffff;
+}
+
+.btn-uninstall-soft {
+    background-color: rgba(220, 38, 38, 0.15);
+    border: 1px solid rgba(239, 68, 68, 0.45);
+    color: #fca5a5;
+    font-weight: 700;
+    border-radius: 9px;
+    padding: 6px 12px;
+    font-size: 12.5px;
+    min-height: 36px;
+}
+
+.btn-uninstall-soft:hover {
+    background-color: rgba(220, 38, 38, 0.30);
+    border-color: rgba(248, 113, 113, 0.72);
+    color: #ffffff;
+}
+
+.store-installed-pill {
+    background-color: rgba(34, 197, 94, 0.14);
+    border: 1px solid rgba(34, 197, 94, 0.42);
+    color: #4ade80;
+    font-weight: 700;
+    border-radius: 9px;
+    padding: 6px 12px;
+    font-size: 12.5px;
+    min-height: 36px;
+}
+
+.store-star-filled {
+    color: #f59e0b;
+    font-size: 15px;
+}
+
+.store-star-empty {
+    color: rgba(245, 158, 11, 0.35);
+    font-size: 15px;
+}
+
+.store-rating-score {
+    font-size: 12.5px;
+    font-weight: 700;
+    color: #e4e4e7;
+}
+
+.store-rating-count {
+    font-size: 11.5px;
+    color: #7c7c90;
+}
+
+.store-count-pill {
+    font-size: 10.5px;
+    font-weight: 700;
+    color: #c4b5fd;
+    background-color: rgba(145, 70, 255, 0.18);
+    border: 1px solid rgba(168, 85, 247, 0.30);
+    padding: 1px 7px;
+    border-radius: 999px;
+}
+
+.store-section-hint {
+    font-size: 11.5px;
+    color: #727285;
 }
 
 .store-screenshot-tile {
     background-color: #191920;
+    border: 1px solid rgba(255, 255, 255, 0.09);
+    border-radius: 10px;
+    min-height: 154px;
+    transition: all 140ms ease;
+}
+
+.store-screenshot-tile:hover {
+    border-color: rgba(168, 85, 247, 0.65);
+    box-shadow: 0 0 14px rgba(145, 70, 255, 0.25);
+}
+
+.store-shot-zoom-badge {
+    background-color: rgba(145, 70, 255, 0.85);
+    color: #ffffff;
+    border-radius: 6px;
+    min-width: 24px;
+    min-height: 24px;
+    margin: 7px;
+}
+
+.store-shot-caption {
+    font-size: 10px;
+    font-weight: 700;
+    color: rgba(255, 255, 255, 0.90);
+    background-color: rgba(12, 12, 16, 0.76);
+    border: 1px solid rgba(255, 255, 255, 0.10);
+    padding: 2px 8px;
+    border-radius: 5px;
+    margin: 7px;
+}
+
+.store-action-preview-card {
+    background-color: #181820;
+    border: 1px solid rgba(255, 255, 255, 0.07);
+    border-radius: 10px;
+    padding: 10px 13px;
+}
+
+.store-action-ico-box {
+    background-color: #21212c;
     border: 1px solid rgba(255, 255, 255, 0.08);
-    border-radius: 0px;
-    min-height: 105px;
+    border-radius: 8px;
+    min-width: 34px;
+    min-height: 34px;
+}
+
+.store-action-name {
+    font-size: 12.5px;
+    font-weight: 700;
+    color: #f4f4f5;
+}
+
+.store-action-desc {
+    font-size: 11.5px;
+    color: #8f8fa3;
+}
+
+.store-toggle-actions-btn {
+    background: transparent;
+    border: none;
+    box-shadow: none;
+    color: #c084fc;
+    font-size: 11.5px;
+    font-weight: 600;
+    padding: 2px 6px;
+}
+
+.store-toggle-actions-btn:hover {
+    color: #e9d5ff;
+    background-color: rgba(145, 70, 255, 0.14);
+    border-radius: 6px;
+}
+
+.store-lightbox-root {
+    background-color: #111114;
+    color: #e4e4e7;
+    padding: 16px 20px 18px 20px;
+}
+
+.store-lightbox-frame {
+    background-color: #16161b;
+    border: 1px solid rgba(255, 255, 255, 0.09);
+    border-radius: 12px;
+}
+
+.store-card-runtime-ballista {
+    font-size: 9.5px;
+    font-weight: 700;
+    color: #d8b4fe;
+    background-color: rgba(145, 70, 255, 0.18);
+    border: 1px solid rgba(168, 85, 247, 0.42);
+    border-radius: 6px;
+    padding: 1px 6px;
+}
+
+.store-card-runtime-sc {
+    font-size: 9.5px;
+    font-weight: 700;
+    color: #fcd34d;
+    background-color: rgba(217, 119, 6, 0.16);
+    border: 1px solid rgba(245, 158, 11, 0.42);
+    border-radius: 6px;
+    padding: 1px 6px;
 }
 
 /* Polished Plugin Install Result Dialog */

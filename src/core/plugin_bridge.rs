@@ -98,6 +98,10 @@ pub struct BridgeCommand {
     pub value: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trigger_button: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub norm_x: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub norm_y: Option<f64>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -172,10 +176,18 @@ pub enum BridgeEvent {
 
 pub type BridgeEventCallback = Arc<dyn Fn(BridgeEvent) + Send + Sync + 'static>;
 
+struct NativeProcessHandle {
+    stdin: ChildStdin,
+    child: Child,
+    binary_path: PathBuf,
+}
+
 #[derive(Clone)]
 pub struct PluginBridge {
     stdin: Arc<Mutex<Option<ChildStdin>>>,
     child: Arc<Mutex<Option<Child>>>,
+    native_plugins: Arc<Mutex<HashMap<String, NativeProcessHandle>>>,
+    slot_owners: Arc<Mutex<HashMap<String, String>>>,
     event_callback: Arc<Mutex<Option<BridgeEventCallback>>>,
     pending_events: Arc<Mutex<Vec<BridgeEvent>>>,
 }
@@ -185,6 +197,8 @@ impl PluginBridge {
         Self {
             stdin: Arc::new(Mutex::new(None)),
             child: Arc::new(Mutex::new(None)),
+            native_plugins: Arc::new(Mutex::new(HashMap::new())),
+            slot_owners: Arc::new(Mutex::new(HashMap::new())),
             event_callback: Arc::new(Mutex::new(None)),
             pending_events: Arc::new(Mutex::new(Vec::new())),
         }
@@ -262,16 +276,201 @@ impl PluginBridge {
         Ok(())
     }
 
+    fn write_cmd_to_stdin(stdin: &mut ChildStdin, cmd: &BridgeCommand) {
+        if let Ok(json_str) = serde_json::to_string(cmd) {
+            let _ = stdin.write_all(json_str.as_bytes());
+            let _ = stdin.write_all(b"\n");
+            let _ = stdin.flush();
+        }
+    }
+
     pub fn send_command(&self, cmd: BridgeCommand) {
         if let Ok(mut lock) = self.stdin.lock() {
             if let Some(ref mut stdin) = *lock {
-                if let Ok(json_str) = serde_json::to_string(&cmd) {
-                    let _ = stdin.write_all(json_str.as_bytes());
-                    let _ = stdin.write_all(b"\n");
-                    let _ = stdin.flush();
+                Self::write_cmd_to_stdin(stdin, &cmd);
+            }
+        }
+    }
+
+    fn send_to_plugin_or_python(&self, plugin_id: &str, cmd: BridgeCommand) {
+        if let Ok(mut natives) = self.native_plugins.lock() {
+            if let Some(handle) = natives.get_mut(plugin_id) {
+                Self::write_cmd_to_stdin(&mut handle.stdin, &cmd);
+                return;
+            }
+        }
+        self.send_command(cmd);
+    }
+
+    fn send_to_slot_owner_or_python(&self, slot: &str, mut cmd: BridgeCommand) {
+        let resolved = self.slot_owners.lock().ok().and_then(|m| {
+            if let Some(pid) = m.get(slot) {
+                return Some((slot.to_string(), pid.clone()));
+            }
+            let suffix = format!("::{slot}");
+            m.iter()
+                .find(|(k, _)| k.ends_with(&suffix))
+                .map(|(k, pid)| (k.clone(), pid.clone()))
+        });
+        if let Some((canonical_slot, pid)) = resolved {
+            if cmd.slot.as_deref() == Some(slot) && canonical_slot != slot {
+                cmd.slot = Some(canonical_slot);
+            }
+            self.send_to_plugin_or_python(&pid, cmd);
+        } else {
+            self.send_command(cmd);
+        }
+    }
+
+    fn broadcast_to_all_natives(&self, cmd: &BridgeCommand) {
+        if let Ok(mut natives) = self.native_plugins.lock() {
+            for handle in natives.values_mut() {
+                Self::write_cmd_to_stdin(&mut handle.stdin, cmd);
+            }
+        }
+    }
+
+    /// Spawns (or restarts if updated) an out-of-process Native Ballista Rust plugin binary
+    /// speaking Ballista's newline-delimited JSONL IPC protocol.
+    pub fn init_native_plugin(
+        &self,
+        plugin_id: &str,
+        plugin_path: &Path,
+        binary_path: &Path,
+    ) -> Result<(), String> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(meta) = std::fs::metadata(binary_path) {
+                let mode = meta.permissions().mode();
+                if (mode & 0o111) == 0 {
+                    let _ = std::fs::set_permissions(
+                        binary_path,
+                        std::fs::Permissions::from_mode(mode | 0o755),
+                    );
                 }
             }
         }
+
+        // If already running from the exact same binary and alive, just re-send init_plugin
+        if let Ok(mut natives) = self.native_plugins.lock() {
+            if let Some(existing) = natives.get_mut(plugin_id) {
+                let alive = existing.child.try_wait().ok().flatten().is_none();
+                if alive && existing.binary_path == binary_path {
+                    Self::write_cmd_to_stdin(
+                        &mut existing.stdin,
+                        &BridgeCommand {
+                            cmd: "init_plugin".into(),
+                            plugin_id: Some(plugin_id.into()),
+                            plugin_path: Some(plugin_path.to_string_lossy().to_string()),
+                            ..Default::default()
+                        },
+                    );
+                    return Ok(());
+                }
+                let _ = existing.child.kill();
+                let _ = existing.child.wait();
+                natives.remove(plugin_id);
+            }
+        }
+
+        let data_dir = glib::user_data_dir()
+            .join("ballista")
+            .join("plugin_data")
+            .join(plugin_id);
+        let cache_dir = glib::user_cache_dir()
+            .join("ballista")
+            .join("plugins")
+            .join(plugin_id);
+        let _ = std::fs::create_dir_all(&data_dir);
+        let _ = std::fs::create_dir_all(&cache_dir);
+
+        tracing::info!(
+            "Starting Native Ballista plugin '{}' ({})",
+            plugin_id,
+            binary_path.display()
+        );
+
+        let mut child = Command::new(binary_path)
+            .current_dir(plugin_path)
+            .env("BALLISTA_PLUGIN_ID", plugin_id)
+            .env("BALLISTA_PLUGIN_DIR", plugin_path)
+            .env("BALLISTA_DATA_DIR", &data_dir)
+            .env("BALLISTA_CACHE_DIR", &cache_dir)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .map_err(|e| {
+                format!(
+                    "Failed to spawn native plugin '{}' ({}): {e}",
+                    plugin_id,
+                    binary_path.display()
+                )
+            })?;
+
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| format!("Failed to capture stdout for native plugin '{plugin_id}'"))?;
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| format!("Failed to capture stdin for native plugin '{plugin_id}'"))?;
+
+        Self::write_cmd_to_stdin(
+            &mut stdin,
+            &BridgeCommand {
+                cmd: "init_plugin".into(),
+                plugin_id: Some(plugin_id.into()),
+                plugin_path: Some(plugin_path.to_string_lossy().to_string()),
+                ..Default::default()
+            },
+        );
+
+        if let Ok(mut natives) = self.native_plugins.lock() {
+            natives.insert(
+                plugin_id.to_string(),
+                NativeProcessHandle {
+                    stdin,
+                    child,
+                    binary_path: binary_path.to_path_buf(),
+                },
+            );
+        }
+
+        let cb_lock = self.event_callback.clone();
+        let pending_lock = self.pending_events.clone();
+        let pid_log = plugin_id.to_string();
+
+        std::thread::spawn(move || {
+            let reader = BufReader::new(stdout);
+            for line in reader.lines() {
+                match line {
+                    Ok(l) => {
+                        let l_trimmed = l.trim();
+                        if l_trimmed.is_empty() {
+                            continue;
+                        }
+                        if let Ok(event) = serde_json::from_str::<BridgeEvent>(l_trimmed) {
+                            let cb_opt = cb_lock.lock().unwrap().clone();
+                            if let Some(cb) = cb_opt {
+                                cb(event);
+                            } else {
+                                pending_lock.lock().unwrap().push(event);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("Native plugin '{}' stdout read error: {e}", pid_log);
+                        break;
+                    }
+                }
+            }
+            tracing::info!("Native plugin '{}' stdout reader terminated", pid_log);
+        });
+
+        Ok(())
     }
 
     pub fn init_plugin(&self, plugin_id: &str, plugin_path: &Path) {
@@ -284,6 +483,24 @@ impl PluginBridge {
     }
 
     pub fn uninstall_plugin(&self, plugin_id: &str) {
+        if let Ok(mut owners) = self.slot_owners.lock() {
+            owners.retain(|_, owner| owner != plugin_id);
+        }
+        if let Ok(mut natives) = self.native_plugins.lock() {
+            if let Some(mut handle) = natives.remove(plugin_id) {
+                Self::write_cmd_to_stdin(
+                    &mut handle.stdin,
+                    &BridgeCommand {
+                        cmd: "shutdown".into(),
+                        plugin_id: Some(plugin_id.into()),
+                        ..Default::default()
+                    },
+                );
+                let _ = handle.child.kill();
+                let _ = handle.child.wait();
+                return;
+            }
+        }
         self.send_command(BridgeCommand {
             cmd: "uninstall_plugin".into(),
             plugin_id: Some(plugin_id.into()),
@@ -292,54 +509,83 @@ impl PluginBridge {
     }
 
     pub fn create_action(&self, slot: &str, plugin_id: &str, action_id: &str, settings: HashMap<String, serde_json::Value>) {
-        self.send_command(BridgeCommand {
-            cmd: "create_action".into(),
-            plugin_id: Some(plugin_id.into()),
-            slot: Some(slot.into()),
-            action_id: Some(action_id.into()),
-            settings: Some(settings),
-            ..Default::default()
-        });
+        if let Ok(mut owners) = self.slot_owners.lock() {
+            owners.insert(slot.to_string(), plugin_id.to_string());
+        }
+        self.send_to_plugin_or_python(
+            plugin_id,
+            BridgeCommand {
+                cmd: "create_action".into(),
+                plugin_id: Some(plugin_id.into()),
+                slot: Some(slot.into()),
+                action_id: Some(action_id.into()),
+                settings: Some(settings),
+                ..Default::default()
+            },
+        );
     }
 
     pub fn destroy_action(&self, slot: &str) {
-        self.send_command(BridgeCommand {
+        let cmd = BridgeCommand {
             cmd: "destroy_action".into(),
             slot: Some(slot.into()),
             ..Default::default()
-        });
+        };
+        let owner = self.slot_owners.lock().ok().and_then(|mut m| m.remove(slot));
+        if let Some(pid) = owner {
+            self.send_to_plugin_or_python(&pid, cmd);
+        } else {
+            self.send_command(cmd);
+        }
     }
 
     pub fn clear_all_actions(&self) {
-        self.send_command(BridgeCommand {
+        if let Ok(mut owners) = self.slot_owners.lock() {
+            owners.clear();
+        }
+        let cmd = BridgeCommand {
             cmd: "clear_all_actions".into(),
             ..Default::default()
-        });
+        };
+        self.broadcast_to_all_natives(&cmd);
+        self.send_command(cmd);
     }
 
     pub fn clear_device_actions(&self, device_key: &str) {
-        self.send_command(BridgeCommand {
+        let prefix = format!("{device_key}::");
+        if let Ok(mut owners) = self.slot_owners.lock() {
+            owners.retain(|slot, _| !slot.starts_with(&prefix));
+        }
+        let cmd = BridgeCommand {
             cmd: "clear_device_actions".into(),
             slot: Some(device_key.into()),
             ..Default::default()
-        });
+        };
+        self.broadcast_to_all_natives(&cmd);
+        self.send_command(cmd);
     }
 
     pub fn update_action_settings(&self, slot: &str, settings: HashMap<String, serde_json::Value>) {
-        self.send_command(BridgeCommand {
-            cmd: "update_action_settings".into(),
-            slot: Some(slot.into()),
-            settings: Some(settings),
-            ..Default::default()
-        });
+        self.send_to_slot_owner_or_python(
+            slot,
+            BridgeCommand {
+                cmd: "update_action_settings".into(),
+                slot: Some(slot.into()),
+                settings: Some(settings),
+                ..Default::default()
+            },
+        );
     }
 
     pub fn get_action_config_rows(&self, slot: &str) {
-        self.send_command(BridgeCommand {
-            cmd: "get_action_config_rows".into(),
-            slot: Some(slot.into()),
-            ..Default::default()
-        });
+        self.send_to_slot_owner_or_python(
+            slot,
+            BridgeCommand {
+                cmd: "get_action_config_rows".into(),
+                slot: Some(slot.into()),
+                ..Default::default()
+            },
+        );
     }
 
     pub fn set_action_config_row(
@@ -352,35 +598,44 @@ impl PluginBridge {
         color: Option<String>,
         value: Option<f64>,
     ) {
-        self.send_command(BridgeCommand {
-            cmd: "set_action_config_row".into(),
-            slot: Some(slot.into()),
-            index: Some(index),
-            selected,
-            active,
-            text,
-            color,
-            value,
-            ..Default::default()
-        });
+        self.send_to_slot_owner_or_python(
+            slot,
+            BridgeCommand {
+                cmd: "set_action_config_row".into(),
+                slot: Some(slot.into()),
+                index: Some(index),
+                selected,
+                active,
+                text,
+                color,
+                value,
+                ..Default::default()
+            },
+        );
     }
 
     pub fn trigger_action_config_button(&self, slot: &str, index: usize) {
-        self.send_command(BridgeCommand {
-            cmd: "trigger_action_config_button".into(),
-            slot: Some(slot.into()),
-            index: Some(index),
-            trigger_button: Some(true),
-            ..Default::default()
-        });
+        self.send_to_slot_owner_or_python(
+            slot,
+            BridgeCommand {
+                cmd: "trigger_action_config_button".into(),
+                slot: Some(slot.into()),
+                index: Some(index),
+                trigger_button: Some(true),
+                ..Default::default()
+            },
+        );
     }
 
     pub fn get_plugin_settings_rows(&self, plugin_id: &str) {
-        self.send_command(BridgeCommand {
-            cmd: "get_plugin_settings_rows".into(),
-            plugin_id: Some(plugin_id.into()),
-            ..Default::default()
-        });
+        self.send_to_plugin_or_python(
+            plugin_id,
+            BridgeCommand {
+                cmd: "get_plugin_settings_rows".into(),
+                plugin_id: Some(plugin_id.into()),
+                ..Default::default()
+            },
+        );
     }
 
     pub fn set_plugin_settings_row(
@@ -393,53 +648,88 @@ impl PluginBridge {
         color: Option<String>,
         value: Option<f64>,
     ) {
-        self.send_command(BridgeCommand {
-            cmd: "set_plugin_settings_row".into(),
-            plugin_id: Some(plugin_id.into()),
-            index: Some(index),
-            selected,
-            active,
-            text,
-            color,
-            value,
-            ..Default::default()
-        });
+        self.send_to_plugin_or_python(
+            plugin_id,
+            BridgeCommand {
+                cmd: "set_plugin_settings_row".into(),
+                plugin_id: Some(plugin_id.into()),
+                index: Some(index),
+                selected,
+                active,
+                text,
+                color,
+                value,
+                ..Default::default()
+            },
+        );
     }
 
     pub fn trigger_plugin_settings_button(&self, plugin_id: &str, index: usize) {
-        self.send_command(BridgeCommand {
-            cmd: "trigger_plugin_settings_button".into(),
-            plugin_id: Some(plugin_id.into()),
-            index: Some(index),
-            trigger_button: Some(true),
-            ..Default::default()
-        });
+        self.send_to_plugin_or_python(
+            plugin_id,
+            BridgeCommand {
+                cmd: "trigger_plugin_settings_button".into(),
+                plugin_id: Some(plugin_id.into()),
+                index: Some(index),
+                trigger_button: Some(true),
+                ..Default::default()
+            },
+        );
     }
 
     pub fn send_key_event(&self, slot: &str, is_down: bool) {
-        self.send_command(BridgeCommand {
-            cmd: "key_event".into(),
-            slot: Some(slot.into()),
-            event: Some(if is_down { "down".into() } else { "up".into() }),
-            ..Default::default()
-        });
+        self.send_to_slot_owner_or_python(
+            slot,
+            BridgeCommand {
+                cmd: "key_event".into(),
+                slot: Some(slot.into()),
+                event: Some(if is_down { "down".into() } else { "up".into() }),
+                ..Default::default()
+            },
+        );
     }
 
     pub fn send_dial_event(&self, slot: &str, event_type: &str, delta: i32) {
-        self.send_command(BridgeCommand {
-            cmd: "dial_event".into(),
-            slot: Some(slot.into()),
-            event: Some(event_type.into()),
-            delta: Some(delta),
-            ..Default::default()
-        });
+        self.send_to_slot_owner_or_python(
+            slot,
+            BridgeCommand {
+                cmd: "dial_event".into(),
+                slot: Some(slot.into()),
+                event: Some(event_type.into()),
+                delta: Some(delta),
+                ..Default::default()
+            },
+        );
+    }
+
+    pub fn send_dial_tap(&self, slot: &str, norm_x: f64, norm_y: f64) {
+        self.send_to_slot_owner_or_python(
+            slot,
+            BridgeCommand {
+                cmd: "dial_event".into(),
+                slot: Some(slot.into()),
+                event: Some("tap".into()),
+                delta: Some(0),
+                norm_x: Some(norm_x.clamp(0.0, 1.0)),
+                norm_y: Some(norm_y.clamp(0.0, 1.0)),
+                ..Default::default()
+            },
+        );
     }
 
     pub fn shutdown(&self) {
-        self.send_command(BridgeCommand {
+        let cmd = BridgeCommand {
             cmd: "shutdown".into(),
             ..Default::default()
-        });
+        };
+        if let Ok(mut natives) = self.native_plugins.lock() {
+            for (_, mut handle) in natives.drain() {
+                Self::write_cmd_to_stdin(&mut handle.stdin, &cmd);
+                let _ = handle.child.kill();
+                let _ = handle.child.wait();
+            }
+        }
+        self.send_command(cmd);
     }
 
     pub fn locate_bridge_dir() -> Option<PathBuf> {

@@ -66,7 +66,7 @@ pub fn open_plugin_settings_dialog(
 
     let custom_group = PreferencesGroup::new();
     custom_group.set_title(&format!("{plugin_name} Configuration"));
-    custom_group.set_description(Some("Live settings provided natively by this StreamController plugin"));
+    custom_group.set_description(Some("Live settings provided by this plugin"));
     page.add(&custom_group);
 
     let content_wrapper = Box::new(Orientation::Vertical, 0);
@@ -180,6 +180,12 @@ pub fn open_plugin_settings_dialog(
                                 btn.add_css_class("suggested-action");
                             } else {
                                 btn.remove_css_class("suggested-action");
+                            }
+                            if let Some(ar) = btn
+                                .ancestor(ActionRow::static_type())
+                                .and_then(|w| w.downcast::<ActionRow>().ok())
+                            {
+                                ar.set_subtitle(&glib::markup_escape_text(&row.subtitle));
                             }
                         }
                     }

@@ -33,6 +33,8 @@ pub struct KeyAppearance {
     pub center_label: Option<String>,
     #[serde(default)]
     pub bottom_label: Option<String>,
+    #[serde(default)]
+    pub custom_title_override: bool,
 }
 
 fn default_show_title() -> bool {
@@ -58,6 +60,7 @@ impl Default for KeyAppearance {
             top_label: None,
             center_label: None,
             bottom_label: None,
+            custom_title_override: false,
         }
     }
 }
@@ -68,6 +71,9 @@ impl KeyAppearance {
     }
 
     pub fn combined_display_summary(&self) -> String {
+        if !self.show_title {
+            return String::new();
+        }
         if self.has_plugin_labels() {
             let mut parts = Vec::new();
             if let Some(ref t) = self.top_label {

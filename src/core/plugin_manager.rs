@@ -65,6 +65,8 @@ pub struct PluginActionInfo {
     pub name: String,
     pub icon_name_or_file: String,
     pub config_rows: Vec<ActionConfigRow>,
+    #[serde(default)]
+    pub caps: Option<crate::native_sdk::TargetCaps>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -76,6 +78,8 @@ pub struct DiscoveredPlugin {
     pub description: String,
     pub path: PathBuf,
     pub actions: Vec<PluginActionInfo>,
+    #[serde(default)]
+    pub is_native: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -213,11 +217,21 @@ impl PluginManager {
                     } else {
                         find_action_icon(&plugin.path, action_stem)
                     };
+                    let caps = if plugin.is_native {
+                        Some(crate::native_sdk::TargetCaps {
+                            keys: am.supports_key,
+                            dials: am.supports_dial,
+                            touchscreen: am.supports_touchscreen,
+                        })
+                    } else {
+                        None
+                    };
                     updated_actions.push(PluginActionInfo {
                         id: am.action_id.clone(),
                         name: am.action_name.clone(),
                         icon_name_or_file: icon,
                         config_rows: Vec::new(),
+                        caps,
                     });
                 }
                 plugin.actions = updated_actions;
@@ -433,54 +447,121 @@ impl PluginManager {
                                         .unwrap_or("")
                                         .to_string();
 
-                                    // Dynamic Discovery of Actions from actions/ directory
+                                    let is_native = matches!(
+                                        json.get("runtime")
+                                            .or_else(|| json.get("plugin_type"))
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("streamcontroller")
+                                            .to_lowercase()
+                                            .as_str(),
+                                        "ballista" | "native"
+                                    );
+
+                                    // Dynamic Discovery of Actions
                                     let mut actions = Vec::new();
-                                    let actions_dir = p.join("actions");
-
-                                    if actions_dir.exists() && actions_dir.is_dir() {
-                                        if let Ok(act_entries) = fs::read_dir(&actions_dir) {
-                                            for act_entry in act_entries.flatten() {
-                                                let act_p = act_entry.path();
-                                                let file_name = act_p.file_name().unwrap_or_default().to_string_lossy().to_string();
-                                                
-                                                if file_name.starts_with('_') || file_name == "mixins" {
-                                                    continue;
-                                                }
-
-                                                let action_stem = if act_p.is_dir() {
-                                                    file_name
-                                                } else if act_p.extension().and_then(|e| e.to_str()) == Some("py") {
-                                                    act_p.file_stem().unwrap_or_default().to_string_lossy().to_string()
-                                                } else {
+                                    if is_native {
+                                        if let Some(arr) = json.get("actions").and_then(|v| v.as_array()) {
+                                            for a in arr {
+                                                let Some(a_id) = a.get("id").and_then(|v| v.as_str()) else {
                                                     continue;
                                                 };
-
-                                                let action_id = format!("{id}::{action_stem}");
-                                                let display_name = format_action_name(&action_stem);
-
-                                                // Find candidate action icon in assets/
-                                                let icon_str = find_action_icon(&p, &action_stem);
-
-                                                // Parse interactive config rows from the action Python file
-                                                let action_py = if act_p.is_dir() {
-                                                    act_p.join(format!("{action_stem}.py"))
+                                                let a_name = a
+                                                    .get("name")
+                                                    .and_then(|v| v.as_str())
+                                                    .unwrap_or(a_id)
+                                                    .to_string();
+                                                let icon_spec = a
+                                                    .get("icon")
+                                                    .and_then(|v| v.as_str())
+                                                    .unwrap_or("");
+                                                let icon_str = if !icon_spec.is_empty() {
+                                                    let asset_cand = p.join(icon_spec);
+                                                    let assets_sub = p.join("assets").join(icon_spec);
+                                                    if asset_cand.is_file() {
+                                                        asset_cand.to_string_lossy().to_string()
+                                                    } else if assets_sub.is_file() {
+                                                        assets_sub.to_string_lossy().to_string()
+                                                    } else if icon_spec.ends_with("-symbolic") {
+                                                        icon_spec.to_string()
+                                                    } else {
+                                                        "audio-x-generic-symbolic".to_string()
+                                                    }
                                                 } else {
-                                                    act_p.clone()
+                                                    let stem = a_id.split("::").last().unwrap_or(a_id);
+                                                    find_action_icon(&p, stem)
                                                 };
-                                                let config_rows = parse_action_config_rows(&action_py);
-
-                                                actions.push(PluginActionInfo {
-                                                    id: action_id,
-                                                    name: display_name,
-                                                    icon_name_or_file: icon_str,
-                                                    config_rows,
+                                                let surfs: Vec<String> = a
+                                                    .get("surfaces")
+                                                    .and_then(|v| v.as_array())
+                                                    .map(|sa| {
+                                                        sa.iter()
+                                                            .filter_map(|x| x.as_str().map(|s| s.to_lowercase()))
+                                                            .collect()
+                                                    })
+                                                    .unwrap_or_else(|| vec!["keys".into()]);
+                                                let caps = Some(crate::native_sdk::TargetCaps {
+                                                    keys: surfs.iter().any(|s| s == "keys" || s == "key"),
+                                                    dials: surfs.iter().any(|s| s == "dials" || s == "dial"),
+                                                    touchscreen: surfs.iter().any(|s| s == "touchscreen" || s == "touch"),
                                                 });
+                                                actions.push(PluginActionInfo {
+                                                    id: a_id.to_string(),
+                                                    name: a_name,
+                                                    icon_name_or_file: icon_str,
+                                                    config_rows: Vec::new(),
+                                                    caps,
+                                                });
+                                            }
+                                        }
+                                    } else {
+                                        let actions_dir = p.join("actions");
+
+                                        if actions_dir.exists() && actions_dir.is_dir() {
+                                            if let Ok(act_entries) = fs::read_dir(&actions_dir) {
+                                                for act_entry in act_entries.flatten() {
+                                                    let act_p = act_entry.path();
+                                                    let file_name = act_p.file_name().unwrap_or_default().to_string_lossy().to_string();
+                                                    
+                                                    if file_name.starts_with('_') || file_name == "mixins" {
+                                                        continue;
+                                                    }
+
+                                                    let action_stem = if act_p.is_dir() {
+                                                        file_name
+                                                    } else if act_p.extension().and_then(|e| e.to_str()) == Some("py") {
+                                                        act_p.file_stem().unwrap_or_default().to_string_lossy().to_string()
+                                                    } else {
+                                                        continue;
+                                                    };
+
+                                                    let action_id = format!("{id}::{action_stem}");
+                                                    let display_name = format_action_name(&action_stem);
+
+                                                    // Find candidate action icon in assets/
+                                                    let icon_str = find_action_icon(&p, &action_stem);
+
+                                                    // Parse interactive config rows from the action Python file
+                                                    let action_py = if act_p.is_dir() {
+                                                        act_p.join(format!("{action_stem}.py"))
+                                                    } else {
+                                                        act_p.clone()
+                                                    };
+                                                    let config_rows = parse_action_config_rows(&action_py);
+
+                                                    actions.push(PluginActionInfo {
+                                                        id: action_id,
+                                                        name: display_name,
+                                                        icon_name_or_file: icon_str,
+                                                        config_rows,
+                                                        caps: None,
+                                                    });
+                                                }
                                             }
                                         }
                                     }
 
                                     // Fallback if no sub-actions were parsed
-                                    if actions.is_empty() {
+                                    if actions.is_empty() && !is_native {
                                         if id.contains("AppLauncher") {
                                             let icon_str = find_action_icon(&p, "action_launch");
                                             actions.push(PluginActionInfo {
@@ -488,6 +569,7 @@ impl PluginManager {
                                                 name: "Launch App".into(),
                                                 icon_name_or_file: icon_str,
                                                 config_rows: Vec::new(),
+                                                caps: None,
                                             });
                                         } else {
                                             let icon_str = find_action_icon(&p, "action");
@@ -496,11 +578,14 @@ impl PluginManager {
                                                 name: "Execute Action".into(),
                                                 icon_name_or_file: icon_str,
                                                 config_rows: Vec::new(),
+                                                caps: None,
                                             });
                                         }
                                     }
 
-                                    actions.sort_by(|a, b| a.name.cmp(&b.name));
+                                    if !is_native {
+                                        actions.sort_by(|a, b| a.name.cmp(&b.name));
+                                    }
 
                                     self.plugins.insert(id.clone(), DiscoveredPlugin {
                                         id: id.clone(),
@@ -510,10 +595,26 @@ impl PluginManager {
                                         description,
                                         path: p.clone(),
                                         actions,
+                                        is_native,
                                     });
 
-                                    // Initialize plugin in Python compatibility bridge
-                                    self.bridge.init_plugin(&id, &p);
+                                    // Initialize plugin: Native Ballista binary vs StreamController Python bridge
+                                    if is_native {
+                                        if let Some(bin_path) = resolve_native_entrypoint(&p, &json) {
+                                            if let Err(e) = self.bridge.init_native_plugin(&id, &p, &bin_path) {
+                                                tracing::error!("Failed to launch native plugin '{}': {e}", id);
+                                            }
+                                        } else {
+                                            tracing::warn!(
+                                                "Native plugin '{}' ({}) has no executable entrypoint for linux-{}",
+                                                id,
+                                                p.display(),
+                                                std::env::consts::ARCH
+                                            );
+                                        }
+                                    } else {
+                                        self.bridge.init_plugin(&id, &p);
+                                    }
                                 }
                             }
                         }
@@ -780,6 +881,26 @@ impl PluginManager {
     }
 
     fn run_plugin_install_hook(plugin_dir: &Path) {
+        // Ensure any native Ballista entrypoint binaries are marked executable after zip extraction
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let manifest_file = plugin_dir.join("manifest.json");
+            if let Ok(data) = fs::read_to_string(&manifest_file) {
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&data) {
+                    if let Some(bin_path) = resolve_native_entrypoint(plugin_dir, &json) {
+                        if let Ok(meta) = fs::metadata(&bin_path) {
+                            let mode = meta.permissions().mode();
+                            let _ = fs::set_permissions(
+                                &bin_path,
+                                fs::Permissions::from_mode(mode | 0o755),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
         let install_py = plugin_dir.join("__install__.py");
         if !install_py.exists() {
             return;
@@ -990,6 +1111,36 @@ impl PluginManager {
         }
         Vec::new()
     }
+}
+
+fn resolve_native_entrypoint(plugin_dir: &Path, manifest: &serde_json::Value) -> Option<PathBuf> {
+    let arch_key = format!("linux-{}", std::env::consts::ARCH);
+    if let Some(ep) = manifest.get("entrypoint") {
+        if let Some(rel) = ep.as_str() {
+            let p = plugin_dir.join(rel);
+            if p.is_file() {
+                return Some(p);
+            }
+        } else if let Some(obj) = ep.as_object() {
+            if let Some(rel) = obj.get(&arch_key).and_then(|v| v.as_str()) {
+                let p = plugin_dir.join(rel);
+                if p.is_file() {
+                    return Some(p);
+                }
+            }
+        }
+    }
+    // Fallback: locate first binary inside bin/linux-<arch>/
+    let arch_dir = plugin_dir.join("bin").join(&arch_key);
+    if let Ok(entries) = fs::read_dir(&arch_dir) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_file() {
+                return Some(p);
+            }
+        }
+    }
+    None
 }
 
 fn create_state_appearance(title: &str, icon_path: Option<String>) -> KeyAppearance {

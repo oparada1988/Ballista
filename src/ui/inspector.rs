@@ -855,9 +855,14 @@ impl PropertyInspector {
                     *self.rendered_live_slot.borrow_mut() = None;
                     self.rendered_live_rows.borrow_mut().clear();
                     self.rendered_live_widgets.borrow_mut().clear();
-                    // Trigger live config row fetch from compatibility bridge
+                    // Trigger live config row fetch from compatibility bridge / native plugin host
                     if let Some(ref pm) = *self.plugin_manager.borrow() {
-                        pm.bridge.get_action_config_rows(&slot);
+                        let scoped_slot = if active_dkey.is_empty() {
+                            slot.clone()
+                        } else {
+                            format!("{active_dkey}::{slot}")
+                        };
+                        pm.bridge.get_action_config_rows(&scoped_slot);
                     }
 
                     // Seamless check: does this action have real interactive settings?
@@ -1226,7 +1231,14 @@ impl PropertyInspector {
             } else {
                 self.preview_icon.set_visible(false);
             }
-            if app.has_plugin_labels() {
+            if !app.show_title {
+                self.preview_top_label.set_text("");
+                self.preview_top_label.set_visible(false);
+                self.preview_center_label.set_text("");
+                self.preview_center_label.set_visible(false);
+                self.preview_inner_label.set_text("");
+                self.preview_inner_label.set_visible(false);
+            } else if app.has_plugin_labels() {
                 let top_txt = app.top_label.as_deref().unwrap_or("");
                 self.preview_top_label.set_text(top_txt);
                 self.preview_top_label.set_visible(!top_txt.is_empty());
@@ -1387,7 +1399,14 @@ impl PropertyInspector {
             self.preview_icon.set_visible(false);
         }
 
-        if app.has_plugin_labels() {
+        if !app.show_title {
+            self.preview_top_label.set_text("");
+            self.preview_top_label.set_visible(false);
+            self.preview_center_label.set_text("");
+            self.preview_center_label.set_visible(false);
+            self.preview_inner_label.set_text("");
+            self.preview_inner_label.set_visible(false);
+        } else if app.has_plugin_labels() {
             let top_txt = app.top_label.as_deref().unwrap_or("");
             self.preview_top_label.set_text(top_txt);
             self.preview_top_label.set_visible(!top_txt.is_empty());
@@ -1534,6 +1553,14 @@ impl PropertyInspector {
                                 btn.add_css_class("suggested-action");
                             } else {
                                 btn.remove_css_class("suggested-action");
+                            }
+                            if let Some(sub) = btn
+                                .next_sibling()
+                                .and_then(|w| w.downcast::<Label>().ok())
+                            {
+                                if sub.text().as_str() != row.subtitle {
+                                    sub.set_text(&row.subtitle);
+                                }
                             }
                         }
                     }

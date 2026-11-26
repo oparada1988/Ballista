@@ -2599,14 +2599,16 @@ impl Canvas {
                         caps: action_caps,
                     };
 
-                    let (new_top, new_center, new_bottom) = if app.has_plugin_labels() {
+                    let (new_top, new_center, new_bottom) = if !app.show_title {
+                        (String::new(), String::new(), String::new())
+                    } else if app.has_plugin_labels() {
                         (
                             app.top_label.clone().unwrap_or_default(),
                             app.center_label.clone().unwrap_or_default(),
                             app.bottom_label.clone().unwrap_or_default(),
                         )
                     } else {
-                        let title = if !app.show_title || app.title.is_empty() {
+                        let title = if app.title.is_empty() {
                             String::new()
                         } else {
                             app.title.clone()

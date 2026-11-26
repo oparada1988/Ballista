@@ -1800,6 +1800,9 @@ impl MainWindow {
                             &slot,
                             &mut |action| {
                                 let apply_label = |app: &mut KeyAppearance| {
+                                    if app.custom_title_override {
+                                        return;
+                                    }
                                     match pos.as_str() {
                                         "top" => app.top_label = label_val.clone(),
                                         "center" => app.center_label = label_val.clone(),
@@ -1810,6 +1813,8 @@ impl MainWindow {
                                         app.title = summary;
                                     } else if !text.is_empty() {
                                         app.title = text.clone();
+                                    } else if !app.has_plugin_labels() {
+                                        app.title.clear();
                                     }
                                     if let Some(ref c) = parsed_color {
                                         app.text_color = c.clone();
@@ -2237,18 +2242,18 @@ impl MainWindow {
                             canvas_hw.pulse_dial_press(slot, 115);
                         }
                         let slot_str = format!("dial_{slot}");
+                        let local_x = (x as f64 - (slot as f64 * 200.0)).clamp(0.0, 200.0);
+                        let norm_x = (local_x / 200.0).clamp(0.0, 1.0);
+                        let norm_y = (y as f64 / 100.0).clamp(0.0, 1.0);
                         if nh_hw.has_slot(&dev_key, &slot_str) {
-                            let local_x = (x as f64 - (slot as f64 * 200.0)).clamp(0.0, 200.0);
-                            let norm_x = (local_x / 200.0).clamp(0.0, 1.0);
-                            let norm_y = (y as f64 / 100.0).clamp(0.0, 1.0);
                             let (cmds, updated) =
                                 nh_hw.handle_touch_tap(&dev_key, &slot_str, norm_x, norm_y);
                             disp_hw(dev_key, slot_str, cmds, updated);
                         } else {
-                            pm_hw.borrow().bridge.send_dial_event(
+                            pm_hw.borrow().bridge.send_dial_tap(
                                 &scoped_bridge_slot(&dev_key, &slot_str),
-                                "tap",
-                                0,
+                                norm_x,
+                                norm_y,
                             );
                         }
                     }
@@ -3121,14 +3126,39 @@ impl MainWindow {
             let target = *insp_target_title.borrow();
             let text = entry.text().to_string();
             let st = insp_ui_title.selected_state_idx.get();
+            let mut show_now = true;
+            let mut align_now = TextVerticalAlign::Bottom;
             {
                 let mut prof = prof_title.borrow_mut();
                 if let Some(page) = prof.current_page_mut() {
-                    mutate_target_appearance(page, target, st, |app| app.title = text.clone());
+                    mutate_target_appearance(page, target, st, |app| {
+                        app.title = text.clone();
+                        app.top_label = None;
+                        app.center_label = None;
+                        app.bottom_label = None;
+                        app.custom_title_override = true;
+                        show_now = app.show_title;
+                        align_now = app.vertical_align;
+                    });
                 }
             }
             persist_title();
-            insp_ui_title.preview_inner_label.set_text(&text);
+            insp_ui_title.preview_top_label.set_text("");
+            insp_ui_title.preview_top_label.set_visible(false);
+            insp_ui_title.preview_center_label.set_text("");
+            insp_ui_title.preview_center_label.set_visible(false);
+            if show_now && !text.is_empty() {
+                insp_ui_title.preview_inner_label.set_text(&text);
+                insp_ui_title.preview_inner_label.set_visible(true);
+            } else {
+                insp_ui_title.preview_inner_label.set_text("");
+                insp_ui_title.preview_inner_label.set_visible(false);
+            }
+            match align_now {
+                TextVerticalAlign::Top => insp_ui_title.preview_inner_label.set_valign(gtk::Align::Start),
+                TextVerticalAlign::Center => insp_ui_title.preview_inner_label.set_valign(gtk::Align::Center),
+                TextVerticalAlign::Bottom => insp_ui_title.preview_inner_label.set_valign(gtk::Align::End),
+            }
             if !text.is_empty() {
                 insp_ui_title.mark_assigned();
             }
@@ -3487,7 +3517,18 @@ impl MainWindow {
                 {
                     let mut p = prof.borrow_mut();
                     if let Some(page) = p.current_page_mut() {
-                        mutate_target_appearance(page, target, st, |app| app.vertical_align = pos);
+                        mutate_target_appearance(page, target, st, |app| {
+                            app.vertical_align = pos;
+                            if app.has_plugin_labels() {
+                                let promoted = app.combined_display_summary();
+                                if !promoted.is_empty() && app.title.is_empty() {
+                                    app.title = promoted;
+                                }
+                                app.top_label = None;
+                                app.center_label = None;
+                                app.bottom_label = None;
+                            }
+                        });
                     }
                 }
                 persist();

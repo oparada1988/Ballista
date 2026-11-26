@@ -139,6 +139,9 @@ fn draw_key_appearance_labels(
     app: &KeyAppearance,
     elapsed_sec: f64,
 ) -> bool {
+    if !app.show_title {
+        return false;
+    }
     let mut overflows = false;
     if app.has_plugin_labels() {
         if let Some(ref t) = app.top_label {
@@ -1794,7 +1797,9 @@ impl HardwareManager {
                             pc::show_layout(&cr, &layout);
                         };
 
-                        if app.has_plugin_labels() {
+                        if !app.show_title {
+                            // User explicitly hid labels on this slot
+                        } else if app.has_plugin_labels() {
                             if let Some(ref t) = app.top_label {
                                 draw_dial_label(t, 6.0);
                             }

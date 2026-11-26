@@ -146,7 +146,7 @@ impl Sidebar {
                 let actions_tuples: Vec<(&str, &str, &str, Option<TargetCaps>)> = plugin
                     .actions
                     .iter()
-                    .map(|a| (a.id.as_str(), a.name.as_str(), a.icon_name_or_file.as_str(), None))
+                    .map(|a| (a.id.as_str(), a.name.as_str(), a.icon_name_or_file.as_str(), a.caps))
                     .collect();
 
                 self.append_collapsible_category(
