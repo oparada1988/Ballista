@@ -823,6 +823,7 @@ impl PropertyInspector {
                     .unwrap_or(false);
 
                 let active_dkey = self.active_device_key.borrow().clone();
+                let mut used_uuid_cache = false;
                 let live_rows = if is_native {
                     self.native_host
                         .borrow()
@@ -831,6 +832,13 @@ impl PropertyInspector {
                 } else if let Some(ref pm) = *self.plugin_manager.borrow() {
                     pm.get_live_config_rows(&format!("{active_dkey}::{slot}"))
                         .or_else(|| pm.get_live_config_rows(&slot))
+                        .or_else(|| {
+                            let cached = pm.get_cached_uuid_config_rows(&act.uuid);
+                            if cached.is_some() {
+                                used_uuid_cache = true;
+                            }
+                            cached
+                        })
                 } else {
                     None
                 };
@@ -851,6 +859,17 @@ impl PropertyInspector {
                     };
                     self.action_info_desc.set_text(&desc);
                     self.render_live_config_rows(&slot, rows);
+                    if used_uuid_cache {
+                        // Refresh in background so any server-side updates patch in-place cleanly
+                        if let Some(ref pm) = *self.plugin_manager.borrow() {
+                            let scoped_slot = if active_dkey.is_empty() {
+                                slot.clone()
+                            } else {
+                                format!("{active_dkey}::{slot}")
+                            };
+                            pm.bridge.get_action_config_rows(&scoped_slot);
+                        }
+                    }
                 } else {
                     *self.rendered_live_slot.borrow_mut() = None;
                     self.rendered_live_rows.borrow_mut().clear();

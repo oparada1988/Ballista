@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -232,6 +232,19 @@ pub enum HardwareEvent {
     DeviceLost { dev_path: PathBuf },
 }
 
+#[derive(Default)]
+struct PendingSyncWork {
+    full_page: Option<(String, DeviceKind, Profile, u64)>,
+    single_slots: HashMap<String, (String, DeviceKind, Profile)>,
+    stopped: bool,
+}
+
+struct DeviceSyncQueue {
+    state: Mutex<PendingSyncWork>,
+    cv: Condvar,
+    sync_gen: AtomicU64,
+}
+
 #[derive(Clone)]
 pub struct HardwareManager {
     hid_api: Arc<Mutex<Option<HidApi>>>,
@@ -239,6 +252,7 @@ pub struct HardwareManager {
     device_kinds: Arc<Mutex<HashMap<PathBuf, DeviceKind>>>,
     listener_stops: Arc<Mutex<HashMap<PathBuf, Arc<AtomicBool>>>>,
     active_animations: Arc<Mutex<HashMap<String, (String, Arc<AtomicBool>)>>>,
+    sync_workers: Arc<Mutex<HashMap<PathBuf, Arc<DeviceSyncQueue>>>>,
     native_host: Arc<Mutex<Option<crate::native_sdk::NativePluginHost>>>,
     suspended: Arc<AtomicBool>,
     branding_locked: Arc<AtomicBool>,
@@ -338,6 +352,7 @@ impl HardwareManager {
             device_kinds: Arc::new(Mutex::new(HashMap::new())),
             listener_stops: Arc::new(Mutex::new(HashMap::new())),
             active_animations: Arc::new(Mutex::new(HashMap::new())),
+            sync_workers: Arc::new(Mutex::new(HashMap::new())),
             native_host: Arc::new(Mutex::new(None)),
             suspended: Arc::new(AtomicBool::new(false)),
             branding_locked: Arc::new(AtomicBool::new(false)),
@@ -510,6 +525,99 @@ impl HardwareManager {
         }
     }
 
+    /// Stops and drains all per-device background hardware sync worker threads.
+    fn stop_all_sync_workers(&self) {
+        let workers: Vec<Arc<DeviceSyncQueue>> = {
+            let mut map = self.sync_workers.lock().unwrap();
+            map.drain().map(|(_, q)| q).collect()
+        };
+        for q in workers {
+            q.sync_gen.fetch_add(1, Ordering::SeqCst);
+            let mut st = q.state.lock().unwrap();
+            st.full_page = None;
+            st.single_slots.clear();
+            st.stopped = true;
+            q.cv.notify_all();
+        }
+    }
+
+    /// Cancels any queued/in-flight async page or slot sync for a specific device path
+    /// (used before blocking fade-in / branding transitions so stale jobs never race).
+    fn cancel_pending_sync_for(&self, dev_path: &Path) {
+        let q_opt = self.sync_workers.lock().unwrap().get(dev_path).cloned();
+        if let Some(q) = q_opt {
+            q.sync_gen.fetch_add(1, Ordering::SeqCst);
+            let mut st = q.state.lock().unwrap();
+            st.full_page = None;
+            st.single_slots.clear();
+        }
+    }
+
+    /// Returns (or lazily spawns) the dedicated single-threaded coalescing hardware sync worker
+    /// for `dev_path`. Keeps the GTK main thread 100% free of JPEG encoding and USB HID I/O.
+    fn get_or_spawn_sync_worker(&self, dev_path: &Path) -> Arc<DeviceSyncQueue> {
+        let mut map = self.sync_workers.lock().unwrap();
+        if let Some(existing) = map.get(dev_path) {
+            if !existing.state.lock().unwrap().stopped {
+                return existing.clone();
+            }
+        }
+        let queue = Arc::new(DeviceSyncQueue {
+            state: Mutex::new(PendingSyncWork::default()),
+            cv: Condvar::new(),
+            sync_gen: AtomicU64::new(0),
+        });
+        map.insert(dev_path.to_path_buf(), queue.clone());
+        drop(map);
+
+        let hw_w = self.clone();
+        let path_w = dev_path.to_path_buf();
+        let q_w = queue.clone();
+        thread::spawn(move || {
+            loop {
+                let (full_job, slot_jobs) = {
+                    let mut st = q_w.state.lock().unwrap();
+                    while !st.stopped && st.full_page.is_none() && st.single_slots.is_empty() {
+                        st = q_w.cv.wait(st).unwrap();
+                    }
+                    if st.stopped {
+                        break;
+                    }
+                    if let Some(full) = st.full_page.take() {
+                        st.single_slots.clear();
+                        (Some(full), Vec::new())
+                    } else {
+                        let slots: Vec<(String, (String, DeviceKind, Profile))> =
+                            st.single_slots.drain().collect();
+                        (None, slots)
+                    }
+                };
+
+                if let Some((device_key, kind, profile, expected_gen)) = full_job {
+                    hw_w.sync_hardware_page_inner(
+                        &path_w,
+                        &device_key,
+                        kind,
+                        &profile,
+                        Some((&q_w.sync_gen, expected_gen)),
+                    );
+                } else {
+                    for (slot, (device_key, kind, profile)) in slot_jobs {
+                        if hw_w.is_suspended() || hw_w.is_branding_locked() {
+                            break;
+                        }
+                        if q_w.state.lock().unwrap().full_page.is_some() {
+                            break;
+                        }
+                        hw_w.sync_single_slot_blocking(&path_w, &device_key, kind, &profile, &slot);
+                    }
+                }
+            }
+        });
+
+        queue
+    }
+
     /// Writes the Ballista branding frames (centered 2x2 logo + black surround keys +
     /// touch strip / Neo info bar) directly to an already-open `HidDevice`.
     pub fn write_branding_direct(dev: &HidDevice, kind: DeviceKind) -> Result<(), String> {
@@ -611,6 +719,7 @@ impl HardwareManager {
         default_brightness: u8,
     ) {
         self.transition_gen.fetch_add(1, Ordering::SeqCst);
+        self.stop_all_sync_workers();
         self.stop_all_listeners();
         self.stop_all_animations();
 
@@ -829,7 +938,8 @@ impl HardwareManager {
                 }
 
                 // 2. Render and upload the complete Action UI while dark at 0%
-                hw.sync_hardware_page(&dev_path, &device_key, kind, &profile);
+                hw.cancel_pending_sync_for(&dev_path);
+                hw.sync_hardware_page_blocking(&dev_path, &device_key, kind, &profile);
 
                 if hw.transition_gen.load(Ordering::SeqCst) != my_gen
                     || hw.is_suspended()
@@ -870,6 +980,9 @@ impl HardwareManager {
     ) {
         self.branding_locked.store(true, Ordering::SeqCst);
         let my_gen = self.transition_gen.fetch_add(1, Ordering::SeqCst) + 1;
+        for (dev_path, _, _) in &targets {
+            self.cancel_pending_sync_for(dev_path);
+        }
         self.stop_all_animations();
 
         for (dev_path, kind, target_brightness) in targets {
@@ -1906,9 +2019,43 @@ impl HardwareManager {
         encode_hardware_image(&transformed, KeyImageFormat::Jpeg, 95)
     }
 
-    /// Syncs an entire profile page to physical hardware LCD keys, touchscreen strip, and Neo info bar
+    /// Enqueues a non-blocking, latest-wins full-page hardware sync on this device's dedicated
+    /// background worker thread. Returns immediately so the GTK UI renders on the very next frame!
     pub fn sync_hardware_page(&self, dev_path: &Path, device_key: &str, kind: DeviceKind, profile: &Profile) {
         if !kind.is_visual() || self.is_suspended() || self.is_branding_locked() {
+            return;
+        }
+        let q = self.get_or_spawn_sync_worker(dev_path);
+        let my_gen = q.sync_gen.fetch_add(1, Ordering::SeqCst) + 1;
+        let mut st = q.state.lock().unwrap();
+        if st.stopped {
+            return;
+        }
+        st.full_page = Some((device_key.to_string(), kind, profile.clone(), my_gen));
+        st.single_slots.clear();
+        q.cv.notify_one();
+    }
+
+    /// Synchronously renders and uploads an entire profile page to physical hardware LCD keys,
+    /// touchscreen strip, and Neo info bar (used on background fade-in threads).
+    pub fn sync_hardware_page_blocking(&self, dev_path: &Path, device_key: &str, kind: DeviceKind, profile: &Profile) {
+        self.sync_hardware_page_inner(dev_path, device_key, kind, profile, None);
+    }
+
+    fn sync_hardware_page_inner(
+        &self,
+        dev_path: &Path,
+        device_key: &str,
+        kind: DeviceKind,
+        profile: &Profile,
+        cancel_gen: Option<(&AtomicU64, u64)>,
+    ) {
+        let is_cancelled = || -> bool {
+            self.is_suspended()
+                || self.is_branding_locked()
+                || cancel_gen.map_or(false, |(g, exp)| g.load(Ordering::SeqCst) != exp)
+        };
+        if !kind.is_visual() || is_cancelled() {
             return;
         }
         self.branding_painted
@@ -1927,6 +2074,9 @@ impl HardwareManager {
         let total_keys = kind.total_keys();
         if let Some(page) = profile.current_page() {
             for key in 0..total_keys {
+                if is_cancelled() {
+                    return;
+                }
                 let action = page.keys.get(&key);
                 let appearance = action.map(|a| a.active_appearance());
                 let icon_name = action
@@ -2098,6 +2248,9 @@ impl HardwareManager {
         }
 
         // Stream Deck + (800x100) and Stream Deck + XL (1200x100) Touchscreen strip
+        if is_cancelled() {
+            return;
+        }
         if let Some((tw, th)) = kind.touchscreen_size() {
             let touch_anim_id = format!("touch_{}", dev_path.display());
             let mut anim_lock = self.active_animations.lock().unwrap();
@@ -2180,6 +2333,9 @@ impl HardwareManager {
         }
 
         // Stream Deck Neo 248x58 Info Bar LCD
+        if is_cancelled() {
+            return;
+        }
         if kind.has_info_screen() {
             let bar_jpeg = self.render_neo_info_bar_jpeg(profile);
             let dev = dev_arc.lock().unwrap();
@@ -2193,9 +2349,28 @@ impl HardwareManager {
         }
     }
 
-    /// Lightweight single-slot hardware push for live 1Hz native action ticks (Clock, System Metrics, Media)
-    /// so ticking a single key never re-renders or re-uploads all 32 keys over USB.
+    /// Lightweight non-blocking single-slot hardware push for live 1Hz native action ticks
+    /// (Clock, System Metrics, Media) and bridge slot updates, coalesced per device & slot
+    /// on the device's background worker thread.
     pub fn sync_single_slot(&self, dev_path: &Path, device_key: &str, kind: DeviceKind, profile: &Profile, slot: &str) {
+        if !kind.is_visual() || self.is_suspended() || self.is_branding_locked() {
+            return;
+        }
+        let q = self.get_or_spawn_sync_worker(dev_path);
+        let mut st = q.state.lock().unwrap();
+        if st.stopped {
+            return;
+        }
+        if let Some((_, _, ref mut pending_prof, _)) = st.full_page {
+            *pending_prof = profile.clone();
+        } else {
+            st.single_slots
+                .insert(slot.to_string(), (device_key.to_string(), kind, profile.clone()));
+        }
+        q.cv.notify_one();
+    }
+
+    fn sync_single_slot_blocking(&self, dev_path: &Path, device_key: &str, kind: DeviceKind, profile: &Profile, slot: &str) {
         if !kind.is_visual() || self.is_suspended() || self.is_branding_locked() {
             return;
         }

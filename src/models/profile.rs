@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum TouchscreenMode {
@@ -193,6 +194,9 @@ impl Profile {
 
     pub fn set_page(&mut self, idx: usize) -> bool {
         if idx < self.pages.len() {
+            if self.current_page_idx == idx && self.folder_stack.is_empty() {
+                return false;
+            }
             self.folder_stack.clear();
             self.current_page_idx = idx;
             true
@@ -278,6 +282,14 @@ impl ProfileStore {
     }
 
     pub fn save_profiles(profiles: &[Profile], active_by_device: &HashMap<String, String>) {
+        // Supersede any queued background write so an older async snapshot can never overwrite this sync write
+        if let Some(saver) = ASYNC_PROFILE_SAVER.get() {
+            let mut st = saver.state.lock().unwrap();
+            st.pending = None;
+            while st.writing {
+                st = saver.cv.wait(st).unwrap();
+            }
+        }
         let store = Self {
             profiles: profiles.to_vec(),
             active_by_device: active_by_device.clone(),
@@ -285,7 +297,31 @@ impl ProfileStore {
         store.save();
     }
 
+    /// Non-blocking latest-wins background persistence so page switches and live plugin updates
+    /// never block the GTK main thread on JSON serialization or disk I/O.
+    pub fn save_profiles_async(profiles: &[Profile], active_by_device: &HashMap<String, String>) {
+        let store = Self {
+            profiles: profiles.to_vec(),
+            active_by_device: active_by_device.clone(),
+        };
+        let saver = ASYNC_PROFILE_SAVER.get_or_init(AsyncProfileSaver::start);
+        let mut st = saver.state.lock().unwrap();
+        st.pending = Some(store);
+        saver.cv.notify_one();
+    }
+
+    /// Waits for any queued async profile save to finish writing to disk (called on graceful quit/suspend).
+    pub fn flush_async_saves() {
+        if let Some(saver) = ASYNC_PROFILE_SAVER.get() {
+            let mut st = saver.state.lock().unwrap();
+            while st.pending.is_some() || st.writing {
+                st = saver.cv.wait(st).unwrap();
+            }
+        }
+    }
+
     pub fn save(&self) {
+        let _guard = PROFILE_FILE_WRITE_LOCK.lock().unwrap();
         let path = Self::store_path();
         if let Some(parent) = path.parent() {
             let _ = fs::create_dir_all(parent);
@@ -319,5 +355,70 @@ impl ProfileStore {
             .find(|p| p.device_kind == kind)
             .cloned()
             .unwrap_or_else(|| Profile::new_for_device("Default Profile", kind))
+    }
+}
+
+static PROFILE_FILE_WRITE_LOCK: Mutex<()> = Mutex::new(());
+static ASYNC_PROFILE_SAVER: OnceLock<Arc<AsyncProfileSaver>> = OnceLock::new();
+
+struct AsyncSaveState {
+    pending: Option<ProfileStore>,
+    writing: bool,
+}
+
+struct AsyncProfileSaver {
+    state: Mutex<AsyncSaveState>,
+    cv: Condvar,
+}
+
+impl AsyncProfileSaver {
+    fn start() -> Arc<Self> {
+        let saver = Arc::new(Self {
+            state: Mutex::new(AsyncSaveState {
+                pending: None,
+                writing: false,
+            }),
+            cv: Condvar::new(),
+        });
+        let worker = saver.clone();
+        std::thread::spawn(move || loop {
+            let next = {
+                let mut st = worker.state.lock().unwrap();
+                while st.pending.is_none() {
+                    st = worker.cv.wait(st).unwrap();
+                }
+                let item = st.pending.take();
+                st.writing = true;
+                item
+            };
+            if let Some(store) = next {
+                store.save();
+            }
+            let mut st = worker.state.lock().unwrap();
+            st.writing = false;
+            worker.cv.notify_all();
+        });
+        saver
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn set_page_returns_false_when_already_on_same_page_outside_folder() {
+        let mut prof = Profile::new_for_device("Test", DeviceKind::StreamDeckPlus);
+        prof.add_page(); // now on page 1 (index 1)
+        assert_eq!(prof.current_page_idx, 1);
+        assert!(!prof.set_page(1)); // no-op when already on page 1
+        assert!(prof.set_page(0));  // switches to page 0
+        assert!(!prof.set_page(0)); // no-op when already on page 0
+
+        // Entering a folder and clicking the underlying page chip should exit the folder and return true
+        prof.enter_folder("folder-1", "My Folder");
+        assert!(prof.is_in_folder());
+        assert!(prof.set_page(0));
+        assert!(!prof.is_in_folder());
     }
 }

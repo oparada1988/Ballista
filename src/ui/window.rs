@@ -26,6 +26,14 @@ use std::rc::Rc;
 type NativeCommandDispatcher =
     Rc<dyn Fn(String, String, Vec<HostCommand>, Option<HashMap<String, serde_json::Value>>)>;
 
+thread_local! {
+    /// Tracks the last rendered `(icon_path, icon_scale, file_content_stamp)` per scoped bridge slot
+    /// (`"{device_key}::{slot}"`) so unchanged `SetMedia` echoes on page switches become true no-ops,
+    /// while atomic in-place card rewrites (new mtime/size/inode) still trigger immediate redraws.
+    static BRIDGE_MEDIA_STAMPS: RefCell<HashMap<String, (Option<String>, u32, Option<(u128, u64, u64)>)>> =
+        RefCell::new(HashMap::new());
+}
+
 pub struct MainWindow {
     pub window: ApplicationWindow,
     pub header: Header,
@@ -284,7 +292,7 @@ impl MainWindow {
                             .insert(dev.stable_key(), current_p.id.clone());
                     }
                 }
-                ProfileStore::save_profiles(&profs.borrow(), &act_map.borrow());
+                ProfileStore::save_profiles_async(&profs.borrow(), &act_map.borrow());
             })
         };
 
@@ -336,6 +344,7 @@ impl MainWindow {
                 };
                 s.save();
                 persist_q();
+                ProfileStore::flush_async_saves();
                 if !shut_done.replace(true) {
                     hw_q.borrow().prepare_for_shutdown(fade_to_zero_after_hold);
                 } else {
@@ -423,6 +432,7 @@ impl MainWindow {
             st.work_paned_position = work_paned_close.position();
             st.save();
             persist_close();
+            ProfileStore::flush_async_saves();
 
             match st.close_behavior {
                 CloseBehavior::MinimizeToTray => {
@@ -676,7 +686,7 @@ impl MainWindow {
                     if is_gui_deck {
                         persist_nat();
                     } else {
-                        ProfileStore::save_profiles(&profs_nat.borrow(), &act_by_dev_nat.borrow());
+                        ProfileStore::save_profiles_async(&profs_nat.borrow(), &act_by_dev_nat.borrow());
                     }
                 };
 
@@ -893,7 +903,7 @@ impl MainWindow {
                                     .iter()
                                     .position(|n| n == &next_p.name)
                                     .unwrap_or(0);
-                                ProfileStore::save_profiles(&profs_b, &act_by_dev_nat.borrow());
+                                ProfileStore::save_profiles_async(&profs_b, &act_by_dev_nat.borrow());
                                 drop(profs_b);
                                 if is_gui_deck {
                                     hdr_nat.update_profiles(&p_names, sel_pos);
@@ -1514,6 +1524,9 @@ impl MainWindow {
                 let slot = format_target_slot(target);
                 let scoped_slot = scoped_bridge_slot(&dkey, &slot);
                 nh_assign.destroy_slot(&dkey, &slot);
+                BRIDGE_MEDIA_STAMPS.with(|m| {
+                    m.borrow_mut().remove(&scoped_slot);
+                });
                 {
                     let pm = pm_assign.borrow();
                     pm.bridge.destroy_action(&scoped_slot);
@@ -1642,57 +1655,89 @@ impl MainWindow {
         let persist_bridge = persist_profiles.clone();
 
         glib::spawn_future_local(async move {
-            while let Ok(event) = bridge_receiver.recv().await {
-                let apply_bridge_slot_update =
-                    |raw_slot: &str, mutator: &mut dyn FnMut(&mut KeyAction) -> bool, push_hw: bool| {
-                        let active_gui_key = active_device_key_for(
-                            &devs_bridge,
-                            &act_bridge,
-                            prof_bridge.borrow().device_kind,
-                        );
-                        let (opt_dkey, base_slot) = split_bridge_slot(raw_slot);
-                        let dkey = opt_dkey
-                            .map(|s| s.to_string())
-                            .unwrap_or_else(|| active_gui_key.clone());
-                        let is_gui = dkey == active_gui_key;
-                        let target = parse_slot_target(base_slot);
-                        let target_dev = devs_bridge
-                            .borrow()
-                            .iter()
-                            .find(|d| d.stable_key() == dkey)
-                            .cloned();
-                        let target_kind = target_dev
-                            .as_ref()
-                            .map(|d| d.kind)
-                            .unwrap_or_else(|| prof_bridge.borrow().device_kind);
+            while let Ok(first_event) = bridge_receiver.recv().await {
+                // Drain any immediately available burst events (e.g. 8x SetMedia + 8x SetLabel + 8x ActionConfigRows
+                // emitted on page switch) into a single coalesced UI/hardware/persistence pass.
+                let mut batch = Vec::with_capacity(16);
+                batch.push(first_event);
+                while batch.len() < 64 {
+                    match bridge_receiver.try_recv() {
+                        Ok(ev) => batch.push(ev),
+                        Err(_) => break,
+                    }
+                }
 
-                        let mut updated = false;
-                        let mut updated_prof: Option<Profile> = None;
+                let mut need_sidebar_refresh = false;
+                let mut gui_visual_dirty = false;
+                let mut gui_preview_dirty = false;
+                let mut need_persist_gui = false;
+                let mut need_persist_bg = false;
+                let mut dirty_hw_slots: HashMap<
+                    String,
+                    (ConnectedDevice, Profile, std::collections::HashSet<String>),
+                > = HashMap::new();
+                let mut latest_config_rows: HashMap<
+                    String,
+                    Vec<crate::core::plugin_bridge::BridgeConfigRow>,
+                > = HashMap::new();
 
-                        if is_gui {
-                            {
+                for event in batch {
+                    let mut apply_bridge_slot_update =
+                        |raw_slot: &str, mutator: &mut dyn FnMut(&mut KeyAction) -> bool, push_hw: bool| {
+                            let active_gui_key = active_device_key_for(
+                                &devs_bridge,
+                                &act_bridge,
+                                prof_bridge.borrow().device_kind,
+                            );
+                            let (opt_dkey, base_slot) = split_bridge_slot(raw_slot);
+                            let dkey = opt_dkey
+                                .map(|s| s.to_string())
+                                .unwrap_or_else(|| active_gui_key.clone());
+                            let is_gui = dkey == active_gui_key;
+                            let target = parse_slot_target(base_slot);
+                            let target_dev = devs_bridge
+                                .borrow()
+                                .iter()
+                                .find(|d| d.stable_key() == dkey)
+                                .cloned();
+                            let target_kind = target_dev
+                                .as_ref()
+                                .map(|d| d.kind)
+                                .unwrap_or_else(|| prof_bridge.borrow().device_kind);
+
+                            let mut updated = false;
+                            let mut updated_prof: Option<Profile> = None;
+
+                            if is_gui {
                                 let mut prof = prof_bridge.borrow_mut();
                                 if let Some(page) = prof.current_page_mut() {
-                                    let action = get_target_mut(page, target);
-                                    updated = mutator(action);
-                                }
-                                if updated {
-                                    updated_prof = Some(prof.clone());
-                                }
-                            }
-                            if updated {
-                                persist_bridge();
-                                if let Some(ref prof) = updated_prof {
-                                    canvas_bridge.render_profile_page(prof);
-                                    if target == *insp_bridge.current_target.borrow() {
-                                        if let Some(act) = get_target_ref(prof, target) {
-                                            insp_bridge.update_preview_only(act);
+                                    // Cross-page guard: only mutate an existing non-system plugin action on
+                                    // the currently active page (never create ghost keys on an empty page!).
+                                    let existing = match target {
+                                        InspectorTarget::Key(k) => page.keys.get_mut(&k),
+                                        InspectorTarget::Dial(d) => page.dial_actions.get_mut(&d),
+                                        InspectorTarget::Touchscreen => page.touchscreen_action.as_mut(),
+                                    };
+                                    if let Some(action) = existing {
+                                        if !action.plugin_id.is_empty() && action.plugin_id != "system" {
+                                            updated = mutator(action);
                                         }
                                     }
                                 }
-                            }
-                        } else {
-                            {
+                                if updated && push_hw {
+                                    updated_prof = Some(prof.clone());
+                                }
+                                drop(prof);
+                                if updated {
+                                    need_persist_gui = true;
+                                    if push_hw {
+                                        gui_visual_dirty = true;
+                                        if target == *insp_bridge.current_target.borrow() {
+                                            gui_preview_dirty = true;
+                                        }
+                                    }
+                                }
+                            } else {
                                 let mut list = profs_bridge.borrow_mut();
                                 if let Some(p_idx) = find_profile_idx_for_device(
                                     &list,
@@ -1701,218 +1746,364 @@ impl MainWindow {
                                     target_kind,
                                 ) {
                                     if let Some(page) = list[p_idx].current_page_mut() {
-                                        let action = get_target_mut(page, target);
-                                        updated = mutator(action);
+                                        let existing = match target {
+                                            InspectorTarget::Key(k) => page.keys.get_mut(&k),
+                                            InspectorTarget::Dial(d) => page.dial_actions.get_mut(&d),
+                                            InspectorTarget::Touchscreen => page.touchscreen_action.as_mut(),
+                                        };
+                                        if let Some(action) = existing {
+                                            if !action.plugin_id.is_empty() && action.plugin_id != "system" {
+                                                updated = mutator(action);
+                                            }
+                                        }
                                     }
-                                    if updated {
+                                    if updated && push_hw {
                                         updated_prof = Some(list[p_idx].clone());
                                     }
                                 }
+                                drop(list);
+                                if updated {
+                                    need_persist_bg = true;
+                                }
                             }
-                            if updated {
-                                ProfileStore::save_profiles(
-                                    &profs_bridge.borrow(),
-                                    &act_by_dev_bridge.borrow(),
-                                );
+
+                            if updated && push_hw {
+                                if let (Some(dev), Some(prof)) = (target_dev, updated_prof) {
+                                    let entry = dirty_hw_slots
+                                        .entry(dkey)
+                                        .or_insert_with(|| (dev, prof.clone(), std::collections::HashSet::new()));
+                                    entry.1 = prof;
+                                    entry.2.insert(base_slot.to_string());
+                                }
+                            }
+                        };
+
+                    match event {
+                        crate::core::plugin_bridge::BridgeEvent::PluginInitialized {
+                            plugin_id,
+                            plugin_name,
+                            has_settings,
+                            actions,
+                            ..
+                        } => {
+                            tracing::info!(
+                                "Bridge initialized plugin '{}' ({}) with {} actions (has_settings={})",
+                                plugin_name,
+                                plugin_id,
+                                actions.len(),
+                                has_settings
+                            );
+                            {
+                                let mut pm = pm_bridge.borrow_mut();
+                                pm.apply_bridge_plugin_metadata(&plugin_id, &plugin_name, has_settings, &actions);
+                            }
+                            need_sidebar_refresh = true;
+                        }
+                        crate::core::plugin_bridge::BridgeEvent::PluginSettingsRows { plugin_id, rows } => {
+                            pm_bridge.borrow().set_live_plugin_settings_rows(&plugin_id, rows.clone());
+                            if let Some((ref open_pid, ref cb)) = *active_ps_bridge.borrow() {
+                                if open_pid == &plugin_id {
+                                    cb(&rows);
+                                }
                             }
                         }
+                        crate::core::plugin_bridge::BridgeEvent::SetMedia { slot, media_path, size, .. } => {
+                            let new_icon = if media_path.is_empty() {
+                                None
+                            } else {
+                                Some(media_path.clone())
+                            };
+                            let new_pct = size.map(|sz| (sz * 100.0).round().clamp(20.0, 100.0) as u32);
+                            let new_stamp = new_icon
+                                .as_deref()
+                                .and_then(super::canvas::file_content_stamp);
+                            let active_gui_key = active_device_key_for(
+                                &devs_bridge,
+                                &act_bridge,
+                                prof_bridge.borrow().device_kind,
+                            );
+                            let (opt_dkey, base_slot) = split_bridge_slot(&slot);
+                            let stamp_key = scoped_bridge_slot(
+                                opt_dkey.unwrap_or(&active_gui_key),
+                                base_slot,
+                            );
+                            apply_bridge_slot_update(
+                                &slot,
+                                &mut |action| {
+                                    let target_scale = new_pct.unwrap_or(action.appearance.icon_scale);
+                                    let prev_stamp = BRIDGE_MEDIA_STAMPS
+                                        .with(|m| m.borrow().get(&stamp_key).cloned());
+                                    let cur_st = action.current_state;
+                                    let state_matches = if cur_st < action.states.len() {
+                                        action.states[cur_st].icon_path == new_icon
+                                            && action.states[cur_st].icon_scale == target_scale
+                                    } else {
+                                        true
+                                    };
+                                    let same_appearance = action.appearance.icon_path == new_icon
+                                        && action.appearance.icon_scale == target_scale
+                                        && state_matches;
+                                    let same_file = prev_stamp
+                                        .as_ref()
+                                        .map(|(p, sc, st)| {
+                                            *p == new_icon && *sc == target_scale && *st == new_stamp
+                                        })
+                                        .unwrap_or(false);
+                                    if same_appearance && same_file {
+                                        return false;
+                                    }
+                                    action.appearance.icon_path = new_icon.clone();
+                                    action.appearance.icon_scale = target_scale;
+                                    if cur_st < action.states.len() {
+                                        action.states[cur_st].icon_path = new_icon.clone();
+                                        action.states[cur_st].icon_scale = target_scale;
+                                    }
+                                    BRIDGE_MEDIA_STAMPS.with(|m| {
+                                        m.borrow_mut().insert(
+                                            stamp_key.clone(),
+                                            (new_icon.clone(), target_scale, new_stamp),
+                                        );
+                                    });
+                                    true
+                                },
+                                true,
+                            );
+                        }
+                        crate::core::plugin_bridge::BridgeEvent::SetLabel {
+                            slot,
+                            text,
+                            position,
+                            color,
+                            font_size,
+                            font_family,
+                        } => {
+                            let parsed_color = color.as_ref().and_then(parse_bridge_color);
+                            let pos = position.as_deref().unwrap_or("bottom").to_string();
+                            let label_val = if text.is_empty() { None } else { Some(text.clone()) };
+                            apply_bridge_slot_update(
+                                &slot,
+                                &mut |action| {
+                                    let apply_label = |app: &mut KeyAppearance| -> bool {
+                                        if app.custom_title_override {
+                                            return false;
+                                        }
+                                        let old_top = app.top_label.clone();
+                                        let old_center = app.center_label.clone();
+                                        let old_bottom = app.bottom_label.clone();
+                                        let old_title = app.title.clone();
+                                        let old_color = app.text_color.clone();
+                                        let old_fs = app.font_size;
+                                        let old_ff = app.font_family.clone();
 
-                        if updated && push_hw {
-                            if let (Some(dev), Some(prof)) = (target_dev, updated_prof) {
-                                hw_bridge.borrow().sync_hardware_page(
+                                        match pos.as_str() {
+                                            "top" => app.top_label = label_val.clone(),
+                                            "center" => app.center_label = label_val.clone(),
+                                            _ => app.bottom_label = label_val.clone(),
+                                        }
+                                        let summary = app.combined_display_summary();
+                                        if !summary.is_empty() {
+                                            app.title = summary;
+                                        } else if !text.is_empty() {
+                                            app.title = text.clone();
+                                        } else if !app.has_plugin_labels() {
+                                            app.title.clear();
+                                        }
+                                        if let Some(ref c) = parsed_color {
+                                            app.text_color = c.clone();
+                                        }
+                                        if let Some(fs) = font_size {
+                                            if fs > 0 {
+                                                app.font_size = fs;
+                                            }
+                                        }
+                                        if let Some(ref ff) = font_family {
+                                            if !ff.is_empty() {
+                                                app.font_family = ff.clone();
+                                            }
+                                        }
+                                        app.top_label != old_top
+                                            || app.center_label != old_center
+                                            || app.bottom_label != old_bottom
+                                            || app.title != old_title
+                                            || app.text_color != old_color
+                                            || app.font_size != old_fs
+                                            || app.font_family != old_ff
+                                    };
+                                    let mut changed = apply_label(&mut action.appearance);
+                                    let cur_st = action.current_state;
+                                    if cur_st < action.states.len() {
+                                        changed |= apply_label(&mut action.states[cur_st]);
+                                    }
+                                    changed
+                                },
+                                true,
+                            );
+                        }
+                        crate::core::plugin_bridge::BridgeEvent::SetState { slot, state } => {
+                            apply_bridge_slot_update(
+                                &slot,
+                                &mut |action| {
+                                    if state < action.states.len() && state != action.current_state {
+                                        action.set_active_state(state);
+                                        true
+                                    } else {
+                                        false
+                                    }
+                                },
+                                true,
+                            );
+                        }
+                        crate::core::plugin_bridge::BridgeEvent::SetSettings { slot, settings } => {
+                            apply_bridge_slot_update(
+                                &slot,
+                                &mut |action| {
+                                    let mut changed = false;
+                                    for (k, v) in &settings {
+                                        if action.raw_settings.get(k) != Some(v) {
+                                            changed = true;
+                                            let val_str = match v {
+                                                serde_json::Value::String(s) => s.clone(),
+                                                serde_json::Value::Number(n) => n.to_string(),
+                                                serde_json::Value::Bool(b) => b.to_string(),
+                                                serde_json::Value::Null => String::new(),
+                                                other => other.to_string(),
+                                            };
+                                            action.raw_settings.insert(k.clone(), v.clone());
+                                            action.parameters.insert(k.clone(), val_str);
+                                        }
+                                    }
+                                    changed
+                                },
+                                false,
+                            );
+                        }
+                        crate::core::plugin_bridge::BridgeEvent::ActionConfigRows { slot, rows } => {
+                            latest_config_rows.insert(slot, rows);
+                        }
+                        crate::core::plugin_bridge::BridgeEvent::SetBackgroundColor { slot, color } => {
+                            let hex_color = parse_bridge_color(&color);
+                            apply_bridge_slot_update(
+                                &slot,
+                                &mut |action| {
+                                    let mut changed = false;
+                                    if action.appearance.bg_color != hex_color {
+                                        action.appearance.bg_color = hex_color.clone();
+                                        changed = true;
+                                    }
+                                    let cur_st = action.current_state;
+                                    if cur_st < action.states.len()
+                                        && action.states[cur_st].bg_color != hex_color
+                                    {
+                                        action.states[cur_st].bg_color = hex_color.clone();
+                                        changed = true;
+                                    }
+                                    changed
+                                },
+                                true,
+                            );
+                        }
+                        crate::core::plugin_bridge::BridgeEvent::ShowError { slot, duration } => {
+                            tracing::warn!("Plugin reported action error on slot {} (duration={}s)", slot, duration);
+                        }
+                        crate::core::plugin_bridge::BridgeEvent::HideError { slot } => {
+                            tracing::debug!("Plugin cleared action error on slot {}", slot);
+                        }
+                        crate::core::plugin_bridge::BridgeEvent::Notification { title, body, .. } => {
+                            tracing::info!("Plugin notification: {} — {}", title, body);
+                        }
+                        _ => {}
+                    }
+                }
+
+                // Apply coalesced ActionConfigRows updates (and cache by action UUID for instant page-switch restore)
+                if !latest_config_rows.is_empty() {
+                    let active_gui_key = active_device_key_for(
+                        &devs_bridge,
+                        &act_bridge,
+                        prof_bridge.borrow().device_kind,
+                    );
+                    let cur_target = *insp_bridge.current_target.borrow();
+                    let cur_target_slot = format_target_slot(cur_target);
+                    let pm = pm_bridge.borrow();
+                    for (slot, rows) in latest_config_rows {
+                        pm.set_live_config_rows(&slot, rows.clone());
+                        let (opt_dkey, base_slot) = split_bridge_slot(&slot);
+                        let dkey = opt_dkey.unwrap_or(&active_gui_key);
+                        let matches_gui_dev = dkey == active_gui_key;
+                        let target = parse_slot_target(base_slot);
+
+                        // Cache rows against action UUID so switching back to this page later renders immediately
+                        let action_uuid = if matches_gui_dev {
+                            get_target_ref(&prof_bridge.borrow(), target).map(|a| a.uuid.clone())
+                        } else {
+                            let target_kind = devs_bridge
+                                .borrow()
+                                .iter()
+                                .find(|d| d.stable_key() == dkey)
+                                .map(|d| d.kind)
+                                .unwrap_or_else(|| prof_bridge.borrow().device_kind);
+                            let list = profs_bridge.borrow();
+                            find_profile_idx_for_device(
+                                &list,
+                                &act_by_dev_bridge.borrow(),
+                                dkey,
+                                target_kind,
+                            )
+                            .and_then(|idx| get_target_ref(&list[idx], target))
+                            .map(|a| a.uuid.clone())
+                        };
+                        if let Some(uuid) = action_uuid {
+                            pm.set_cached_uuid_config_rows(&uuid, rows.clone());
+                        }
+
+                        if matches_gui_dev && cur_target_slot == base_slot {
+                            insp_bridge.render_live_config_rows(base_slot, &rows);
+                        }
+                    }
+                }
+
+                if need_sidebar_refresh {
+                    refresh_sidebar_bridge();
+                }
+
+                if gui_visual_dirty {
+                    let prof = prof_bridge.borrow();
+                    canvas_bridge.render_profile_page(&prof);
+                    if gui_preview_dirty {
+                        let cur_target = *insp_bridge.current_target.borrow();
+                        if let Some(act) = get_target_ref(&prof, cur_target) {
+                            insp_bridge.update_preview_only(act);
+                        }
+                    }
+                }
+
+                if need_persist_gui {
+                    persist_bridge();
+                } else if need_persist_bg {
+                    ProfileStore::save_profiles_async(
+                        &profs_bridge.borrow(),
+                        &act_by_dev_bridge.borrow(),
+                    );
+                }
+
+                // Non-blocking hardware push for ONLY the slots that actually changed
+                if !dirty_hw_slots.is_empty() {
+                    let hw = hw_bridge.borrow();
+                    for (dkey, (dev, prof, slots)) in dirty_hw_slots {
+                        if slots.len() > 4 || slots.contains("touchscreen") {
+                            hw.sync_hardware_page(&dev.dev_path, &dkey, dev.kind, &prof);
+                        } else {
+                            for slot_name in slots {
+                                hw.sync_single_slot(
                                     &dev.dev_path,
                                     &dkey,
                                     dev.kind,
                                     &prof,
+                                    &slot_name,
                                 );
                             }
                         }
-                    };
-
-                match event {
-                    crate::core::plugin_bridge::BridgeEvent::PluginInitialized {
-                        plugin_id,
-                        plugin_name,
-                        has_settings,
-                        actions,
-                        ..
-                    } => {
-                        tracing::info!(
-                            "Bridge initialized plugin '{}' ({}) with {} actions (has_settings={})",
-                            plugin_name,
-                            plugin_id,
-                            actions.len(),
-                            has_settings
-                        );
-                        {
-                            let mut pm = pm_bridge.borrow_mut();
-                            pm.apply_bridge_plugin_metadata(&plugin_id, &plugin_name, has_settings, &actions);
-                        }
-                        refresh_sidebar_bridge();
                     }
-                    crate::core::plugin_bridge::BridgeEvent::PluginSettingsRows { plugin_id, rows } => {
-                        pm_bridge.borrow().set_live_plugin_settings_rows(&plugin_id, rows.clone());
-                        if let Some((ref open_pid, ref cb)) = *active_ps_bridge.borrow() {
-                            if open_pid == &plugin_id {
-                                cb(&rows);
-                            }
-                        }
-                    }
-                    crate::core::plugin_bridge::BridgeEvent::SetMedia { slot, media_path, size, .. } => {
-                        apply_bridge_slot_update(
-                            &slot,
-                            &mut |action| {
-                                let new_icon = if media_path.is_empty() {
-                                    None
-                                } else {
-                                    Some(media_path.clone())
-                                };
-                                action.appearance.icon_path = new_icon.clone();
-                                if let Some(sz) = size {
-                                    let pct = (sz * 100.0).round().clamp(20.0, 100.0) as u32;
-                                    action.appearance.icon_scale = pct;
-                                }
-                                let cur_st = action.current_state;
-                                if cur_st < action.states.len() {
-                                    action.states[cur_st].icon_path = new_icon;
-                                    if let Some(sz) = size {
-                                        let pct = (sz * 100.0).round().clamp(20.0, 100.0) as u32;
-                                        action.states[cur_st].icon_scale = pct;
-                                    }
-                                }
-                                true
-                            },
-                            true,
-                        );
-                    }
-                    crate::core::plugin_bridge::BridgeEvent::SetLabel {
-                        slot,
-                        text,
-                        position,
-                        color,
-                        font_size,
-                        font_family,
-                    } => {
-                        let parsed_color = color.as_ref().and_then(parse_bridge_color);
-                        let pos = position.as_deref().unwrap_or("bottom").to_string();
-                        let label_val = if text.is_empty() { None } else { Some(text.clone()) };
-                        apply_bridge_slot_update(
-                            &slot,
-                            &mut |action| {
-                                let apply_label = |app: &mut KeyAppearance| {
-                                    if app.custom_title_override {
-                                        return;
-                                    }
-                                    match pos.as_str() {
-                                        "top" => app.top_label = label_val.clone(),
-                                        "center" => app.center_label = label_val.clone(),
-                                        _ => app.bottom_label = label_val.clone(),
-                                    }
-                                    let summary = app.combined_display_summary();
-                                    if !summary.is_empty() {
-                                        app.title = summary;
-                                    } else if !text.is_empty() {
-                                        app.title = text.clone();
-                                    } else if !app.has_plugin_labels() {
-                                        app.title.clear();
-                                    }
-                                    if let Some(ref c) = parsed_color {
-                                        app.text_color = c.clone();
-                                    }
-                                    if let Some(fs) = font_size {
-                                        if fs > 0 {
-                                            app.font_size = fs;
-                                        }
-                                    }
-                                    if let Some(ref ff) = font_family {
-                                        if !ff.is_empty() {
-                                            app.font_family = ff.clone();
-                                        }
-                                    }
-                                };
-                                apply_label(&mut action.appearance);
-                                let cur_st = action.current_state;
-                                if cur_st < action.states.len() {
-                                    apply_label(&mut action.states[cur_st]);
-                                }
-                                true
-                            },
-                            true,
-                        );
-                    }
-                    crate::core::plugin_bridge::BridgeEvent::SetState { slot, state } => {
-                        apply_bridge_slot_update(
-                            &slot,
-                            &mut |action| {
-                                if state < action.states.len() {
-                                    action.set_active_state(state);
-                                    true
-                                } else {
-                                    false
-                                }
-                            },
-                            true,
-                        );
-                    }
-                    crate::core::plugin_bridge::BridgeEvent::SetSettings { slot, settings } => {
-                        apply_bridge_slot_update(
-                            &slot,
-                            &mut |action| {
-                                for (k, v) in &settings {
-                                    let val_str = match v {
-                                        serde_json::Value::String(s) => s.clone(),
-                                        serde_json::Value::Number(n) => n.to_string(),
-                                        serde_json::Value::Bool(b) => b.to_string(),
-                                        serde_json::Value::Null => String::new(),
-                                        other => other.to_string(),
-                                    };
-                                    action.raw_settings.insert(k.clone(), v.clone());
-                                    action.parameters.insert(k.clone(), val_str);
-                                }
-                                true
-                            },
-                            false,
-                        );
-                    }
-                    crate::core::plugin_bridge::BridgeEvent::ActionConfigRows { slot, rows } => {
-                        pm_bridge.borrow().set_live_config_rows(&slot, rows.clone());
-                        let active_gui_key = active_device_key_for(
-                            &devs_bridge,
-                            &act_bridge,
-                            prof_bridge.borrow().device_kind,
-                        );
-                        let (opt_dkey, base_slot) = split_bridge_slot(&slot);
-                        let matches_gui_dev = opt_dkey.map(|k| k == active_gui_key).unwrap_or(true);
-                        let target = *insp_bridge.current_target.borrow();
-                        if matches_gui_dev && format_target_slot(target) == base_slot {
-                            insp_bridge.render_live_config_rows(base_slot, &rows);
-                        }
-                    }
-                    crate::core::plugin_bridge::BridgeEvent::SetBackgroundColor { slot, color } => {
-                        let hex_color = parse_bridge_color(&color);
-                        apply_bridge_slot_update(
-                            &slot,
-                            &mut |action| {
-                                action.appearance.bg_color = hex_color.clone();
-                                let cur_st = action.current_state;
-                                if cur_st < action.states.len() {
-                                    action.states[cur_st].bg_color = hex_color.clone();
-                                }
-                                true
-                            },
-                            true,
-                        );
-                    }
-                    crate::core::plugin_bridge::BridgeEvent::ShowError { slot, duration } => {
-                        tracing::warn!("Plugin reported action error on slot {} (duration={}s)", slot, duration);
-                    }
-                    crate::core::plugin_bridge::BridgeEvent::HideError { slot } => {
-                        tracing::debug!("Plugin cleared action error on slot {}", slot);
-                    }
-                    crate::core::plugin_bridge::BridgeEvent::Notification { title, body, .. } => {
-                        tracing::info!("Plugin notification: {} — {}", title, body);
-                    }
-                    _ => {}
                 }
             }
         });
@@ -2118,7 +2309,7 @@ impl MainWindow {
                             hwm_hw
                                 .borrow()
                                 .sync_hardware_page(&dev.dev_path, &dev_key, dev.kind, &up);
-                            ProfileStore::save_profiles(
+                            ProfileStore::save_profiles_async(
                                 &profiles_hw.borrow(),
                                 &active_by_dev_hw.borrow(),
                             );
@@ -2292,14 +2483,16 @@ impl MainWindow {
                             let cur_b = WindowState::load().brightness_for(&dev_key);
                             if is_active_deck {
                                 let mut p = profile_hw.borrow_mut();
-                                if is_right {
-                                    p.prev_page();
+                                let changed = if is_right {
+                                    p.prev_page()
                                 } else {
-                                    p.next_page();
+                                    p.next_page()
+                                };
+                                if !changed {
+                                    continue;
                                 }
                                 let p_imm = p.clone();
                                 drop(p);
-                                persist_hw();
                                 sync_device_runtime(
                                     &dev_key,
                                     &p_imm,
@@ -2312,6 +2505,7 @@ impl MainWindow {
                                 let cur_target = *inspector_hw.current_target.borrow();
                                 inspector_hw.set_key_action(get_target_ref(&p_imm, cur_target));
                                 Self::sync_hardware(&devs_hw, *act_hw.borrow(), &hwm_hw, &p_imm);
+                                persist_hw();
                             } else {
                                 let mut updated_prof: Option<Profile> = None;
                                 {
@@ -2322,19 +2516,17 @@ impl MainWindow {
                                         &dev_key,
                                         dev.kind,
                                     ) {
-                                        if is_right {
-                                            list[p_idx].prev_page();
+                                        let changed = if is_right {
+                                            list[p_idx].prev_page()
                                         } else {
-                                            list[p_idx].next_page();
+                                            list[p_idx].next_page()
+                                        };
+                                        if changed {
+                                            updated_prof = Some(list[p_idx].clone());
                                         }
-                                        updated_prof = Some(list[p_idx].clone());
                                     }
                                 }
                                 if let Some(p_imm) = updated_prof {
-                                    ProfileStore::save_profiles(
-                                        &profiles_hw.borrow(),
-                                        &active_by_dev_hw.borrow(),
-                                    );
                                     sync_device_runtime(
                                         &dev_key,
                                         &p_imm,
@@ -2348,6 +2540,10 @@ impl MainWindow {
                                         &dev_key,
                                         dev.kind,
                                         &p_imm,
+                                    );
+                                    ProfileStore::save_profiles_async(
+                                        &profiles_hw.borrow(),
+                                        &active_by_dev_hw.borrow(),
                                     );
                                 }
                             }
@@ -2440,7 +2636,7 @@ impl MainWindow {
                     .filter(|p| p.device_kind == dev_kind)
                     .position(|p| p.id == *act_id.borrow())
                     .unwrap_or(0);
-                ProfileStore::save_profiles(&profs_b, &act_by_dev.borrow());
+                ProfileStore::save_profiles_async(&profs_b, &act_by_dev.borrow());
                 drop(profs_b);
 
                 c_cur.set_active_device_key(&dev_key);
@@ -2861,6 +3057,7 @@ impl MainWindow {
                         devs_pwr.borrow().len()
                     );
                     persist_pwr();
+                    ProfileStore::flush_async_saves();
                     if !shut_done_pwr.replace(true) {
                         hw_pwr.borrow().prepare_for_shutdown(true);
                     }
@@ -2879,6 +3076,7 @@ impl MainWindow {
                         dev_count
                     );
                     persist_pwr();
+                    ProfileStore::flush_async_saves();
                     hw_pwr.borrow().prepare_for_suspend();
                     if let Some(ref pm) = *pm_cell_cb.borrow() {
                         pm.release_sleep_inhibitor();
@@ -3016,11 +3214,13 @@ impl MainWindow {
         let persist_page_add = persist_profiles.clone();
 
         canvas.add_page_btn.connect_clicked(move |_| {
-            {
+            let added = {
                 let mut p = prof_page_add.borrow_mut();
-                p.add_page();
+                p.add_page().is_some()
+            };
+            if !added {
+                return;
             }
-            persist_page_add();
             let p = prof_page_add.borrow();
             let dkey = active_device_key_for(&devs_page_add, &act_page_add, p.device_kind);
             let p_names: Vec<String> = profs_page_add
@@ -3034,8 +3234,9 @@ impl MainWindow {
             canvas_page_add.render_profile_page(&p);
             let cur_target = *insp_page_add.current_target.borrow();
             insp_page_add.set_key_action(get_target_ref(&p, cur_target));
+            Self::sync_hardware(&devs_page_add, *act_page_add.borrow(), &hw_page_add, &p);
             drop(p);
-            Self::sync_hardware(&devs_page_add, *act_page_add.borrow(), &hw_page_add, &prof_page_add.borrow());
+            persist_page_add();
         });
 
         let prof_page_del = profile.clone();
@@ -3050,11 +3251,13 @@ impl MainWindow {
         let persist_page_del = persist_profiles.clone();
 
         canvas.remove_page_btn.connect_clicked(move |_| {
-            {
+            let removed = {
                 let mut p = prof_page_del.borrow_mut();
-                p.remove_current_page();
+                p.remove_current_page()
+            };
+            if !removed {
+                return;
             }
-            persist_page_del();
             let p = prof_page_del.borrow();
             let dkey = active_device_key_for(&devs_page_del, &act_page_del, p.device_kind);
             let p_names: Vec<String> = profs_page_del
@@ -3068,8 +3271,9 @@ impl MainWindow {
             canvas_page_del.render_profile_page(&p);
             let cur_target = *insp_page_del.current_target.borrow();
             insp_page_del.set_key_action(get_target_ref(&p, cur_target));
+            Self::sync_hardware(&devs_page_del, *act_page_del.borrow(), &hw_page_del, &p);
             drop(p);
-            Self::sync_hardware(&devs_page_del, *act_page_del.borrow(), &hw_page_del, &prof_page_del.borrow());
+            persist_page_del();
         });
 
         let prof_page_sel = profile.clone();
@@ -3084,11 +3288,13 @@ impl MainWindow {
         let persist_page_sel = persist_profiles.clone();
 
         canvas.set_page_callback(move |page_idx| {
-            {
+            let changed = {
                 let mut p = prof_page_sel.borrow_mut();
-                p.set_page(page_idx);
+                p.set_page(page_idx)
+            };
+            if !changed {
+                return;
             }
-            persist_page_sel();
             let p = prof_page_sel.borrow();
             let dkey = active_device_key_for(&devs_page_sel, &act_page_sel, p.device_kind);
             let p_names: Vec<String> = profs_page_sel
@@ -3102,8 +3308,9 @@ impl MainWindow {
             canvas_page_sel.render_profile_page(&p);
             let cur_target = *insp_page_sel.current_target.borrow();
             insp_page_sel.set_key_action(get_target_ref(&p, cur_target));
+            Self::sync_hardware(&devs_page_sel, *act_page_sel.borrow(), &hw_page_sel, &p);
             drop(p);
-            Self::sync_hardware(&devs_page_sel, *act_page_sel.borrow(), &hw_page_sel, &prof_page_sel.borrow());
+            persist_page_sel();
         });
 
         // ===================== Connect Inspector Controls =====================
@@ -4181,13 +4388,16 @@ impl MainWindow {
                 }
 
                 let mut p = prof_swipe.borrow_mut();
-                if vx < -50.0 {
+                let changed = if vx < -50.0 {
                     // Swipe left -> Next Page
-                    p.next_page();
+                    p.next_page()
                 } else if vx > 50.0 {
                     // Swipe right -> Previous Page
-                    p.prev_page();
+                    p.prev_page()
                 } else {
+                    return;
+                };
+                if !changed {
                     return;
                 }
                 let p_imm = p.clone();
@@ -4321,6 +4531,10 @@ fn sync_device_runtime(
     );
     pm.bridge.clear_device_actions(device_key);
     pm.clear_device_live_config_rows(device_key);
+    let stamp_prefix = format!("{device_key}::");
+    BRIDGE_MEDIA_STAMPS.with(|m| {
+        m.borrow_mut().retain(|k, _| !k.starts_with(&stamp_prefix));
+    });
     if let Some(page) = profile.current_page() {
         let _ = native_host.sync_page(device_key, page);
         for (k, act) in &page.keys {
@@ -4328,8 +4542,18 @@ fn sync_device_runtime(
                 && act.plugin_id != "system"
                 && !native_host.is_native_plugin(&act.plugin_id)
             {
+                let scoped = scoped_bridge_slot(device_key, &format!("key_{k}"));
+                let app = act.active_appearance();
+                let stamp = app
+                    .icon_path
+                    .as_deref()
+                    .and_then(super::canvas::file_content_stamp);
+                BRIDGE_MEDIA_STAMPS.with(|m| {
+                    m.borrow_mut()
+                        .insert(scoped.clone(), (app.icon_path.clone(), app.icon_scale, stamp));
+                });
                 pm.bridge.create_action(
-                    &scoped_bridge_slot(device_key, &format!("key_{k}")),
+                    &scoped,
                     &act.plugin_id,
                     &act.action_id,
                     act.merged_settings_json(),
@@ -4341,8 +4565,18 @@ fn sync_device_runtime(
                 && act.plugin_id != "system"
                 && !native_host.is_native_plugin(&act.plugin_id)
             {
+                let scoped = scoped_bridge_slot(device_key, &format!("dial_{d}"));
+                let app = act.active_appearance();
+                let stamp = app
+                    .icon_path
+                    .as_deref()
+                    .and_then(super::canvas::file_content_stamp);
+                BRIDGE_MEDIA_STAMPS.with(|m| {
+                    m.borrow_mut()
+                        .insert(scoped.clone(), (app.icon_path.clone(), app.icon_scale, stamp));
+                });
                 pm.bridge.create_action(
-                    &scoped_bridge_slot(device_key, &format!("dial_{d}")),
+                    &scoped,
                     &act.plugin_id,
                     &act.action_id,
                     act.merged_settings_json(),
@@ -4354,8 +4588,18 @@ fn sync_device_runtime(
                 && act.plugin_id != "system"
                 && !native_host.is_native_plugin(&act.plugin_id)
             {
+                let scoped = scoped_bridge_slot(device_key, "touchscreen");
+                let app = act.active_appearance();
+                let stamp = app
+                    .icon_path
+                    .as_deref()
+                    .and_then(super::canvas::file_content_stamp);
+                BRIDGE_MEDIA_STAMPS.with(|m| {
+                    m.borrow_mut()
+                        .insert(scoped.clone(), (app.icon_path.clone(), app.icon_scale, stamp));
+                });
                 pm.bridge.create_action(
-                    &scoped_bridge_slot(device_key, "touchscreen"),
+                    &scoped,
                     &act.plugin_id,
                     &act.action_id,
                     act.merged_settings_json(),

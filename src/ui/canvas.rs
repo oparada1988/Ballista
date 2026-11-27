@@ -4,7 +4,80 @@ use gtk::cairo;
 use gtk::prelude::*;
 use gtk::{Box, Button, CenterBox, DrawingArea, Grid, Label, Orientation, Overlay, Picture};
 use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
+
+/// Returns a lightweight filesystem content fingerprint `(mtime_nanos, byte_len, inode)`
+/// so texture caches and bridge `SetMedia` deduplication stay 100% accurate even when a
+/// plugin atomically overwrites the same filename (e.g. `np_dial_0.png`).
+pub fn file_content_stamp(path: &str) -> Option<(u128, u64, u64)> {
+    let meta = std::fs::metadata(path).ok()?;
+    let mtime_nanos = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    #[cfg(unix)]
+    let ino = {
+        use std::os::unix::fs::MetadataExt;
+        meta.ino()
+    };
+    #[cfg(not(unix))]
+    let ino = 0u64;
+    Some((mtime_nanos, meta.len(), ino))
+}
+
+#[derive(Hash, PartialEq, Eq, Clone)]
+struct TextureCacheKey {
+    path: String,
+    stamp: (u128, u64, u64),
+    width: i32,
+    height: i32,
+    radius_tenths: i32,
+    preserve_aspect: bool,
+}
+
+struct BoundedTextureCache {
+    map: HashMap<TextureCacheKey, gtk::gdk::Texture>,
+    order: VecDeque<TextureCacheKey>,
+    max_entries: usize,
+}
+
+impl BoundedTextureCache {
+    fn new(max_entries: usize) -> Self {
+        Self {
+            map: HashMap::new(),
+            order: VecDeque::new(),
+            max_entries,
+        }
+    }
+
+    fn get(&self, key: &TextureCacheKey) -> Option<gtk::gdk::Texture> {
+        self.map.get(key).cloned()
+    }
+
+    fn insert(&mut self, key: TextureCacheKey, tex: gtk::gdk::Texture) {
+        if self.map.contains_key(&key) {
+            self.map.insert(key, tex);
+            return;
+        }
+        while self.map.len() >= self.max_entries {
+            if let Some(oldest) = self.order.pop_front() {
+                self.map.remove(&oldest);
+            } else {
+                break;
+            }
+        }
+        self.order.push_back(key.clone());
+        self.map.insert(key, tex);
+    }
+}
+
+thread_local! {
+    static TEXTURE_CACHE: RefCell<BoundedTextureCache> = RefCell::new(BoundedTextureCache::new(160));
+    static RESOLVED_ICON_CACHE: RefCell<HashMap<(String, i32), String>> = RefCell::new(HashMap::new());
+}
 
 pub fn resolve_icon_path(icon_name_or_path: &str, size: i32) -> Option<String> {
     if icon_name_or_path.is_empty() {
@@ -15,6 +88,32 @@ pub fn resolve_icon_path(icon_name_or_path: &str, size: i32) -> Option<String> {
     if p.is_absolute() && p.exists() {
         return Some(icon_name_or_path.to_string());
     }
+
+    let cache_key = (icon_name_or_path.to_string(), size);
+    if let Some(cached) = RESOLVED_ICON_CACHE.with(|c| c.borrow().get(&cache_key).cloned()) {
+        if std::path::Path::new(&cached).exists() {
+            return Some(cached);
+        }
+        RESOLVED_ICON_CACHE.with(|c| {
+            c.borrow_mut().remove(&cache_key);
+        });
+    }
+
+    let resolved = resolve_icon_path_uncached(icon_name_or_path, size);
+    if let Some(ref found) = resolved {
+        RESOLVED_ICON_CACHE.with(|c| {
+            let mut map = c.borrow_mut();
+            if map.len() >= 512 {
+                map.clear();
+            }
+            map.insert(cache_key, found.clone());
+        });
+    }
+    resolved
+}
+
+fn resolve_icon_path_uncached(icon_name_or_path: &str, size: i32) -> Option<String> {
+    let p = std::path::Path::new(icon_name_or_path);
 
     let raw_name = p.file_name().and_then(|n| n.to_str()).unwrap_or(icon_name_or_path);
     let clean_name = raw_name
@@ -126,6 +225,19 @@ pub fn resolve_icon_path(icon_name_or_path: &str, size: i32) -> Option<String> {
 
 pub fn create_rounded_texture(path: &str, width: i32, height: i32, radius: f64, preserve_aspect: bool) -> Option<gtk::gdk::Texture> {
     use gtk::gdk::prelude::GdkCairoContextExt;
+    let stamp = file_content_stamp(path)?;
+    let cache_key = TextureCacheKey {
+        path: path.to_string(),
+        stamp,
+        width,
+        height,
+        radius_tenths: (radius * 10.0).round() as i32,
+        preserve_aspect,
+    };
+    if let Some(hit) = TEXTURE_CACHE.with(|c| c.borrow().get(&cache_key)) {
+        return Some(hit);
+    }
+
     let is_svg = path.to_lowercase().ends_with(".svg");
     let pb = if is_svg {
         // Rasterize vector artwork at crisp 2x HiDPI resolution
@@ -137,7 +249,7 @@ pub fn create_rounded_texture(path: &str, width: i32, height: i32, radius: f64, 
         if raw.width() == tw && raw.height() == th {
             raw
         } else {
-            raw.scale_simple(tw, th, gdk_pixbuf::InterpType::Hyper)?
+            raw.scale_simple(tw, th, gdk_pixbuf::InterpType::Bilinear)?
         }
     } else {
         // Preserve native raster resolution (up to 2x target) so crisp 200x100 dial cards
@@ -151,7 +263,7 @@ pub fn create_rounded_texture(path: &str, width: i32, height: i32, radius: f64, 
             let scale = (max_w as f64 / raw.width() as f64).min(max_h as f64 / raw.height() as f64);
             let nw = (raw.width() as f64 * scale).round().max(1.0) as i32;
             let nh = (raw.height() as f64 * scale).round().max(1.0) as i32;
-            raw.scale_simple(nw, nh, gdk_pixbuf::InterpType::Hyper)?
+            raw.scale_simple(nw, nh, gdk_pixbuf::InterpType::Bilinear)?
         }
     };
     let pw = pb.width();
@@ -181,14 +293,16 @@ pub fn create_rounded_texture(path: &str, width: i32, height: i32, radius: f64, 
     let stride = surface.stride();
     let data = surface.take_data().ok()?;
     let bytes = glib::Bytes::from(&*data);
-    let texture = gtk::gdk::MemoryTexture::new(
+    let texture: gtk::gdk::Texture = gtk::gdk::MemoryTexture::new(
         pw,
         ph,
         gtk::gdk::MemoryFormat::B8g8r8a8Premultiplied,
         &bytes,
         stride as usize,
-    );
-    Some(texture.upcast())
+    )
+    .upcast();
+    TEXTURE_CACHE.with(|c| c.borrow_mut().insert(cache_key, texture.clone()));
+    Some(texture)
 }
 
 /// Resolves a rectangular (e.g. 2:1 dial card) paintable at crisp HiDPI resolution
@@ -645,6 +759,10 @@ pub struct Canvas {
     pub current_kind: Rc<RefCell<DeviceKind>>,
     pub current_btn_size: Rc<Cell<i32>>,
     pub css_provider: gtk::CssProvider,
+    pub last_css: Rc<RefCell<String>>,
+    pub key_visual_sigs: Rc<RefCell<Vec<Option<String>>>>,
+    pub touch_visual_sigs: Rc<RefCell<Vec<Option<String>>>>,
+    pub touch_wallpaper_sig: Rc<RefCell<Option<String>>>,
     pub page_pill_box: Box,
     pub page_chips_box: Box,
     pub page_chips: Rc<RefCell<Vec<Button>>>,
@@ -795,6 +913,10 @@ impl Canvas {
             current_kind: Rc::new(RefCell::new(initial_kind)),
             current_btn_size: Rc::new(Cell::new(86)),
             css_provider,
+            last_css: Rc::new(RefCell::new(String::new())),
+            key_visual_sigs: Rc::new(RefCell::new(Vec::new())),
+            touch_visual_sigs: Rc::new(RefCell::new(Vec::new())),
+            touch_wallpaper_sig: Rc::new(RefCell::new(None)),
             page_pill_box,
             page_chips_box,
             page_chips: Rc::new(RefCell::new(Vec::new())),
@@ -875,6 +997,13 @@ impl Canvas {
         }
         self.key_icons.borrow_mut().clear();
         self.key_overlays.borrow_mut().clear();
+        self.key_visual_sigs.borrow_mut().clear();
+        self.touch_visual_sigs.borrow_mut().clear();
+        *self.touch_wallpaper_sig.borrow_mut() = None;
+        self.last_css.borrow_mut().clear();
+        for (_, src) in self.active_ui_animations.borrow_mut().drain() {
+            src.remove();
+        }
         self.touch_segments.borrow_mut().clear();
         self.touch_native_canvases.borrow_mut().clear();
         self.touch_labels.borrow_mut().clear();
@@ -2525,28 +2654,39 @@ impl Canvas {
         let total_pages = profile.pages.len();
         let cur_idx = profile.current_page_idx;
 
-        // Rebuild dynamic page chips [ (1) ] [ 2 ] [ 3 ] ...
-        while let Some(child) = self.page_chips_box.first_child() {
-            self.page_chips_box.remove(&child);
-        }
-        self.page_chips.borrow_mut().clear();
-
-        for i in 0..total_pages {
-            let chip = Button::with_label(&format!("{}", i + 1));
-            chip.add_css_class("page-chip");
-            if i == cur_idx {
-                chip.add_css_class("active");
+        // Incrementally update dynamic page chips [ (1) ] [ 2 ] [ 3 ] ...
+        // Only rebuild chip widgets when the page count changes (avoids GTK widget churn on every switch).
+        if self.page_chips.borrow().len() != total_pages {
+            while let Some(child) = self.page_chips_box.first_child() {
+                self.page_chips_box.remove(&child);
             }
+            self.page_chips.borrow_mut().clear();
 
-            let cb_ref = self.on_page_selected.clone();
-            chip.connect_clicked(move |_| {
-                if let Some(ref cb) = *cb_ref.borrow() {
-                    cb(i);
+            for i in 0..total_pages {
+                let chip = Button::with_label(&format!("{}", i + 1));
+                chip.add_css_class("page-chip");
+                if i == cur_idx {
+                    chip.add_css_class("active");
                 }
-            });
 
-            self.page_chips_box.append(&chip);
-            self.page_chips.borrow_mut().push(chip);
+                let cb_ref = self.on_page_selected.clone();
+                chip.connect_clicked(move |_| {
+                    if let Some(ref cb) = *cb_ref.borrow() {
+                        cb(i);
+                    }
+                });
+
+                self.page_chips_box.append(&chip);
+                self.page_chips.borrow_mut().push(chip);
+            }
+        } else {
+            for (i, chip) in self.page_chips.borrow().iter().enumerate() {
+                if i == cur_idx {
+                    chip.add_css_class("active");
+                } else {
+                    chip.remove_css_class("active");
+                }
+            }
         }
 
         self.add_page_btn.set_sensitive(total_pages < 10);
@@ -2578,6 +2718,11 @@ impl Canvas {
             if key_meta.len() != keys.len() {
                 key_meta.resize(keys.len(), SlotDragMeta::default());
             }
+            let mut key_sigs = self.key_visual_sigs.borrow_mut();
+            if key_sigs.len() != keys.len() {
+                key_sigs.resize(keys.len(), None);
+            }
+            let active_dkey = self.active_device_key.borrow().clone();
 
             // 1. Primary LCD Keys
             for (idx, _btn) in keys.iter().enumerate() {
@@ -2620,6 +2765,7 @@ impl Canvas {
                         }
                     };
 
+                    let mut label_dirty = false;
                     if let Some(st_rc) = label_states.get(idx) {
                         let mut st = st_rc.borrow_mut();
                         let text_changed = st.top != new_top
@@ -2627,22 +2773,24 @@ impl Canvas {
                             || st.bottom != new_bottom
                             || st.font_family != app.font_family
                             || st.font_size != app.font_size;
-                        st.top = new_top;
-                        st.center = new_center;
-                        st.bottom = new_bottom;
-                        st.font_family = app.font_family.clone();
-                        st.font_size = app.font_size;
-                        st.text_color = app.text_color.clone();
-                        if text_changed {
-                            st.marquee_start = std::time::Instant::now();
+                        let color_changed = st.text_color != app.text_color;
+                        if text_changed || color_changed {
+                            st.top = new_top;
+                            st.center = new_center;
+                            st.bottom = new_bottom;
+                            st.font_family = app.font_family.clone();
+                            st.font_size = app.font_size;
+                            st.text_color = app.text_color.clone();
+                            if text_changed {
+                                st.marquee_start = std::time::Instant::now();
+                            }
+                            label_dirty = true;
                         }
                     }
-                    if let Some(da) = label_canvases.get(idx) {
-                        da.queue_draw();
-                    }
-
-                    if let Some(src) = self.active_ui_animations.borrow_mut().remove(&idx) {
-                        src.remove();
+                    if label_dirty {
+                        if let Some(da) = label_canvases.get(idx) {
+                            da.queue_draw();
+                        }
                     }
 
                     // Check if this key is backed by a Ballista-native Rust action with custom Cairo artwork
@@ -2651,7 +2799,6 @@ impl Canvas {
                         .as_deref()
                         .filter(|p| !p.is_empty() && std::path::Path::new(p).exists())
                         .is_some();
-                    let active_dkey = self.active_device_key.borrow().clone();
                     let is_native_action = native_host_opt
                         .as_ref()
                         .map(|h| h.is_native_plugin(&action.plugin_id) && h.has_slot(&active_dkey, &format!("key_{idx}")))
@@ -2667,118 +2814,139 @@ impl Canvas {
 
                     if let Some(icon) = icons.get(idx) {
                         if show_native_canvas {
-                            icon.set_visible(false);
-                        } else {
-                        let btn_sz = (self.current_btn_size.get() - 4).max(20) as f64;
-                        let scale_pct = (app.icon_scale.clamp(20, 100) as f64) / 100.0;
-                        let icon_sz = ((btn_sz * scale_pct) as i32).max(12);
-                        let pad = if app.icon_scale < 100 {
-                            ((btn_sz * (1.0 - scale_pct)) / 2.0).round() as i32
-                        } else {
-                            0
-                        };
-                        icon.set_margin_start(pad);
-                        icon.set_margin_end(pad);
-                        icon.set_margin_top(pad);
-                        icon.set_margin_bottom(pad);
-                        icon.set_size_request(-1, -1);
-
-                        let mut icon_path = app.icon_path.as_deref();
-                        let icon_name = action.parameters.get("icon_name").map(|s| s.as_str())
-                            .or_else(|| match action.action_id.as_str() {
-                                "system.hotkey" => Some("input-keyboard-symbolic"),
-                                "system.url" => Some("web-browser-symbolic"),
-                                "system.terminal" => Some("utilities-terminal-symbolic"),
-                                "app_launcher.launch" => Some("system-run"),
-                                _ => None,
-                            });
-
-                        // For App Launcher actions: ignore generic placeholder icons if an app has been configured
-                        if action.action_id.contains("AppLauncher") || action.action_id == "app_launcher.launch" {
-                            if action.parameters.contains_key("desktop_id") || action.parameters.contains_key("icon_name") {
-                                if let Some(p) = icon_path {
-                                    if p.ends_with("action_launch.png") || p.ends_with("default_app.png") {
-                                        icon_path = action.parameters.get("icon_path").map(|s| s.as_str());
-                                    }
+                            if key_sigs[idx].as_deref() != Some("native") {
+                                if let Some(src) = self.active_ui_animations.borrow_mut().remove(&idx) {
+                                    src.remove();
                                 }
+                                icon.set_visible(false);
+                                key_sigs[idx] = Some("native".to_string());
                             }
-                        }
+                        } else {
+                            let btn_sz = (self.current_btn_size.get() - 4).max(20) as f64;
+                            let scale_pct = (app.icon_scale.clamp(20, 100) as f64) / 100.0;
+                            let icon_sz = ((btn_sz * scale_pct) as i32).max(12);
+                            let pad = if app.icon_scale < 100 {
+                                ((btn_sz * (1.0 - scale_pct)) / 2.0).round() as i32
+                            } else {
+                                0
+                            };
 
-                        if let Some(path) = icon_path {
-                            if path.to_lowercase().ends_with(".gif") && std::path::Path::new(path).exists() {
-                                // 1. Immediately show first frame with zero UI hitch
-                                if let Some(texture) = create_rounded_texture(path, icon_sz, icon_sz, 11.0, true) {
-                                    icon.set_paintable(Some(&texture));
-                                    icon.set_visible(true);
-                                }
+                            let mut icon_path = app.icon_path.as_deref();
+                            let icon_name = action.parameters.get("icon_name").map(|s| s.as_str())
+                                .or_else(|| match action.action_id.as_str() {
+                                    "system.hotkey" => Some("input-keyboard-symbolic"),
+                                    "system.url" => Some("web-browser-symbolic"),
+                                    "system.terminal" => Some("utilities-terminal-symbolic"),
+                                    "app_launcher.launch" => Some("system-run"),
+                                    _ => None,
+                                });
 
-                                // 2. Decode animation frames in background thread via async_channel
-                                let (sender, receiver) = async_channel::unbounded::<Vec<crate::core::animation::RawGifFrame>>();
-                                let pic_clone = icon.clone();
-                                let active_anims = self.active_ui_animations.clone();
-                                let key_idx = idx;
-
-                                glib::spawn_future_local(async move {
-                                    if let Ok(raw_frames) = receiver.recv().await {
-                                        if raw_frames.len() > 1 {
-                                            use gtk::prelude::Cast;
-                                            let mut textures: Vec<(gtk::gdk::Texture, u32)> = Vec::new();
-                                            for f in raw_frames {
-                                                let bytes = glib::Bytes::from(&f.rgba[..]);
-                                                let texture = gtk::gdk::MemoryTexture::new(
-                                                    f.width as i32,
-                                                    f.height as i32,
-                                                    gtk::gdk::MemoryFormat::R8g8b8a8,
-                                                    &bytes,
-                                                    (f.width * 4) as usize,
-                                                );
-                                                textures.push((texture.upcast(), f.delay_ms));
-                                            }
-
-                                            let frames_rc = std::rc::Rc::new(textures);
-                                            let frame_idx = std::rc::Rc::new(std::cell::Cell::new(0));
-                                            let delay = frames_rc[0].1.max(30);
-
-                                            let pic_anim = pic_clone.clone();
-                                            let frames_anim = frames_rc.clone();
-                                            let idx_anim = frame_idx.clone();
-
-                                            let source_id = glib::timeout_add_local(
-                                                std::time::Duration::from_millis(delay as u64),
-                                                move || {
-                                                    let next_i = (idx_anim.get() + 1) % frames_anim.len();
-                                                    idx_anim.set(next_i);
-                                                    pic_anim.set_paintable(Some(&frames_anim[next_i].0));
-                                                    glib::ControlFlow::Continue
-                                                }
-                                            );
-
-                                            if let Some(old) = active_anims.borrow_mut().insert(key_idx, source_id) {
-                                                old.remove();
-                                            }
+                            // For App Launcher actions: ignore generic placeholder icons if an app has been configured
+                            if action.action_id.contains("AppLauncher") || action.action_id == "app_launcher.launch" {
+                                if action.parameters.contains_key("desktop_id") || action.parameters.contains_key("icon_name") {
+                                    if let Some(p) = icon_path {
+                                        if p.ends_with("action_launch.png") || p.ends_with("default_app.png") {
+                                            icon_path = action.parameters.get("icon_path").map(|s| s.as_str());
                                         }
                                     }
-                                });
-
-                                let path_clone = path.to_string();
-                                let dim = icon_sz as u32;
-                                std::thread::spawn(move || {
-                                    if let Some(raw_frames) = crate::core::animation::GifAnimation::load_key_gif_raw(&path_clone, dim, 11.0) {
-                                        let _ = sender.send_blocking(raw_frames);
-                                    }
-                                });
-                            } else if let Some(paintable) = lookup_icon_paintable(Some(path), icon_name, icon_sz, 11.0) {
-                                icon.set_paintable(Some(&paintable));
-                                icon.set_visible(true);
-                            } else {
-                                icon.set_visible(false);
+                                }
                             }
-                        } else if let Some(paintable) = lookup_icon_paintable(None, icon_name, icon_sz, 11.0) {
-                            icon.set_paintable(Some(&paintable));
-                            icon.set_visible(true);
-                        } else {
-                            icon.set_visible(false);
-                        }
+
+                            let desired_sig = if let Some(p) = icon_path {
+                                Some(format!("p:{p}:{:?}:{:?}:{icon_sz}:{pad}", file_content_stamp(p), icon_name))
+                            } else if let Some(n) = icon_name {
+                                Some(format!("n:{n}:{icon_sz}:{pad}"))
+                            } else {
+                                None
+                            };
+
+                            if key_sigs[idx] != desired_sig {
+                                if let Some(src) = self.active_ui_animations.borrow_mut().remove(&idx) {
+                                    src.remove();
+                                }
+                                icon.set_margin_start(pad);
+                                icon.set_margin_end(pad);
+                                icon.set_margin_top(pad);
+                                icon.set_margin_bottom(pad);
+                                icon.set_size_request(-1, -1);
+
+                                if let Some(path) = icon_path {
+                                    if path.to_lowercase().ends_with(".gif") && std::path::Path::new(path).exists() {
+                                        // 1. Immediately show first frame with zero UI hitch
+                                        if let Some(texture) = create_rounded_texture(path, icon_sz, icon_sz, 11.0, true) {
+                                            icon.set_paintable(Some(&texture));
+                                            icon.set_visible(true);
+                                        }
+
+                                        // 2. Decode animation frames in background thread via async_channel
+                                        let (sender, receiver) = async_channel::unbounded::<Vec<crate::core::animation::RawGifFrame>>();
+                                        let pic_clone = icon.clone();
+                                        let active_anims = self.active_ui_animations.clone();
+                                        let key_idx = idx;
+
+                                        glib::spawn_future_local(async move {
+                                            if let Ok(raw_frames) = receiver.recv().await {
+                                                if raw_frames.len() > 1 {
+                                                    use gtk::prelude::Cast;
+                                                    let mut textures: Vec<(gtk::gdk::Texture, u32)> = Vec::new();
+                                                    for f in raw_frames {
+                                                        let bytes = glib::Bytes::from(&f.rgba[..]);
+                                                        let texture = gtk::gdk::MemoryTexture::new(
+                                                            f.width as i32,
+                                                            f.height as i32,
+                                                            gtk::gdk::MemoryFormat::R8g8b8a8,
+                                                            &bytes,
+                                                            (f.width * 4) as usize,
+                                                        );
+                                                        textures.push((texture.upcast(), f.delay_ms));
+                                                    }
+
+                                                    let frames_rc = std::rc::Rc::new(textures);
+                                                    let frame_idx = std::rc::Rc::new(std::cell::Cell::new(0));
+                                                    let delay = frames_rc[0].1.max(30);
+
+                                                    let pic_anim = pic_clone.clone();
+                                                    let frames_anim = frames_rc.clone();
+                                                    let idx_anim = frame_idx.clone();
+
+                                                    let source_id = glib::timeout_add_local(
+                                                        std::time::Duration::from_millis(delay as u64),
+                                                        move || {
+                                                            let next_i = (idx_anim.get() + 1) % frames_anim.len();
+                                                            idx_anim.set(next_i);
+                                                            pic_anim.set_paintable(Some(&frames_anim[next_i].0));
+                                                            glib::ControlFlow::Continue
+                                                        }
+                                                    );
+
+                                                    if let Some(old) = active_anims.borrow_mut().insert(key_idx, source_id) {
+                                                        old.remove();
+                                                    }
+                                                }
+                                            }
+                                        });
+
+                                        let path_clone = path.to_string();
+                                        let dim = icon_sz as u32;
+                                        std::thread::spawn(move || {
+                                            if let Some(raw_frames) = crate::core::animation::GifAnimation::load_key_gif_raw(&path_clone, dim, 11.0) {
+                                                let _ = sender.send_blocking(raw_frames);
+                                            }
+                                        });
+                                    } else if let Some(paintable) = lookup_icon_paintable(Some(path), icon_name, icon_sz, 11.0) {
+                                        icon.set_paintable(Some(&paintable));
+                                        icon.set_visible(true);
+                                    } else {
+                                        icon.set_visible(false);
+                                    }
+                                } else if let Some(paintable) = lookup_icon_paintable(None, icon_name, icon_sz, 11.0) {
+                                    icon.set_paintable(Some(&paintable));
+                                    icon.set_visible(true);
+                                } else {
+                                    icon.set_visible(false);
+                                }
+                                key_sigs[idx] = desired_sig;
+                            }
                         }
                     }
 
@@ -2789,18 +2957,30 @@ impl Canvas {
                     ));
                 } else {
                     key_meta[idx] = SlotDragMeta::default();
+                    if key_sigs[idx].is_some() {
+                        if let Some(src) = self.active_ui_animations.borrow_mut().remove(&idx) {
+                            src.remove();
+                        }
+                        key_sigs[idx] = None;
+                    }
                     if let Some(nda) = native_canvases.get(idx) {
                         nda.set_visible(false);
                     }
+                    let mut had_label = false;
                     if let Some(st_rc) = label_states.get(idx) {
                         let mut st = st_rc.borrow_mut();
-                        st.top.clear();
-                        st.center.clear();
-                        st.bottom.clear();
-                        st.needs_scroll.set(false);
+                        if !st.top.is_empty() || !st.center.is_empty() || !st.bottom.is_empty() {
+                            st.top.clear();
+                            st.center.clear();
+                            st.bottom.clear();
+                            st.needs_scroll.set(false);
+                            had_label = true;
+                        }
                     }
-                    if let Some(da) = label_canvases.get(idx) {
-                        da.queue_draw();
+                    if had_label {
+                        if let Some(da) = label_canvases.get(idx) {
+                            da.queue_draw();
+                        }
                     }
                     if let Some(icon) = icons.get(idx) {
                         icon.set_visible(false);
@@ -2813,6 +2993,7 @@ impl Canvas {
             }
 
             // 2. Touchscreen & Dial Slots Rendering
+            drop(key_sigs);
             drop(key_meta);
             let touch_labels = self.touch_labels.borrow();
             let touch_icons = self.touch_icons.borrow();
@@ -2868,27 +3049,41 @@ impl Canvas {
                         let (strip_w, strip_h, _, _) = touch_strip_dimensions(kind, btn_size, spacing);
                         let inner_w = (strip_w - 4).max(40);
                         let inner_h = (strip_h - 4).max(36);
+                        let wp_sig = Some(format!("{path}:{:?}:{inner_w}x{inner_h}", file_content_stamp(path)));
 
-                        if path.to_lowercase().ends_with(".gif") {
-                            pic.set_filename(Some(path));
-                        } else if let Some(texture) = create_rounded_texture(path, inner_w, inner_h, 11.0, false) {
-                            pic.set_paintable(Some(&texture));
-                        } else if let Ok(pb) = gdk_pixbuf::Pixbuf::from_file_at_scale(path, inner_w, inner_h, false) {
-                            let texture = gtk::gdk::Texture::for_pixbuf(&pb);
-                            pic.set_paintable(Some(&texture));
-                        } else {
-                            pic.set_filename(Some(path));
+                        if *self.touch_wallpaper_sig.borrow() != wp_sig {
+                            if path.to_lowercase().ends_with(".gif") {
+                                pic.set_filename(Some(path));
+                            } else if let Some(texture) = create_rounded_texture(path, inner_w, inner_h, 11.0, false) {
+                                pic.set_paintable(Some(&texture));
+                            } else if let Ok(pb) = gdk_pixbuf::Pixbuf::from_file_at_scale(path, inner_w, inner_h, false) {
+                                let texture = gtk::gdk::Texture::for_pixbuf(&pb);
+                                pic.set_paintable(Some(&texture));
+                            } else {
+                                pic.set_filename(Some(path));
+                            }
+                            *self.touch_wallpaper_sig.borrow_mut() = wp_sig;
                         }
                         pic.set_visible(true);
                     } else {
+                        *self.touch_wallpaper_sig.borrow_mut() = None;
                         pic.set_visible(false);
                     }
                 } else {
+                    *self.touch_wallpaper_sig.borrow_mut() = None;
                     pic.set_visible(false);
                 }
             }
 
+            let mut touch_sigs = self.touch_visual_sigs.borrow_mut();
+            if touch_sigs.len() != touch_segs.len() {
+                touch_sigs.resize(touch_segs.len(), None);
+            }
+
             if has_panoramic {
+                for sig in touch_sigs.iter_mut() {
+                    *sig = None;
+                }
                 if let Some(ref act) = page.touchscreen_action {
                     let app = act.active_appearance();
                     let bg = app.bg_color.as_deref().unwrap_or("transparent");
@@ -2931,7 +3126,6 @@ impl Canvas {
                             .as_deref()
                             .filter(|p| !p.is_empty() && std::path::Path::new(p).exists())
                             .is_some();
-                        let active_dkey = self.active_device_key.borrow().clone();
                         let show_native_touch = native_host_opt
                             .as_ref()
                             .map(|h| h.is_native_plugin(&action.plugin_id) && h.has_slot(&active_dkey, &format!("dial_{idx}")))
@@ -2961,47 +3155,59 @@ impl Canvas {
 
                         if let Some(icon) = touch_icons.get(idx) {
                             if show_native_touch {
+                                touch_sigs[idx] = Some("native".to_string());
                                 icon.set_visible(false);
                             } else {
-                            let scale_pct = (app.icon_scale.clamp(20, 100) as f64) / 100.0;
-                            let target_w = ((slot_w as f64 * scale_pct).round() as i32).max(24);
-                            let target_h = ((slot_h as f64 * scale_pct).round() as i32).max(16);
+                                let scale_pct = (app.icon_scale.clamp(20, 100) as f64) / 100.0;
+                                let target_w = ((slot_w as f64 * scale_pct).round() as i32).max(24);
+                                let target_h = ((slot_h as f64 * scale_pct).round() as i32).max(16);
 
-                            let icon_path = app.icon_path.as_deref();
-                            let icon_name = action.parameters.get("icon_name").map(|s| s.as_str())
-                                .or_else(|| match action.action_id.as_str() {
-                                    "system.hotkey" => Some("input-keyboard-symbolic"),
-                                    "system.url" => Some("web-browser-symbolic"),
-                                    "system.terminal" => Some("utilities-terminal-symbolic"),
-                                    "app_launcher.launch" => Some("system-run"),
-                                    _ => None,
-                                });
-
-                            if let Some(paintable) = lookup_rect_paintable(icon_path, icon_name, target_w, target_h, 0.0) {
-                                let aspect = paintable.intrinsic_aspect_ratio();
-                                let is_dial_card = (1.80..=2.20).contains(&aspect);
-                                icon.set_paintable(Some(&paintable));
-                                if app.icon_scale < 100 {
-                                    icon.set_content_fit(gtk::ContentFit::Contain);
-                                    icon.set_halign(gtk::Align::Center);
-                                    icon.set_valign(gtk::Align::Center);
-                                    icon.set_size_request(target_w, target_h);
-                                } else {
-                                    // True 2:1 dial cards fill edge-to-edge (eliminating sub-pixel rounding gaps);
-                                    // square icons preserve their natural aspect ratio cleanly.
-                                    icon.set_content_fit(if is_dial_card {
-                                        gtk::ContentFit::Fill
-                                    } else {
-                                        gtk::ContentFit::Contain
+                                let icon_path = app.icon_path.as_deref();
+                                let icon_name = action.parameters.get("icon_name").map(|s| s.as_str())
+                                    .or_else(|| match action.action_id.as_str() {
+                                        "system.hotkey" => Some("input-keyboard-symbolic"),
+                                        "system.url" => Some("web-browser-symbolic"),
+                                        "system.terminal" => Some("utilities-terminal-symbolic"),
+                                        "app_launcher.launch" => Some("system-run"),
+                                        _ => None,
                                     });
-                                    icon.set_halign(gtk::Align::Fill);
-                                    icon.set_valign(gtk::Align::Fill);
-                                    icon.set_size_request(-1, -1);
+
+                                let desired_touch_sig = if let Some(p) = icon_path {
+                                    Some(format!("p:{p}:{:?}:{:?}:{target_w}x{target_h}:{}", file_content_stamp(p), icon_name, app.icon_scale))
+                                } else if let Some(n) = icon_name {
+                                    Some(format!("n:{n}:{target_w}x{target_h}:{}", app.icon_scale))
+                                } else {
+                                    None
+                                };
+
+                                if touch_sigs[idx] != desired_touch_sig {
+                                    if let Some(paintable) = lookup_rect_paintable(icon_path, icon_name, target_w, target_h, 0.0) {
+                                        let aspect = paintable.intrinsic_aspect_ratio();
+                                        let is_dial_card = (1.80..=2.20).contains(&aspect);
+                                        icon.set_paintable(Some(&paintable));
+                                        if app.icon_scale < 100 {
+                                            icon.set_content_fit(gtk::ContentFit::Contain);
+                                            icon.set_halign(gtk::Align::Center);
+                                            icon.set_valign(gtk::Align::Center);
+                                            icon.set_size_request(target_w, target_h);
+                                        } else {
+                                            // True 2:1 dial cards fill edge-to-edge (eliminating sub-pixel rounding gaps);
+                                            // square icons preserve their natural aspect ratio cleanly.
+                                            icon.set_content_fit(if is_dial_card {
+                                                gtk::ContentFit::Fill
+                                            } else {
+                                                gtk::ContentFit::Contain
+                                            });
+                                            icon.set_halign(gtk::Align::Fill);
+                                            icon.set_valign(gtk::Align::Fill);
+                                            icon.set_size_request(-1, -1);
+                                        }
+                                        icon.set_visible(true);
+                                    } else {
+                                        icon.set_visible(false);
+                                    }
+                                    touch_sigs[idx] = desired_touch_sig;
                                 }
-                                icon.set_visible(true);
-                            } else {
-                                icon.set_visible(false);
-                            }
                             }
                         }
 
@@ -3015,6 +3221,7 @@ impl Canvas {
                             idx, bg, idx, fg, font, size
                         ));
                     } else {
+                        touch_sigs[idx] = None;
                         if let Some(nda) = touch_native_canvases.get(idx) {
                             nda.set_visible(false);
                         }
@@ -3033,6 +3240,10 @@ impl Canvas {
                 }
             }
         }
-        self.css_provider.load_from_data(&css);
+        let mut prev_css = self.last_css.borrow_mut();
+        if *prev_css != css {
+            self.css_provider.load_from_data(&css);
+            *prev_css = css;
+        }
     }
 }

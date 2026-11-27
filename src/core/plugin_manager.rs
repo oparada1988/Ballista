@@ -101,6 +101,7 @@ pub struct PluginManager {
     pub installed_apps: Vec<InstalledApp>,
     pub bridge: super::plugin_bridge::PluginBridge,
     pub live_config_rows: Arc<Mutex<HashMap<String, Vec<super::plugin_bridge::BridgeConfigRow>>>>,
+    pub cached_uuid_config_rows: Arc<Mutex<HashMap<String, Vec<super::plugin_bridge::BridgeConfigRow>>>>,
     pub live_plugin_settings_rows: Arc<Mutex<HashMap<String, Vec<super::plugin_bridge::BridgeConfigRow>>>>,
     pub plugin_has_settings: Arc<Mutex<HashMap<String, bool>>>,
 }
@@ -121,6 +122,7 @@ impl PluginManager {
             installed_apps: Vec::new(),
             bridge,
             live_config_rows: Arc::new(Mutex::new(HashMap::new())),
+            cached_uuid_config_rows: Arc::new(Mutex::new(HashMap::new())),
             live_plugin_settings_rows: Arc::new(Mutex::new(HashMap::new())),
             plugin_has_settings: Arc::new(Mutex::new(HashMap::new())),
         };
@@ -138,6 +140,7 @@ impl PluginManager {
             installed_apps: Vec::new(),
             bridge: super::plugin_bridge::PluginBridge::new(),
             live_config_rows: Arc::new(Mutex::new(HashMap::new())),
+            cached_uuid_config_rows: Arc::new(Mutex::new(HashMap::new())),
             live_plugin_settings_rows: Arc::new(Mutex::new(HashMap::new())),
             plugin_has_settings: Arc::new(Mutex::new(HashMap::new())),
         };
@@ -154,6 +157,29 @@ impl PluginManager {
     pub fn get_live_config_rows(&self, slot: &str) -> Option<Vec<super::plugin_bridge::BridgeConfigRow>> {
         if let Ok(lock) = self.live_config_rows.lock() {
             lock.get(slot).cloned()
+        } else {
+            None
+        }
+    }
+
+    pub fn set_cached_uuid_config_rows(&self, action_uuid: &str, rows: Vec<super::plugin_bridge::BridgeConfigRow>) {
+        if action_uuid.is_empty() {
+            return;
+        }
+        if let Ok(mut lock) = self.cached_uuid_config_rows.lock() {
+            if lock.len() > 256 {
+                lock.clear();
+            }
+            lock.insert(action_uuid.to_string(), rows);
+        }
+    }
+
+    pub fn get_cached_uuid_config_rows(&self, action_uuid: &str) -> Option<Vec<super::plugin_bridge::BridgeConfigRow>> {
+        if action_uuid.is_empty() {
+            return None;
+        }
+        if let Ok(lock) = self.cached_uuid_config_rows.lock() {
+            lock.get(action_uuid).cloned()
         } else {
             None
         }
