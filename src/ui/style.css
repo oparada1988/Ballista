@@ -609,8 +609,8 @@ window.ballista-modal .boxed-list > row:last-child {
     border: 1px solid rgba(255, 255, 255, 0.08);
     border-radius: 0px;
     padding: 0;
-    min-width: 292px;
-    min-height: 105px;
+    min-width: 260px;
+    min-height: 94px;
     transition: all 120ms ease;
 }
 
@@ -623,8 +623,8 @@ window.ballista-modal .boxed-list > row:last-child {
 .store-spotlight-thumbnail {
     border-radius: 0px;
     background-color: #141418;
-    min-width: 292px;
-    min-height: 105px;
+    min-width: 260px;
+    min-height: 94px;
 }
 
 .thumb-banner-fallback {

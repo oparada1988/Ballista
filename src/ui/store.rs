@@ -80,6 +80,31 @@ fn resolve_spotlight_plugins<'a>(
     }
 }
 
+/// Groups spotlight plugins into 3-card slides. When more than 3 plugins exist and the
+/// final slide would be partial (e.g., 4 plugins -> 1 leftover), uses a sliding window
+/// of the last 3 plugins so every slide displays 3 full, aspect-locked banners.
+fn build_spotlight_slides<'a>(plugins: &[&'a PluginInfo]) -> Vec<Vec<&'a PluginInfo>> {
+    if plugins.is_empty() {
+        return Vec::new();
+    }
+    if plugins.len() <= 3 {
+        return vec![plugins.to_vec()];
+    }
+
+    let mut slides: Vec<Vec<&'a PluginInfo>> = Vec::new();
+    let mut start = 0;
+    while start < plugins.len() {
+        let remaining = plugins.len() - start;
+        if remaining < 3 {
+            slides.push(plugins[plugins.len() - 3..].to_vec());
+            break;
+        }
+        slides.push(plugins[start..start + 3].to_vec());
+        start += 3;
+    }
+    slides
+}
+
 fn is_newer_version(candidate: &str, installed: &str) -> bool {
     let parse = |s: &str| -> Vec<u32> {
         s.trim()
@@ -2122,29 +2147,25 @@ pub fn create_store_window(
     carousel.set_size_request(-1, 105);
 
     let spotlight_plugins = resolve_spotlight_plugins(&plugins_catalog, &spotlight_ids);
-    let mut chunk = Vec::new();
-    for (i, item) in spotlight_plugins.iter().enumerate() {
-        let card = create_spotlight_card(item, open_plugin_detail.clone());
-        chunk.push(card);
-
-        if chunk.len() == 3 || i == spotlight_plugins.len() - 1 {
-            let slide_box = Box::new(Orientation::Horizontal, 12);
-            slide_box.set_hexpand(true);
-            slide_box.set_homogeneous(true);
-            slide_box.set_size_request(-1, 105);
-            let card_count = chunk.len();
-            for c in chunk.drain(..) {
-                slide_box.append(&c);
-            }
-            // Keep 3 homogeneous columns on partial final slides so banners keep their 2.78:1 aspect ratio
-            for _ in card_count..3 {
-                let spacer = Box::new(Orientation::Vertical, 0);
-                spacer.set_hexpand(true);
-                spacer.set_can_target(false);
-                slide_box.append(&spacer);
-            }
-            carousel.append(&slide_box);
+    let spotlight_slides = build_spotlight_slides(&spotlight_plugins);
+    for slide_items in spotlight_slides {
+        let slide_box = Box::new(Orientation::Horizontal, 12);
+        slide_box.set_hexpand(true);
+        slide_box.set_homogeneous(true);
+        slide_box.set_size_request(-1, 105);
+        let card_count = slide_items.len();
+        for item in slide_items {
+            let card = create_spotlight_card(item, open_plugin_detail.clone());
+            slide_box.append(&card);
         }
+        // Keep 3 homogeneous columns when fewer than 3 total plugins exist
+        for _ in card_count..3 {
+            let spacer = Box::new(Orientation::Vertical, 0);
+            spacer.set_hexpand(true);
+            spacer.set_can_target(false);
+            slide_box.append(&spacer);
+        }
+        carousel.append(&slide_box);
     }
 
     scroll_content.append(&carousel);
@@ -2787,26 +2808,30 @@ fn show_plugin_install_error_dialog(parent: &Window, title: &str, err: &str) {
 
 // =========================================================================
 // Spotlight Card Builder: 100% Full Artwork Banner (NO Bottom Bar/Name)
-// Covers the entire card edge-to-edge
+// Strictly locked to 1168:420 (~2.78:1) aspect ratio with ContentFit::Cover
 // =========================================================================
 fn create_spotlight_card(
     item: &PluginInfo,
     on_click_detail: Rc<dyn Fn(PluginInfo)>,
-) -> Box {
+) -> gtk::AspectFrame {
+    let frame = gtk::AspectFrame::new(0.5, 0.5, 1168.0 / 420.0, false);
+    frame.set_hexpand(true);
+    frame.set_vexpand(false);
+    frame.set_valign(gtk::Align::Center);
+
     let card = Box::new(Orientation::Vertical, 0);
     card.add_css_class("store-spotlight-card");
     card.set_hexpand(true);
-    card.set_vexpand(false);
-    card.set_size_request(292, 105);
+    card.set_vexpand(true);
+    card.set_overflow(gtk::Overflow::Hidden);
     card.set_cursor_from_name(Some("pointer"));
 
     let mut has_real_thumb = false;
     let thumb_pic = Picture::new();
     thumb_pic.set_can_shrink(true);
-    thumb_pic.set_content_fit(gtk::ContentFit::Fill);
+    thumb_pic.set_content_fit(gtk::ContentFit::Cover);
     thumb_pic.set_hexpand(true);
     thumb_pic.set_vexpand(true);
-    thumb_pic.set_size_request(292, 105);
     thumb_pic.add_css_class("store-spotlight-thumbnail");
 
     if let Some(ref path) = item.thumbnail {
@@ -2825,7 +2850,6 @@ fn create_spotlight_card(
         fallback_box.add_css_class(&item.fallback_grad);
         fallback_box.set_hexpand(true);
         fallback_box.set_vexpand(true);
-        fallback_box.set_size_request(292, 105);
 
         let icon_preview = Image::from_icon_name(if item.is_file_icon { "system-run-symbolic" } else { &item.icon });
         icon_preview.set_pixel_size(42);
@@ -2846,7 +2870,8 @@ fn create_spotlight_card(
     });
     card.add_controller(click_gesture);
 
-    card
+    frame.set_child(Some(&card));
+    frame
 }
 
 fn create_catalog_card(
@@ -3172,5 +3197,29 @@ mod tests {
             .map(|p| p.id.as_str())
             .collect();
         assert_eq!(resolved, vec!["p0", "p1", "p2", "p3", "p4", "p5"]);
+    }
+
+    #[test]
+    fn spotlight_slides_use_sliding_window_for_partial_final_slide() {
+        let plugins: Vec<PluginInfo> = (0..4).map(|i| dummy_plugin(&format!("p{i}"))).collect();
+        let refs: Vec<&PluginInfo> = plugins.iter().collect();
+        let slides = build_spotlight_slides(&refs);
+        let ids: Vec<Vec<&str>> = slides
+            .into_iter()
+            .map(|s| s.into_iter().map(|p| p.id.as_str()).collect())
+            .collect();
+        assert_eq!(ids, vec![vec!["p0", "p1", "p2"], vec!["p1", "p2", "p3"]]);
+
+        // Exact multiple of 3 produces non-overlapping slides
+        let six: Vec<PluginInfo> = (0..6).map(|i| dummy_plugin(&format!("p{i}"))).collect();
+        let six_refs: Vec<&PluginInfo> = six.iter().collect();
+        let six_ids: Vec<Vec<&str>> = build_spotlight_slides(&six_refs)
+            .into_iter()
+            .map(|s| s.into_iter().map(|p| p.id.as_str()).collect())
+            .collect();
+        assert_eq!(
+            six_ids,
+            vec![vec!["p0", "p1", "p2"], vec!["p3", "p4", "p5"]]
+        );
     }
 }
